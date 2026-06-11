@@ -1,0 +1,61 @@
+# 07 — 로드맵
+
+MVP에서 가장 중요한 건 semantic merge를 완벽히 만드는 게 **아니다.** 먼저 만들 5가지:
+
+1. 에이전트가 작업을 **intent/session**으로 시작하게 만들기
+2. 모든 변경을 **operation**으로 제출하게 만들기
+3. 모든 검증을 **evidence**로 저장하기
+4. **accepted/pending/rejected** 상태를 명확히 나누기
+5. 사람의 결정을 **decision**으로 남기기
+
+이 5개만으로도 Git보다 agentic coding에 잘 맞는다. ✅ **Phase 1에서 전부 구현됨.**
+
+## Phase 1 — 코어 원장 ✅ (현재)
+- append-only content-addressed 객체 저장소 (`src/store`)
+- intent/session/operation/evidence/decision/checkpoint/view 객체 (`src/objects`)
+- 파일 단위 연산 + 결정론적 reducer + 정책 엔진 (`src/reducer`)
+- MCP 서버 8 tool (`src/mcp`), 사람용 CLI (`src/cli`)
+- 4단계 충돌(L0–L4) end-to-end 데모 + 동작 계약 테스트
+
+## Phase 2 — AST 인지 머지
+- Tree-sitter 기반 entity index (TypeScript/Python/Go 중 1개부터)
+- function/class/import 단위로 연산 승격, `conflictKey`를 `symbol:...`로 좁힘
+- `entityId` 안정화 → rename/move/edit 자동 병합 (L1을 L0처럼)
+- raw patch 입력 → AST diff 분석 → operation 승격, 실패 시 `draft_text_patch`로 격리
+
+> reducer는 `conflictKey` 유도와 `applyOp` 트리 변형만 교체하면 되도록 설계됨. 나머지 환원 로직은 불변.
+
+## Phase 3 — 검증 루프 & 에이전트 통합
+- evidence를 실제 도구 실행으로 생성(test/typecheck/lint 러너)
+- 실패 op repair loop + `RepairContext`(최소 맥락만 에이전트에 전달)
+- MCP `resources`로 ContextPack, `prompts`로 skill 템플릿 제공
+- WorkLease(soft lease)로 작업 시작 단계 충돌 예방
+
+## Phase 4 — 의미 충돌 & 결정 메모리
+- 타입체크/정적분석을 머지 파이프라인에 편입 → 선언 없이도 L3 자동 탐지
+- 사람 결정 큐 UI(선택지 + 영향도 + 검증 결과)
+- `decision.futurePolicy` 기반 자동 추천(과거 결정 학습)
+
+## Phase 5 — 정책 엔진 심화
+- code-owner 매핑, API contract 규칙, security 규칙
+- 에이전트 신뢰도 학습 → `actorTrust` 동적 조정
+- 정책 버전 관리 + 정책 변경 시 영향 분석
+
+## Phase 6 — Release & provenance
+- Release 객체(서명·증거·아티팩트)
+- SBOM/container/build 메타데이터 연결, MLOps/온프렘 타깃
+
+## 알려진 한계 (정직하게)
+
+1. 모든 언어의 AST/semantic model 지원은 어렵다 → text CRDT fallback 필수.
+2. 자동 병합이 공격적이면 "충돌은 없는데 버그"인 의미 충돌이 는다 → test/typecheck를 머지 파이프라인에 넣어야 함.
+3. operation log가 커진다 → 주기적 snapshot/checkpoint + 오래된 low-level op를 semantic op로 compaction.
+4. 정책이 강력해진다 → 잘못된 정책은 잘못된 변경을 조용히 들인다. 정책 버전·감사·`require_human` 안전판으로 방어.
+
+## 기술 부채 / MVP 단순화
+
+- content addressing은 canonical JSON(추후 CBOR). 직렬화는 `src/core/canonical.ts` 한 곳에 격리.
+- blob은 base64 통짜 저장(추후 청크/delta).
+- `view.query.includeStatuses`는 후보 선택보다 표시 의미에 가깝게 단순화됨.
+- 동기화 프로토콜(operation gossip)은 설계만, 미구현.
+- Lamport clock은 단일 프로세스 가정. 분산 시 actor별 clock + 교환 필요.
