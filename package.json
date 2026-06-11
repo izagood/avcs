@@ -1,0 +1,27 @@
+{
+  "name": "avcs",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Agentic Version Control System — an AI-native VCS where intent, session, operation, evidence and decision are first-class objects and code is a materialized projection of an operation graph.",
+  "bin": {
+    "avcs": "src/cli.ts"
+  },
+  "scripts": {
+    "avcs": "node --experimental-strip-types src/cli.ts",
+    "demo": "node --experimental-strip-types src/demo.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "mcp": "node --experimental-strip-types src/mcp/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

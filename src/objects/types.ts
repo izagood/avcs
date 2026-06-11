@@ -1,0 +1,255 @@
+// The AVCS object model.
+//
+// Everything that matters is a content-addressed, append-only object. Code is NOT
+// stored as commits; it is a *projection* computed from the operation graph. The
+// seven first-class object kinds:
+//
+//   intent     — why a change is being made (goal + constraints + scope)
+//   session    — an agent/human work episode against an intent
+//   operation  — a single semantic change unit (the real history)
+//   evidence   — machine-checkable proof attached to operations
+//   decision   — a recorded resolution of a conflict / design choice
+//   checkpoint — a verified (ops + policy + materializer) state vector
+//   view       — a query over the operation graph (replaces branches)
+//
+// Plus `blob` for raw content and `policy` for the merge rules.
+
+export type ObjectType =
+  | "blob"
+  | "intent"
+  | "session"
+  | "operation"
+  | "evidence"
+  | "decision"
+  | "checkpoint"
+  | "view"
+  | "policy";
+
+export interface BaseObject {
+  type: ObjectType;
+  /** Content address. Filled in by the store on write; absent while building. */
+  oid?: string;
+}
+
+// ── Actors ──────────────────────────────────────────────────────────────────
+export type ActorKind = "human" | "ai_agent" | "ci_bot";
+export interface Actor {
+  kind: ActorKind;
+  /** Stable id, e.g. "human:jinbin" or "ai:claude-code". */
+  id: string;
+  /** For ai_agent: model identifier. */
+  model?: string;
+}
+
+// ── blob ────────────────────────────────────────────────────────────────────
+export interface Blob extends BaseObject {
+  type: "blob";
+  /** Base64 of the raw bytes. (MVP keeps it simple; large blobs get chunked later.) */
+  data: string;
+  encoding: "base64";
+}
+
+// ── intent ──────────────────────────────────────────────────────────────────
+export type IntentKind = "feature" | "bugfix" | "refactor" | "formatting" | "generated";
+/** A symbol/file/glob scope the intent is allowed to touch. */
+export type ScopeRef = string; // e.g. "file:src/cache/*", "symbol:UserService.findById"
+
+export interface Intent extends BaseObject {
+  type: "intent";
+  title: string;
+  owner: string; // actor id, usually a human
+  kind: IntentKind;
+  priority: "low" | "normal" | "high" | "critical";
+  constraints: string[]; // natural-language invariants the change must preserve
+  successCriteria: string[];
+  allowedScopes: ScopeRef[];
+  createdAt: string;
+}
+
+// ── session ─────────────────────────────────────────────────────────────────
+export interface Session extends BaseObject {
+  type: "session";
+  intentOid: string;
+  actor: Actor;
+  baseViewOid: string | null;
+  /** Distilled, redaction-safe context. Raw transcripts live out of band. */
+  summary: string;
+  openedEntities: ScopeRef[];
+  toolCalls: string[];
+  startedAt: string;
+}
+
+// ── operation ───────────────────────────────────────────────────────────────
+// MVP operations are file-granular but carry the full semantic envelope so the
+// Phase-2 AST upgrade is additive, not a rewrite. The reducer treats `conflictKey`
+// (derived from target) as the unit of contention.
+export type OperationKind =
+  | "put_file" // create or replace whole file content
+  | "delete_file"
+  | "rename_file" // identity-preserving move
+  | "note"; // metadata-only op (e.g. record an effect), never mutates the tree
+
+export interface OperationTarget {
+  /** What conceptual entity this op changes. MVP: file; later: symbol/contract. */
+  entityKind: "file" | "symbol" | "contract" | "config" | "test";
+  /** Stable entity id. MVP: the file path. */
+  entityId: string;
+}
+
+export interface OperationBody {
+  kind: OperationKind;
+  /** put_file / rename_file destination path. */
+  path?: string;
+  /** rename_file source path. */
+  fromPath?: string;
+  /** put_file content. */
+  blobOid?: string;
+}
+
+export interface Operation extends BaseObject {
+  type: "operation";
+  sessionOid: string;
+  intentOid: string;
+  actor: Actor;
+  target: OperationTarget;
+  body: OperationBody;
+  /** Direct causal predecessors (this op was authored "after" seeing these). */
+  causalDeps: string[];
+  /** Human/agent statement of purpose for this single op. */
+  declaredPurpose: string;
+  /** Declared reads/effects — used by the semantic-conflict detector. */
+  effects?: {
+    reads?: ScopeRef[];
+    changesBehavior?: boolean;
+    breaksPublicApi?: boolean;
+  };
+  /** Lamport time for deterministic tie-break of concurrent ops. */
+  lamport: number;
+  createdAt: string;
+  /** Self-reported confidence; advisory, never authoritative. */
+  confidence?: number;
+}
+
+// Operation lifecycle status is *not* stored on the immutable op. It is derived
+// from the presence of evidence/decision objects + policy at materialization time.
+export type OperationStatus =
+  | "proposed"
+  | "validating"
+  | "accepted"
+  | "rejected"
+  | "superseded"
+  | "needs_decision"
+  | "quarantined";
+
+// ── evidence ────────────────────────────────────────────────────────────────
+export type EvidenceKind =
+  | "parse"
+  | "typecheck"
+  | "lint"
+  | "unit_test"
+  | "integration_test"
+  | "benchmark"
+  | "security_scan"
+  | "api_compat";
+export type EvidenceResult = "pass" | "fail" | "partial" | "not_run";
+
+export interface Evidence extends BaseObject {
+  type: "evidence";
+  forOps: string[];
+  kind: EvidenceKind;
+  result: EvidenceResult;
+  command?: string;
+  detail?: string;
+  producedBy: Actor;
+  createdAt: string;
+}
+
+// ── decision ────────────────────────────────────────────────────────────────
+export interface Decision extends BaseObject {
+  type: "decision";
+  conflictId: string;
+  chosenOps: string[];
+  rejectedOps: string[];
+  reason: string;
+  decidedBy: Actor;
+  /** Optional reusable rule distilled from this decision. */
+  futurePolicy?: string;
+  createdAt: string;
+}
+
+// ── view ────────────────────────────────────────────────────────────────────
+// A branch replacement: a declarative query over the operation graph.
+export interface ViewQuery {
+  /** Only ops in these statuses are candidates (post-reduction). */
+  includeStatuses: OperationStatus[];
+  /** Restrict to these intents (empty = all). */
+  intentOids?: string[];
+  /** Restrict to these sessions (empty = all). */
+  sessionOids?: string[];
+  /** Hard-exclude specific ops. */
+  excludeOps?: string[];
+}
+
+export interface View extends BaseObject {
+  type: "view";
+  name: string;
+  baseViewOid: string | null;
+  query: ViewQuery;
+  createdAt: string;
+}
+
+// ── checkpoint ──────────────────────────────────────────────────────────────
+export interface Checkpoint extends BaseObject {
+  type: "checkpoint";
+  viewOid: string;
+  /** Frontier operation ids that define this state. */
+  headOps: string[];
+  treeHash: string;
+  policyOid: string;
+  materializerVersion: string;
+  evidence: Partial<Record<EvidenceKind, EvidenceResult>>;
+  status: "draft" | "verified" | "released";
+  summary: string;
+  createdAt: string;
+}
+
+// ── policy ──────────────────────────────────────────────────────────────────
+// The reducer is parameterized by a policy object so that materialization is a pure
+// function of (ops, decisions, policy, materializer). Changing policy yields a new,
+// distinguishable checkpoint.
+export interface PolicyRule {
+  name: string;
+  /** Coarse trigger; the engine matches these against each conflict/op. */
+  when: {
+    opKind?: OperationKind;
+    breaksPublicApi?: boolean;
+    changesBehavior?: boolean;
+    onConflict?: boolean;
+  };
+  /** Effect on priority/decision. */
+  effect:
+    | { type: "require_human" }
+    | { type: "require_evidence"; evidence: EvidenceKind; result: EvidenceResult }
+    | { type: "priority"; weight: number }
+    | { type: "prefer_actor"; kind: ActorKind };
+}
+
+export interface Policy extends BaseObject {
+  type: "policy";
+  version: string;
+  /** Ordered actor trust ladder (higher index = more trusted). */
+  actorTrust: ActorKind[];
+  rules: PolicyRule[];
+  createdAt: string;
+}
+
+export type AnyObject =
+  | Blob
+  | Intent
+  | Session
+  | Operation
+  | Evidence
+  | Decision
+  | View
+  | Checkpoint
+  | Policy;

@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+# Local materialized workspace of demo repos
+/scratch/
+/.avcs-demo/
