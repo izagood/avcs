@@ -140,3 +140,14 @@ export function spliceSymbol(
   }
   return indexer.reassemble(spans);
 }
+
+/**
+ * M3 AST op: rename a top-level symbol — its declaration AND its references WITHIN
+ * the same file (word-boundary replace). Cross-file references need reference
+ * analysis (tree-sitter / typecheck) and are a documented follow-up. Pure.
+ */
+export function renameSymbol(content: string, from: string, to: string): string {
+  if (!from || !to || from === to) return content;
+  const re = new RegExp(`(?<![A-Za-z0-9_$])${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_$])`, "g");
+  return content.replace(re, to);
+}
