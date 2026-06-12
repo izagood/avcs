@@ -18,7 +18,18 @@ state = reduce(base, operationDAG, decisions, policy, materializer)
 5. **AI 출력은 신뢰된 코드가 아니라 증거가 붙은 제안된 연산이다.**
 6. **코드에 last-write-wins를 기본값으로 쓰지 않는다.** 우선순위는 정책이 정한다.
 
-## 지금 동작하는 것 (Phase 1–6 구현 완료)
+## 지금 동작하는 것 (Phase 1–12 MVP 구현 완료 · 테스트 66/66)
+
+추가로 구현된 상위 phase:
+- **Phase 7** 멀티 머신: Membership/역할(서명·키연합) · `pull`(객체 gossip, 두 replica가 같은 treeHash로 수렴) · Protection + `finalize` CAS(non-fast-forward 거부 = 권한이 신선한 히스토리를 덮지 못함)
+- **Phase 8** Lineage: 장기 분기 라인(v1.x∥v2.x, 같은 symbol 다른 내용·충돌 0) · `portOp`(backport=cherry-pick)
+- **Phase 9** Scale: entity index · `materializeAt`(시간여행) · chunked 대용량 blob(dedup)
+- **Phase 10** Observability: `blame`(누가/왜)·`logP`·`bisect`(결정론적)·`diff`
+- **Phase 11** 외부 기여: quarantine 티어 + `promote` + 비신뢰 CI 게이트
+- **Phase 12** 보안: `redact`(유출 비밀 byte-eviction, oid 보존) · break-glass override · forward-only rollback
+- **소소**: `revert` · co-authors · stash(private op) · semver release
+
+### 기반 (Phase 1–6)
 
 - **저장 코어** — append-only, content-addressed 객체 저장소(`.avcs/objects`), 8+2 객체 모델: intent · session · operation · evidence · decision · checkpoint · view · lease · release (+ blob · policy)
 - **결정론적 reducer + 정책 엔진** — 충돌 등급화:
