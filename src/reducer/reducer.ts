@@ -122,7 +122,7 @@ function stricter(a: OperationStatus, b: OperationStatus): OperationStatus {
  * destination, so it contends on BOTH — otherwise a concurrent write to either
  * path would slip through unmerged. note ops contend on nothing.
  */
-function keysOf(op: Operation): string[] {
+export function keysOf(op: Operation): string[] {
   const b = op.body;
   switch (b.kind) {
     case "put_file":

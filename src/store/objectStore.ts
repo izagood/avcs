@@ -10,10 +10,10 @@
 // fully auditable: the entire causal history of how code reached its current state
 // is replayable.
 
-import { mkdir, readFile, readdir, stat, open, rename } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, open, rename, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { canonicalize, computeOid } from "../core/canonical.ts";
+import { canonicalize, computeOid, sha256hex } from "../core/canonical.ts";
 import { withLock, type LockOptions } from "./lock.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
 
@@ -28,6 +28,7 @@ export class ObjectStore {
     await mkdir(join(this.root, "objects"), { recursive: true });
     await mkdir(join(this.root, "refs"), { recursive: true });
     await mkdir(join(this.root, "locks"), { recursive: true });
+    await mkdir(join(this.root, "indexes", "entity"), { recursive: true });
     if (!existsSync(join(this.root, "HEAD"))) {
       await this.#writeAtomic(join(this.root, "HEAD"), "main");
     }
@@ -53,6 +54,27 @@ export class ObjectStore {
   /** Run a critical section under a named cross-process lock (see lock.ts). */
   async withLock<T>(name: string, fn: () => Promise<T>, opts?: LockOptions): Promise<T> {
     return withLock(join(this.root, "locks"), name, fn, opts);
+  }
+
+  // ── entity index (Phase 9) ──────────────────────────────────────────────
+  // An append-only secondary index: entity key → op oids, sharded by key hash, so
+  // "history of this symbol" is O(ops-on-that-entity) instead of a full-store scan.
+  // It is a rebuildable cache (O_APPEND keeps small records atomic across processes).
+  #indexPathFor(key: string): string {
+    const h = sha256hex(key);
+    return join(this.root, "indexes", "entity", h.slice(0, 2), `${h.slice(0, 32)}.idx`);
+  }
+  async appendEntityIndex(key: string, oid: string): Promise<void> {
+    const p = this.#indexPathFor(key);
+    await mkdir(dirname(p), { recursive: true });
+    await appendFile(p, `${oid}\n`, "utf8");
+  }
+  async readEntityIndex(key: string): Promise<string[]> {
+    const p = this.#indexPathFor(key);
+    if (!existsSync(p)) return [];
+    const seen = new Set<string>();
+    for (const line of (await readFile(p, "utf8")).split("\n")) if (line) seen.add(line);
+    return [...seen];
   }
 
   static isRepo(repoDir: string): boolean {
