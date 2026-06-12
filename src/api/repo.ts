@@ -1088,6 +1088,71 @@ export class Repo {
     return pass2;
   }
 
+  // ── git-like working tree (checkout / commit) ─────────────────────────────
+  /** Read a working directory's files (relative paths → content), skipping .avcs/. */
+  async #readWorkTree(workDir: string): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (!existsSync(workDir)) return out;
+    for (const ent of await readdir(workDir, { recursive: true, withFileTypes: true })) {
+      if (!ent.isFile()) continue;
+      const rel = join(ent.parentPath ?? (ent as { path?: string }).path ?? workDir, ent.name).slice(workDir.length + 1);
+      if (rel.startsWith(".avcs") || rel === ".avcs-workspace") continue;
+      out.set(rel.split("\\").join("/"), await readFile(join(workDir, rel), "utf8"));
+    }
+    return out;
+  }
+
+  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
+  async checkoutInto(workDir: string, view = "main"): Promise<string[]> {
+    const res = await this.materialize(view);
+    const written: string[] = [];
+    for (const [path, blobOid] of res.tree) {
+      const full = join(workDir, path);
+      await mkdir(dirname(full), { recursive: true });
+      const synth = res.synthBlobs.get(blobOid);
+      await writeFile(full, synth !== undefined ? Buffer.from(synth, "utf8") : await this.readBlob(blobOid));
+      written.push(path);
+    }
+    return written.sort();
+  }
+
+  /**
+   * Commit a working tree: diff `workDir`'s files against the materialized view and
+   * author put_file / delete_file ops for the changes (the git `add`+`commit` step,
+   * which agents do via operation.propose). Causally builds on the current frontier.
+   */
+  async commitWorkingTree(
+    workDir: string,
+    opts: { message: string; actor: Actor; line?: string },
+  ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string }> {
+    const view = opts.line ?? "main";
+    const res = await this.materialize(view);
+    const current = new Map((await this.materializedFiles(res)).map((f) => [f.path, f.content]));
+    const disk = await this.#readWorkTree(workDir);
+    const added: string[] = [];
+    const modified: string[] = [];
+    const removed: string[] = [];
+    for (const [path, content] of disk) {
+      if (!current.has(path)) added.push(path);
+      else if (current.get(path) !== content) modified.push(path);
+    }
+    for (const path of current.keys()) if (!disk.has(path)) removed.push(path);
+
+    const ops: string[] = [];
+    if (!added.length && !modified.length && !removed.length) return { ops, added, modified, removed, intent: "" };
+
+    const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
+    const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
+    const deps = res.headOps;
+    for (const path of [...added, ...modified].sort()) {
+      ops.push(await this.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: opts.actor, path, content: disk.get(path)!, declaredPurpose: opts.message, causalDeps: deps, line: opts.line }));
+    }
+    for (const path of removed.sort()) {
+      ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line }));
+    }
+    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), intent };
+  }
+
   /**
    * Materialize the state AT a given frontier: reduce only the causal closure of
    * `headOps`. The basis for time-travel — history, bisect, and diff-at-point all
