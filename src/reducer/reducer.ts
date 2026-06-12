@@ -21,6 +21,7 @@ import type {
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
 import { spliceSymbol } from "../semantic/symbols.ts";
+import { ownersFor } from "../policy/owners.ts";
 
 export interface ConflictOption {
   opOid: string;
@@ -40,6 +41,8 @@ export interface Conflict {
   /** Policy's provisional recommendation (never set when a human is required). */
   recommendedOp: string | null;
   reason: string;
+  /** Actor ids that own this scope and should make the call (Phase 5). */
+  requiredOwners?: string[];
 }
 
 /**
@@ -95,6 +98,8 @@ export interface ReduceInput {
   materializeStatuses?: OperationStatus[];
   /** blob oid → content, for ops that need file text (set_symbol). */
   blobContent?: Map<string, string>;
+  /** actorId → bounded reliability nudge (Phase 5 trust learning). */
+  reliability?: Map<string, number>;
 }
 
 // Status precedence when an op belongs to several contended keys (rename touches
@@ -216,11 +221,12 @@ export function reduce(input: ReduceInput): ReductionResult {
   const conflicts: Conflict[] = [];
   const autoDecisions: AutoDecision[] = [];
   const evalCache = new Map<string, OpEvaluation>();
+  const reliability = input.reliability ?? new Map<string, number>();
   const evalOf = (op: Operation, inConflict: boolean): OpEvaluation => {
     const cacheKey = `${op.oid}|${inConflict}`;
     let e = evalCache.get(cacheKey);
     if (!e) {
-      e = evaluateOp(policy, op, evByOp.get(op.oid as string) ?? [], inConflict, intentSatisfied(op, intents));
+      e = evaluateOp(policy, op, evByOp.get(op.oid as string) ?? [], inConflict, intentSatisfied(op, intents), reliability.get(op.actor.id) ?? 0);
       evalCache.set(cacheKey, e);
     }
     return e;
@@ -230,6 +236,11 @@ export function reduce(input: ReduceInput): ReductionResult {
   for (const [key, groupOps] of groups) {
     const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, conflicts, autoDecisions);
     for (const [oid, st] of local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
+  }
+  // Phase 5: annotate needs_human conflicts with the scope owners who should decide.
+  for (const c of conflicts) {
+    const o = ownersFor(c.key, policy.owners ?? []);
+    if (o.length) c.requiredOwners = o;
   }
 
   // A note op is never grouped on an entity; promote any that stayed "proposed".

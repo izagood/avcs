@@ -14,6 +14,8 @@ import { LamportClock } from "../core/clock.ts";
 import { computeOid } from "../core/canonical.ts";
 import { reduce, conflictIdFor, type ReductionResult } from "../reducer/reducer.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
+import { computeReliability } from "../policy/reliability.ts";
+import type { OwnerRule } from "../objects/types.ts";
 import { defaultPolicy, MATERIALIZER_VERSION } from "../reducer/policy.ts";
 import {
   Keyring,
@@ -96,6 +98,27 @@ export class Repo {
     const oid = await this.store.getRef("policy");
     if (!oid) return defaultPolicy();
     return this.store.get<Policy>(oid);
+  }
+
+  /** Replace the active policy (new version ⇒ a distinguishable checkpoint). */
+  async setPolicy(policy: Policy): Promise<string> {
+    const oid = await this.store.put(policy);
+    await this.store.setRef("policy", oid);
+    return oid;
+  }
+
+  /** Set code-owner rules (Phase 5), bumping the policy version. */
+  async setOwners(owners: OwnerRule[]): Promise<string> {
+    const current = await this.policy();
+    return this.setPolicy({ ...current, owners, version: `${current.version}+owners`, createdAt: new Date().toISOString() });
+  }
+
+  /** actorId → learned reliability nudge, from history. */
+  async reliability(): Promise<Map<string, number>> {
+    const ops = await this.store.collect<Operation>("operation");
+    const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
+    const decisions = await this.store.collect<Decision>("decision");
+    return computeReliability(ops, evidence, decisions);
   }
 
   // ── identity / keyring (Phase 3) ──────────────────────────────────────────
@@ -434,7 +457,8 @@ export class Repo {
     }
 
     const policy = await this.policy();
-    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: q.includeStatuses, blobContent };
+    const reliability = computeReliability(ops, evidence, decisions);
+    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: q.includeStatuses, blobContent, reliability };
     const pass1 = reduce(base);
 
     // Phase 4: semantic-conflict pass. Find contract breaks that the text-clean
