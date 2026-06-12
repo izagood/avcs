@@ -100,6 +100,7 @@ export function evaluateOp(
   evidenceForOp: Evidence[],
   inConflict: boolean,
   intentConstraintsSatisfied: boolean,
+  reliabilityBonus = 0,
 ): OpEvaluation {
   const ev: OpEvaluation = {
     blocked: false,
@@ -107,6 +108,12 @@ export function evaluateOp(
     score: actorTrustScore(policy, op.actor),
     notes: [],
   };
+
+  // Phase 5: learned trust nudge (bounded; cannot overpower the ladder — cf. C1).
+  if (reliabilityBonus !== 0) {
+    ev.score += reliabilityBonus * 30;
+    ev.notes.push(`reliability ${reliabilityBonus > 0 ? "+" : ""}${reliabilityBonus}`);
+  }
 
   // Only evidence the operation's own author did NOT produce can vouch for it.
   const trusted = evidenceForOp.filter(

@@ -254,12 +254,20 @@ export interface PolicyRule {
     | { type: "prefer_actor"; kind: ActorKind };
 }
 
+/** Maps a scope pattern to the actor ids that must approve changes there (Phase 5). */
+export interface OwnerRule {
+  scope: ScopeRef;
+  owners: string[];
+}
+
 export interface Policy extends BaseObject {
   type: "policy";
   version: string;
   /** Ordered actor trust ladder (higher index = more trusted). */
   actorTrust: ActorKind[];
   rules: PolicyRule[];
+  /** Code ownership: who must sign off on changes to which scopes. */
+  owners?: OwnerRule[];
   createdAt: string;
 }
 
