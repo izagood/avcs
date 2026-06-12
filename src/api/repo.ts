@@ -217,14 +217,29 @@ export class Repo {
     return this.store.put(session);
   }
 
+  // Large blobs are chunked so a huge file never inflates one JSON object, and
+  // identical chunks dedup by content address. (Phase 9b)
+  static readonly CHUNK_THRESHOLD = 256 * 1024;
+  static readonly CHUNK_SIZE = 64 * 1024;
+
   async putBlob(content: string | Uint8Array): Promise<string> {
-    const data = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-    const blob: Blob = { type: "blob", data: Buffer.from(data).toString("base64"), encoding: "base64" };
-    return this.store.put(blob);
+    const data = Buffer.from(typeof content === "string" ? Buffer.from(content, "utf8") : content);
+    if (data.length <= Repo.CHUNK_THRESHOLD) {
+      return this.store.put({ type: "blob", data: data.toString("base64"), encoding: "base64" } satisfies Blob);
+    }
+    const chunks: string[] = [];
+    for (let i = 0; i < data.length; i += Repo.CHUNK_SIZE) {
+      const part = data.subarray(i, i + Repo.CHUNK_SIZE);
+      chunks.push(await this.store.put({ type: "blob", data: part.toString("base64"), encoding: "base64" } satisfies Blob));
+    }
+    return this.store.put({ type: "blob", data: "", encoding: "base64", chunked: true, chunks } satisfies Blob);
   }
 
   async readBlob(oid: string): Promise<Buffer> {
     const blob = await this.store.get<Blob>(oid);
+    if (blob.chunked && blob.chunks) {
+      return Buffer.concat(await Promise.all(blob.chunks.map((c) => this.readBlob(c))));
+    }
     return Buffer.from(blob.data, "base64");
   }
 
