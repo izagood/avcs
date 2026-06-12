@@ -36,10 +36,13 @@ import type {
   Intent,
   IntentKind,
   Line,
+  Membership,
   Operation,
   OperationBody,
   OperationTarget,
   Policy,
+  Protection,
+  RoleName,
   ScopeRef,
   Session,
   View,
@@ -234,6 +237,7 @@ export class Repo {
     confidence?: number;
     line?: string;
     derivedFrom?: string;
+    signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const op: Operation = {
       type: "operation",
@@ -253,6 +257,7 @@ export class Repo {
       ...(args.line && args.line !== "main" ? { line: args.line } : {}),
       ...(args.derivedFrom ? { derivedFrom: args.derivedFrom } : {}),
     };
+    op.sig = this.#sign("operation", op as unknown as Record<string, unknown>, args.signWith);
     const oid = await this.store.put(op);
     // Maintain the entity index (Phase 9): key → op oids for fast history/blame.
     for (const key of keysOf({ ...op, oid })) await this.store.appendEntityIndex(key, oid);
@@ -524,6 +529,132 @@ export class Repo {
       line: targetLine,
       derivedFrom: sourceOpOid,
     });
+  }
+
+  // ── governance: membership, roles, protection, finalize (Phase 7) ──────────
+  static readonly ROLE_WEIGHT: Record<RoleName, number> = {
+    reader: 0,
+    proposer: 1,
+    reviewer: 2,
+    maintainer: 3,
+    admin: 4,
+  };
+
+  /** Issue a root-signed membership granting a role; registers the member's key. */
+  async registerMembership(args: {
+    actorId: string;
+    publicKey: string;
+    role: RoleName;
+    actorKind?: "human" | "ai_agent" | "ci_bot";
+    scopes?: ScopeRef[];
+    root: { keyId: string; privateKey: string };
+  }): Promise<string> {
+    const m: Membership = {
+      type: "membership",
+      actorId: args.actorId,
+      publicKey: args.publicKey,
+      role: args.role,
+      scopes: args.scopes,
+      issuedBy: args.root.keyId,
+      createdAt: new Date().toISOString(),
+    };
+    m.sig = this.#sign("membership", m as unknown as Record<string, unknown>, args.root);
+    const oid = await this.store.put(m);
+    await this.store.setRef(`member:${args.actorId}`, oid);
+    await this.registerPublicKey({ keyId: args.actorId, publicKey: args.publicKey, actorId: args.actorId, actorKind: args.actorKind ?? "ai_agent" });
+    return oid;
+  }
+
+  async membershipOf(actorId: string): Promise<Membership | null> {
+    const oid = await this.store.getRef(`member:${actorId}`);
+    if (!oid) return null;
+    const m = await this.store.get<Membership>(oid);
+    return m.revokedAt ? null : m;
+  }
+  async roleOf(actorId: string): Promise<RoleName> {
+    return (await this.membershipOf(actorId))?.role ?? "reader";
+  }
+  async hasRole(actorId: string, min: RoleName): Promise<boolean> {
+    return Repo.ROLE_WEIGHT[await this.roleOf(actorId)] >= Repo.ROLE_WEIGHT[min];
+  }
+
+  async setProtection(p: Omit<Protection, "type" | "createdAt">): Promise<string> {
+    const protection: Protection = { type: "protection", ...p, createdAt: new Date().toISOString() };
+    const oid = await this.store.put(protection);
+    await this.store.setRef(`protection:${p.view}`, oid);
+    return oid;
+  }
+  async getProtection(view: string): Promise<Protection | null> {
+    const oid = await this.store.getRef(`protection:${view}`);
+    return oid ? this.store.get<Protection>(oid) : null;
+  }
+
+  /** Current protected head (a checkpoint oid) of a view, or null if never finalized. */
+  async protectedHead(view: string): Promise<string | null> {
+    return this.store.getRef(`head:${view}`);
+  }
+
+  /**
+   * Finalize (= PR merge): advance a view's protected head to `newCheckpoint` via a
+   * compare-and-swap on `parentHead`. Rejects a stale (non-fast-forward) finalize
+   * even for admins unless allowForcePush — this is the causal-currency guard (docs/08
+   * §6/§9): authority never licenses overwriting fresher history.
+   */
+  async finalize(args: {
+    view: string;
+    newCheckpoint: string;
+    parentHead: string | null;
+    by: string; // actor id
+  }): Promise<{ finalized: true; head: string } | { finalized: false; reason: string }> {
+    return this.store.withLock(`finalize:${args.view}`, async () => {
+      const prot = await this.getProtection(args.view);
+      const current = await this.protectedHead(args.view);
+      // CAS / non-fast-forward check
+      if (current !== args.parentHead && !(prot?.allowForcePush)) {
+        return { finalized: false as const, reason: `head moved: ${current ?? "∅"} ≠ parent ${args.parentHead ?? "∅"} — pull and re-reduce first` };
+      }
+      // role gate
+      const minRole = prot?.finalizeRole ?? "maintainer";
+      if (prot && !(await this.hasRole(args.by, minRole))) {
+        return { finalized: false as const, reason: `${args.by} lacks role ${minRole} to finalize ${args.view}` };
+      }
+      // required checks
+      const cp = await this.store.get<Checkpoint>(args.newCheckpoint);
+      for (const k of prot?.requiredChecks ?? []) {
+        if (cp.evidence[k] !== "pass") return { finalized: false as const, reason: `required check ${k} not pass` };
+      }
+      await this.store.setRef(`head:${args.view}`, args.newCheckpoint);
+      return { finalized: true as const, head: args.newCheckpoint };
+    });
+  }
+
+  // ── sync: object gossip between two stores (Phase 7) ───────────────────────
+  /**
+   * Pull objects from another repo's store into this one. Objects are append-only and
+   * content-addressed, so sync is a conflict-free union of whatever the other side has
+   * that we lack. `gate` (optional) lets a hub reject ops not signed by a known member.
+   * Returns counts. Refs (governance) are NOT synced — those are hub-authoritative.
+   */
+  async pull(otherDir: string, opts: { requireSignedMembers?: boolean } = {}): Promise<{ copied: number; rejected: number }> {
+    const other = new ObjectStore(otherDir);
+    let copied = 0;
+    let rejected = 0;
+    for await (const obj of other.list()) {
+      const oid = obj.oid as string;
+      if (await this.store.has(oid)) continue;
+      if (opts.requireSignedMembers && obj.type === "operation") {
+        const op = obj as Operation;
+        const ok = this.keyring.verifyFor(op.actor.id, oid, op.sig) && (await this.hasRole(op.actor.id, "proposer"));
+        if (!ok) {
+          rejected++;
+          continue;
+        }
+      }
+      await this.store.put(obj as never);
+      if (obj.type === "operation") for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
+      copied++;
+    }
+    return { copied, rejected };
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
