@@ -160,6 +160,16 @@ export class ObjectStore {
     if (!existsSync(p)) return null;
     return (await readFile(p, "utf8")).trim();
   }
+  /** All named refs as name → oid (for hub governance distribution). */
+  async listRefs(): Promise<Map<string, string>> {
+    const dir = join(this.root, "refs");
+    if (!existsSync(dir)) return new Map();
+    const out = new Map<string, string>();
+    for (const name of await readdir(dir)) {
+      out.set(name, (await readFile(join(dir, name), "utf8")).trim());
+    }
+    return out;
+  }
   async setHead(viewName: string): Promise<void> {
     await this.#writeAtomic(join(this.root, "HEAD"), viewName);
   }
