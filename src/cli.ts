@@ -149,6 +149,27 @@ async function main(): Promise<void> {
       console.log(h ? `${view}: ${h}` : `${view}: (not finalized)`);
       break;
     }
+    case "checkout": {
+      const repo = await Repo.open(cwd);
+      const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
+      const written = await repo.checkoutInto(cwd, view);
+      console.log(`checked out ${written.length} file(s) from ${view}`);
+      break;
+    }
+    case "commit": {
+      const repo = await Repo.open(cwd);
+      const message = flag("-m") ?? flag("--message");
+      if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>]");
+      const author = flag("--author") ?? "human:cli";
+      const line = flag("--line");
+      const r = await repo.commitWorkingTree(cwd, { message, actor: { kind: "human", id: author }, ...(line ? { line } : {}) });
+      if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
+      for (const p of r.added) console.log(`  A ${p}`);
+      for (const p of r.modified) console.log(`  M ${p}`);
+      for (const p of r.removed) console.log(`  D ${p}`);
+      console.log(`committed ${r.ops.length} change(s) as "${message}"`);
+      break;
+    }
     case "lines": {
       const repo = await Repo.open(cwd);
       const lines = await repo.listLines();
@@ -218,6 +239,8 @@ async function main(): Promise<void> {
           "  init [dir]                  create a repo\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
+          "  checkout [view]             write the view's files into the working dir\n" +
+          "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
           "  clone <hub-url> [dir]       create a repo from a hub\n" +
           "  push <hub-url>              push objects to a hub\n" +
