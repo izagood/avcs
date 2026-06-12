@@ -72,6 +72,13 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "lines": {
+      const repo = await Repo.open(cwd);
+      const lines = await repo.listLines();
+      console.log("main  (root)");
+      for (const l of lines) console.log(`${l.name}  ← forked from ${l.baseLine} @ ${l.forkCheckpointOid?.slice(0, 16)}`);
+      break;
+    }
     case "log": {
       const store = new ObjectStore(cwd);
       const ops = await store.collect<Operation>("operation");
@@ -134,6 +141,7 @@ async function main(): Promise<void> {
           "  init [dir]                  create a repo\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
+          "  lines                       list lineage lines (Phase 8)\n" +
           "  log                         operation history\n" +
           "  materialize [view] [--out d]  project the code tree\n" +
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +
