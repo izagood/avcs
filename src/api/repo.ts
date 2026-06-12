@@ -240,6 +240,9 @@ export class Repo {
     confidence?: number;
     line?: string;
     derivedFrom?: string;
+    revertOf?: string;
+    coAuthors?: Actor[];
+    private?: boolean;
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const op: Operation = {
@@ -259,6 +262,9 @@ export class Repo {
       // their oids stay byte-identical — backward compatibility with "main".
       ...(args.line && args.line !== "main" ? { line: args.line } : {}),
       ...(args.derivedFrom ? { derivedFrom: args.derivedFrom } : {}),
+      ...(args.revertOf ? { revertOf: args.revertOf } : {}),
+      ...(args.coAuthors && args.coAuthors.length ? { coAuthors: args.coAuthors } : {}),
+      ...(args.private ? { private: true } : {}),
     };
     op.sig = this.#sign("operation", op as unknown as Record<string, unknown>, args.signWith);
     const oid = await this.store.put(op);
@@ -719,6 +725,8 @@ export class Repo {
     for await (const obj of other.list()) {
       const oid = obj.oid as string;
       if (await this.store.has(oid)) continue;
+      // Stash: private ops are local-only — never gossiped (Phase 7 follow-up).
+      if (obj.type === "operation" && (obj as Operation).private) continue;
       if (opts.requireSignedMembers && obj.type === "operation") {
         const op = obj as Operation;
         const ok = this.keyring.verifyFor(op.actor.id, oid, op.sig) && (await this.hasRole(op.actor.id, "proposer"));
@@ -807,6 +815,36 @@ export class Repo {
     }
     const p: Promotion = { type: "promotion", ops: opOids, by: byActor, reason, createdAt: new Date().toISOString() };
     return this.store.put(p);
+  }
+
+  /**
+   * Revert an op: a forward-only inverse. Restores the op's file to its pre-op content
+   * (or deletes it if it didn't exist before) as a NEW op with `revertOf` provenance —
+   * append-only, recorded, itself revertable. File-granular in the MVP.
+   */
+  async revert(opOid: string, actor: Actor, line = "main"): Promise<string> {
+    const target = await this.store.get<Operation>(opOid);
+    const path = target.body.path ?? (target.target.entityId.split("#")[0] as string);
+    const before = await this.materializeAt(target.causalDeps);
+    const prev = (await this.materializedFiles(before)).find((f) => f.path === path);
+    const causalDeps = await this.lineFrontier(line);
+    const common = {
+      sessionOid: target.sessionOid,
+      intentOid: target.intentOid,
+      actor,
+      declaredPurpose: `revert ${opOid.slice(0, 16)}: ${target.declaredPurpose}`,
+      causalDeps,
+      line,
+      revertOf: opOid,
+    } as const;
+    if (prev === undefined) {
+      return this.proposeOperation({ ...common, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path } });
+    }
+    return this.proposeOperation({
+      ...common,
+      target: { entityKind: "file", entityId: path },
+      body: { kind: "put_file", path, blobOid: await this.putBlob(prev.content) },
+    });
   }
 
   /**
@@ -1079,6 +1117,8 @@ export class Repo {
       signedBy?: string[];
       signWith?: { keyId: string; privateKey: string };
       summary?: string;
+      version?: string;
+      supportStatus?: "supported" | "maintenance" | "eol";
     } = {},
   ): Promise<{ released: true; releaseOid: string } | { released: false; reason: string }> {
     const result = await this.materialize(viewName);
@@ -1102,11 +1142,14 @@ export class Repo {
       evidence: checkpoint.evidence,
       signedBy: opts.signedBy ?? (opts.signWith ? [opts.signWith.keyId] : []),
       status: "released",
+      ...(opts.version ? { version: opts.version } : {}),
+      ...(opts.supportStatus ? { supportStatus: opts.supportStatus } : {}),
       createdAt: new Date().toISOString(),
     };
     release.sig = this.#sign("release", release as unknown as Record<string, unknown>, opts.signWith);
     const oid = await this.store.put(release);
     await this.store.setRef(`release:${viewName}:latest`, oid);
+    if (opts.version) await this.store.setRef(`release:${viewName}:${opts.version}`, oid);
     return { released: true, releaseOid: oid };
   }
 }
