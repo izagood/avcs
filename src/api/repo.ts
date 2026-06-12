@@ -571,4 +571,57 @@ export class Repo {
     await this.store.setRef(`checkpoint:${viewName}:latest`, oid);
     return oid;
   }
+
+  /** Resolve the materialized tree into {path, content} entries. */
+  async materializedFiles(result: ReductionResult): Promise<{ path: string; content: string }[]> {
+    const out: { path: string; content: string }[] = [];
+    for (const [path, blobOid] of result.tree) {
+      const synth = result.synthBlobs.get(blobOid);
+      out.push({ path, content: synth ?? (await this.readBlob(blobOid)).toString("utf8") });
+    }
+    return out;
+  }
+
+  /**
+   * Phase 6: cut a Release — a verified checkpoint + its evidence + an SBOM of what
+   * shipped + signed-off artifacts. Refuses unless the view is conflict-free (no open
+   * conflicts and no semantic contract breaks): you cannot release an unverified tree.
+   */
+  async cutRelease(
+    viewName: string,
+    opts: {
+      artifacts?: import("../objects/types.ts").ArtifactRef[];
+      signedBy?: string[];
+      signWith?: { keyId: string; privateKey: string };
+      summary?: string;
+    } = {},
+  ): Promise<{ released: true; releaseOid: string } | { released: false; reason: string }> {
+    const result = await this.materialize(viewName);
+    if (result.conflicts.length || result.semanticConflicts.length) {
+      return {
+        released: false,
+        reason: `view has ${result.conflicts.length} open conflict(s) and ${result.semanticConflicts.length} contract break(s); resolve them before releasing`,
+      };
+    }
+    const checkpointOid = await this.createCheckpoint(viewName, opts.summary ?? `release of ${viewName}`);
+    const checkpoint = await this.store.get<Checkpoint>(checkpointOid);
+    const { generateSbom } = await import("../release/sbom.ts");
+    const sbom = generateSbom(await this.materializedFiles(result));
+
+    const release: import("../objects/types.ts").Release = {
+      type: "release",
+      checkpointOid,
+      treeHash: result.treeHash,
+      sbom,
+      artifacts: opts.artifacts ?? [],
+      evidence: checkpoint.evidence,
+      signedBy: opts.signedBy ?? (opts.signWith ? [opts.signWith.keyId] : []),
+      status: "released",
+      createdAt: new Date().toISOString(),
+    };
+    release.sig = this.#sign("release", release as unknown as Record<string, unknown>, opts.signWith);
+    const oid = await this.store.put(release);
+    await this.store.setRef(`release:${viewName}:latest`, oid);
+    return { released: true, releaseOid: oid };
+  }
 }
