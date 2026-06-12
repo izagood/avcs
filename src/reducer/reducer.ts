@@ -100,6 +100,8 @@ export interface ReduceInput {
   blobContent?: Map<string, string>;
   /** actorId → bounded reliability nudge (Phase 5 trust learning). */
   reliability?: Map<string, number>;
+  /** deciderId → role weight; resolves contradictory decisions by authority (docs/08 §4). */
+  authority?: Map<string, number>;
 }
 
 // Status precedence when an op belongs to several contended keys (rename touches
@@ -177,14 +179,29 @@ function intentSatisfied(op: Operation, intents: Map<string, Intent>): boolean {
   return true;
 }
 
-/** opOid → human verdict, with later (canonical) decisions superseding earlier ones. */
-function verdictMap(decisions: Decision[]): Map<string, "accept" | "reject"> {
-  const m = new Map<string, "accept" | "reject">();
+/**
+ * opOid → human verdict. Contradictory decisions are resolved by AUTHORITY first
+ * (docs/08 §4: a higher-authority decider wins), then canonical recency, then accept
+ * over reject within the same decision. `authority` maps decider id → role weight;
+ * absent ⇒ all weight 0, i.e. pure canonical-recency (the prior behavior).
+ */
+function verdictMap(
+  decisions: Decision[],
+  authority?: Map<string, number>,
+): Map<string, "accept" | "reject"> {
+  type Key = [number, string, number]; // [authorityWeight, createdAt, acceptBit]
+  const cmpKey = (a: Key, b: Key) => a[0] - b[0] || cmp(a[1], b[1]) || a[2] - b[2];
+  const best = new Map<string, { v: "accept" | "reject"; key: Key }>();
+  const consider = (oid: string, v: "accept" | "reject", key: Key) => {
+    const cur = best.get(oid);
+    if (!cur || cmpKey(key, cur.key) > 0) best.set(oid, { v, key });
+  };
   for (const d of decisions) {
-    for (const oid of d.rejectedOps) m.set(oid, "reject");
-    for (const oid of d.chosenOps) m.set(oid, "accept");
+    const w = authority?.get(d.decidedBy.id) ?? 0;
+    for (const oid of d.rejectedOps) consider(oid, "reject", [w, d.createdAt, 0]);
+    for (const oid of d.chosenOps) consider(oid, "accept", [w, d.createdAt, 1]);
   }
-  return m;
+  return new Map([...best].map(([oid, x]) => [oid, x.v]));
 }
 
 export function conflictIdFor(key: string): string {
@@ -205,7 +222,7 @@ export function reduce(input: ReduceInput): ReductionResult {
   for (const o of ops) statuses.set(o.oid as string, "proposed");
 
   const anc = ancestry(ops);
-  const verdicts = verdictMap(decisions);
+  const verdicts = verdictMap(decisions, input.authority);
   const evByOp = new Map<string, Evidence[]>();
   for (const e of evidence)
     for (const opId of e.forOps) (evByOp.get(opId) ?? evByOp.set(opId, []).get(opId)!).push(e);

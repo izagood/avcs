@@ -605,6 +605,30 @@ export class Repo {
     return Repo.ROLE_WEIGHT[await this.roleOf(actorId)] >= Repo.ROLE_WEIGHT[min];
   }
 
+  /** deciderId → role weight, for authority-weighted decision precedence (docs/08 §4). */
+  async #authorityMap(): Promise<Map<string, number>> {
+    const m = new Map<string, number>();
+    for (const mem of await this.store.collect<Membership>("membership")) {
+      if (mem.revokedAt) continue;
+      m.set(mem.actorId, Repo.ROLE_WEIGHT[mem.role]);
+    }
+    return m;
+  }
+
+  /** Revoke a membership (admin only): future ops/decisions by this actor lose trust. */
+  async revokeMembership(actorId: string, byAdmin: string): Promise<void> {
+    if (!(await this.hasRole(byAdmin, "admin"))) {
+      throw new Error(`revoke requires role admin; ${byAdmin} is ${await this.roleOf(byAdmin)}`);
+    }
+    const m = await this.membershipOf(actorId);
+    if (!m) return;
+    const revoked: Membership = { ...m, revokedAt: new Date().toISOString() };
+    delete (revoked as { oid?: string }).oid;
+    revoked.sig = undefined;
+    const oid = await this.store.put(revoked);
+    await this.store.setRef(`member:${actorId}`, oid);
+  }
+
   async setProtection(p: Omit<Protection, "type" | "createdAt">): Promise<string> {
     const protection: Protection = { type: "protection", ...p, createdAt: new Date().toISOString() };
     const oid = await this.store.put(protection);
@@ -911,6 +935,8 @@ export class Repo {
         evidence.map((e) => e.oid).sort().join(","),
         decisions.map((d) => d.oid).sort().join(","),
         redactions.map((r) => r.oid).sort().join(","),
+        // memberships affect authority-weighted decisions → invalidate on change
+        (await this.store.collect<Membership>("membership")).map((m) => m.oid).sort().join(","),
         (await this.store.getRef("policy")) ?? "default",
         MATERIALIZER_VERSION,
         (includeStatuses ?? []).join("+"),
@@ -945,7 +971,8 @@ export class Repo {
 
     const policy = await this.policy();
     const reliability = computeReliability(ops, evidence, decisions);
-    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability };
+    const authority = await this.#authorityMap();
+    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability, authority };
     const pass1 = reduce(base);
 
     // Phase 4: semantic-conflict pass. Find contract breaks that the text-clean
