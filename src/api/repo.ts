@@ -757,6 +757,17 @@ export class Repo {
     return { copied, rejected };
   }
 
+  /** Push objects this repo holds that a network hub lacks (M2 / docs/10 WS-B). */
+  async pushHub(hubUrl: string): Promise<{ pushed: number }> {
+    const { pushToHub } = await import("../hub/hubClient.ts");
+    return pushToHub(this.dir, hubUrl);
+  }
+  /** Pull objects a network hub holds that this repo lacks. */
+  async pullHub(hubUrl: string): Promise<{ pulled: number }> {
+    const { pullFromHub } = await import("../hub/hubClient.ts");
+    return pullFromHub(this.dir, hubUrl);
+  }
+
   /** Resolve a view's query into the candidate operation set, then reduce. */
   async materialize(viewName = "main"): Promise<ReductionResult> {
     const view = await this.getView(viewName);
