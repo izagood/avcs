@@ -101,9 +101,45 @@ async function main(): Promise<void> {
     case "pull": {
       const repo = await Repo.open(cwd);
       const from = args[1];
-      if (!from) throw new Error("usage: avcs pull <other-repo-dir>");
-      const r = await repo.pull(from);
-      console.log(`pulled ${r.copied} object(s)${r.rejected ? `, rejected ${r.rejected}` : ""}`);
+      if (!from) throw new Error("usage: avcs pull <hub-url | other-repo-dir>");
+      if (/^https?:\/\//.test(from)) {
+        const r = await repo.pullHub(from);
+        console.log(`pulled ${r.pulled} object(s) from hub ${from}`);
+      } else {
+        const r = await repo.pull(from);
+        console.log(`pulled ${r.copied} object(s)${r.rejected ? `, rejected ${r.rejected}` : ""}`);
+      }
+      break;
+    }
+    case "push": {
+      const repo = await Repo.open(cwd);
+      const url = args[1];
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs push <hub-url>");
+      const r = await repo.pushHub(url);
+      console.log(`pushed ${r.pushed} object(s) to ${url}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
+      break;
+    }
+    case "clone": {
+      const url = args[1];
+      const dir = args[2] ?? cwd;
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir]");
+      const repo = await Repo.init(dir);
+      const r = await repo.pullHub(url);
+      console.log(`cloned ${r.pulled} object(s) from ${url} into ${dir}`);
+      break;
+    }
+    case "serve": {
+      const { startHub } = await import("./hub/hubServer.ts");
+      const dir = args[1] && !args[1].startsWith("--") ? args[1] : cwd;
+      const port = Number(flag("--port") ?? 0);
+      const gated = args.includes("--gated");
+      const hub = await startHub({ repoDir: dir, port, gated });
+      console.log(`avcs hub serving ${dir} at ${hub.url}${gated ? " (gated: member-signed ops only)" : ""}`);
+      console.log("press Ctrl-C to stop");
+      const stop = async () => { await hub.close(); process.exit(0); };
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+      await new Promise(() => {}); // run until signalled
       break;
     }
     case "head": {
@@ -182,7 +218,10 @@ async function main(): Promise<void> {
           "  init [dir]                  create a repo\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
-          "  pull <dir>                  sync objects from another repo (Phase 7)\n" +
+          "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
+          "  clone <hub-url> [dir]       create a repo from a hub\n" +
+          "  push <hub-url>              push objects to a hub\n" +
+          "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +
           "  head [view]                 show the protected head\n" +
           "  lines                       list lineage lines (Phase 8)\n" +
           "  blame <entityKey> [--line l] who owns an entity and why\n" +
