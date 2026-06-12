@@ -26,7 +26,9 @@ export type ObjectType =
   | "policy"
   | "lease"
   | "release"
-  | "line";
+  | "line"
+  | "membership"
+  | "protection";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -351,6 +353,35 @@ export interface Line extends BaseObject {
   createdAt: string;
 }
 
+// ── governance (Phase 7) ──────────────────────────────────────────────────────
+export type RoleName = "reader" | "proposer" | "reviewer" | "maintainer" | "admin";
+
+/** Root-signed membership: federates trust and grants a role. See docs/08. */
+export interface Membership extends BaseObject {
+  type: "membership";
+  actorId: string;
+  publicKey: string;
+  role: RoleName;
+  scopes?: ScopeRef[]; // empty ⇒ org-wide; else a scoped maintainer/reviewer
+  issuedBy: string; // root keyId
+  createdAt: string;
+  revokedAt?: string;
+}
+
+/** Branch-protection-equivalent rule on a protected view. */
+export interface Protection extends BaseObject {
+  type: "protection";
+  view: string;
+  requiredApprovals: number;
+  requireOwnerApproval: boolean;
+  requiredChecks: EvidenceKind[];
+  finalizeRole: "maintainer" | "admin";
+  requireSignedOps: boolean;
+  requireUpToDate: boolean; // reject stale (non-fast-forward) finalize
+  allowForcePush: boolean; // even admins can't roll the head back unless true
+  createdAt: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -363,4 +394,6 @@ export type AnyObject =
   | Policy
   | WorkLease
   | Release
-  | Line;
+  | Line
+  | Membership
+  | Protection;

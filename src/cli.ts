@@ -92,6 +92,21 @@ async function main(): Promise<void> {
       if (!d.added.length && !d.removed.length && !d.modified.length) console.log("(no differences)");
       break;
     }
+    case "pull": {
+      const repo = await Repo.open(cwd);
+      const from = args[1];
+      if (!from) throw new Error("usage: avcs pull <other-repo-dir>");
+      const r = await repo.pull(from);
+      console.log(`pulled ${r.copied} object(s)${r.rejected ? `, rejected ${r.rejected}` : ""}`);
+      break;
+    }
+    case "head": {
+      const repo = await Repo.open(cwd);
+      const view = args[1] ?? "main";
+      const h = await repo.protectedHead(view);
+      console.log(h ? `${view}: ${h}` : `${view}: (not finalized)`);
+      break;
+    }
     case "lines": {
       const repo = await Repo.open(cwd);
       const lines = await repo.listLines();
@@ -161,6 +176,8 @@ async function main(): Promise<void> {
           "  init [dir]                  create a repo\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
+          "  pull <dir>                  sync objects from another repo (Phase 7)\n" +
+          "  head [view]                 show the protected head\n" +
           "  lines                       list lineage lines (Phase 8)\n" +
           "  blame <entityKey> [--line l] who owns an entity and why\n" +
           "  diff <viewA> <viewB>        added/removed/modified paths\n" +
