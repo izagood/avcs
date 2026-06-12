@@ -72,6 +72,26 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "blame": {
+      const repo = await Repo.open(cwd);
+      const key = args[1];
+      if (!key) throw new Error("usage: avcs blame <file:path | symbol:path#name>");
+      const b = await repo.blame(key, flag("--line") ?? "main");
+      if (!b) console.log("no owner (entity not present)");
+      else console.log(`${b.actor.id}  ${b.op.slice(0, 16)}\n  why: ${b.purpose}${b.intentTitle ? `  [intent: ${b.intentTitle}]` : ""}\n  at:  ${b.at}`);
+      break;
+    }
+    case "diff": {
+      const repo = await Repo.open(cwd);
+      const a = args[1] ?? "main";
+      const b = args[2] ?? "main";
+      const d = await repo.diff(a, b);
+      for (const p of d.added) console.log(`+ ${p}`);
+      for (const p of d.removed) console.log(`- ${p}`);
+      for (const p of d.modified) console.log(`~ ${p}`);
+      if (!d.added.length && !d.removed.length && !d.modified.length) console.log("(no differences)");
+      break;
+    }
     case "lines": {
       const repo = await Repo.open(cwd);
       const lines = await repo.listLines();
@@ -142,6 +162,8 @@ async function main(): Promise<void> {
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
           "  lines                       list lineage lines (Phase 8)\n" +
+          "  blame <entityKey> [--line l] who owns an entity and why\n" +
+          "  diff <viewA> <viewB>        added/removed/modified paths\n" +
           "  log                         operation history\n" +
           "  materialize [view] [--out d]  project the code tree\n" +
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +

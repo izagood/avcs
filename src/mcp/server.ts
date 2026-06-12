@@ -308,6 +308,25 @@ const TOOLS: ToolDef[] = [
     handler: (repo, i) => repo.repairContext(i.ops as string[]),
   },
   {
+    name: "avcs.blame",
+    description: "Who currently owns an entity (file:<path> or symbol:<path>#<name>) and WHY — the accepted head op with actor, intent title, and purpose. Stronger than git blame.",
+    inputSchema: { type: "object", properties: { entityKey: { type: "string" }, line: { type: "string" } }, required: ["entityKey"] },
+    handler: (repo, i) => repo.blame(String(i.entityKey), (i.line as string) ?? "main"),
+  },
+  {
+    name: "avcs.history",
+    description: "History of one entity in causal order (the ops that touched a file/symbol, each with actor/intent/purpose). O(ops-on-entity) via the entity index.",
+    inputSchema: { type: "object", properties: { entityKey: { type: "string" } }, required: ["entityKey"] },
+    handler: async (repo, i) =>
+      (await repo.historyOf(String(i.entityKey))).map((o) => ({ op: o.oid, actor: o.actor.id, purpose: o.declaredPurpose, at: o.createdAt, line: o.line ?? "main" })),
+  },
+  {
+    name: "avcs.diff",
+    description: "Diff two views/lines: added/removed/modified paths.",
+    inputSchema: { type: "object", properties: { viewA: { type: "string" }, viewB: { type: "string" } }, required: ["viewA", "viewB"] },
+    handler: (repo, i) => repo.diff(String(i.viewA), String(i.viewB)),
+  },
+  {
     name: "avcs.release.cut",
     description: "Cut a Release: a verified (conflict-free) checkpoint + its evidence + an SBOM of what shipped + artifact references. Refuses if the view has open or semantic conflicts.",
     inputSchema: {

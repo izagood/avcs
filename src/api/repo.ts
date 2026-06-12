@@ -634,6 +634,91 @@ export class Repo {
     return ops.sort((a, b) => a.lamport - b.lamport || ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1));
   }
 
+  // ── observability (Phase 10) ────────────────────────────────────────────
+  /**
+   * Blame: who currently owns an entity and WHY — the accepted head op on its key,
+   * with actor + intent + purpose. Stronger than git blame: the 'why' is first-class.
+   */
+  async blame(
+    entityKey: string,
+    line = "main",
+  ): Promise<{ op: string; actor: Actor; purpose: string; intentTitle?: string; at: string } | null> {
+    const res = await this.materialize(line);
+    const hist = await this.historyOf(entityKey);
+    const owner = [...hist].reverse().find((o) => res.statuses.get(o.oid as string) === "accepted");
+    if (!owner) return null;
+    const intent = await this.readIntent(owner.intentOid).catch(() => null);
+    return {
+      op: owner.oid as string,
+      actor: owner.actor,
+      purpose: owner.declaredPurpose,
+      ...(intent ? { intentTitle: intent.title } : {}),
+      at: owner.createdAt,
+    };
+  }
+
+  /** `log -p` for one entity: each op with its before/after content reconstructed. */
+  async logP(entityKey: string, filePath: string): Promise<{ op: string; purpose: string; before: string; after: string }[]> {
+    const hist = await this.historyOf(entityKey);
+    const out: { op: string; purpose: string; before: string; after: string }[] = [];
+    const fileOf = async (heads: string[]) =>
+      (await this.materializedFiles(await this.materializeAt(heads))).find((f) => f.path === filePath)?.content ?? "";
+    for (const o of hist) {
+      out.push({
+        op: o.oid as string,
+        purpose: o.declaredPurpose,
+        before: await fileOf(o.causalDeps),
+        after: await fileOf([o.oid as string]),
+      });
+    }
+    return out;
+  }
+
+  /** Diff two views (or, with materializeAt, two frontiers). */
+  async diff(viewA: string, viewB: string): Promise<import("../query/diff.ts").TreeDiff> {
+    const { diffTrees } = await import("../query/diff.ts");
+    return diffTrees(await this.materialize(viewA), await this.materialize(viewB));
+  }
+
+  /**
+   * Bisect: find the first operation (between a known-good and known-bad frontier)
+   * that makes `isBad` true. Deterministic — re-reduces at each step with no checkout.
+   */
+  async bisect(
+    goodHeads: string[],
+    badHeads: string[],
+    isBad: (res: ReductionResult) => boolean | Promise<boolean>,
+  ): Promise<string | null> {
+    const allOps = await this.store.collect<Operation>("operation");
+    const byId = new Map(allOps.map((o) => [o.oid as string, o]));
+    const closure = (heads: string[]) => {
+      const seen = new Set<string>();
+      const stack = [...heads];
+      while (stack.length) {
+        const id = stack.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const d of byId.get(id)?.causalDeps ?? []) if (!seen.has(d)) stack.push(d);
+      }
+      return seen;
+    };
+    const good = closure(goodHeads);
+    const between = [...closure(badHeads)]
+      .filter((id) => !good.has(id))
+      .map((id) => byId.get(id)!)
+      .sort((a, b) => a.lamport - b.lamport || ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1));
+    // smallest k in [0..n] such that good ∪ first-k-between is bad
+    let lo = 0;
+    let hi = between.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const heads = [...goodHeads, ...between.slice(0, mid).map((o) => o.oid as string)];
+      if (await isBad(await this.materializeAt(heads))) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo > 0 && lo <= between.length ? (between[lo - 1]!.oid as string) : null;
+  }
+
   /**
    * Decision memory: given a conflict key, recall prior human rulings on the same
    * key — their verdict, reason, and any distilled `futurePolicy`. The next agent
