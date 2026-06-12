@@ -12,7 +12,8 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid } from "../core/canonical.ts";
-import { reduce, type ReductionResult } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, type ReductionResult } from "../reducer/reducer.ts";
+import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { defaultPolicy, MATERIALIZER_VERSION } from "../reducer/policy.ts";
 import {
   Keyring,
@@ -432,15 +433,56 @@ export class Repo {
       if (oid && !blobContent.has(oid)) blobContent.set(oid, (await this.readBlob(oid)).toString("utf8"));
     }
 
-    return reduce({
-      ops,
-      evidence,
-      decisions,
-      intents,
-      policy: await this.policy(),
-      materializeStatuses: q.includeStatuses,
-      blobContent,
-    });
+    const policy = await this.policy();
+    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: q.includeStatuses, blobContent };
+    const pass1 = reduce(base);
+
+    // Phase 4: semantic-conflict pass. Find contract breaks that the text-clean
+    // grouping accepted, then re-reduce with the breaking ops held back so the tree
+    // stays safe and the break becomes a human decision.
+    const semantic = detectSemanticConflicts(ops, pass1, evidence, blobContent);
+    if (semantic.length === 0) return pass1;
+
+    const breaking = new Set(semantic.map((s) => s.breakingOp));
+    const pass2 = reduce({ ...base, ops: ops.filter((o) => !breaking.has(o.oid as string)) });
+    for (const s of semantic) {
+      pass2.statuses.set(s.breakingOp, "needs_decision");
+      for (const d of s.dependentOps) pass2.statuses.set(d, pass2.statuses.get(d) ?? "needs_decision");
+    }
+    pass2.semanticConflicts = semantic;
+    for (const s of semantic) {
+      pass2.conflicts.push({
+        id: `conflict_sem_${(s.symbol.split("#")[1] ?? s.symbol).slice(0, 16)}`,
+        key: `contract:${s.symbol}`,
+        kind: "needs_human",
+        reason: s.reason,
+        recommendedOp: null,
+        options: [s.breakingOp, ...s.dependentOps].map((oid) => ({
+          opOid: oid, actor: "", purpose: oid === s.breakingOp ? "contract change" : "depends on old contract",
+          evidence: [], score: 0, blocked: false, requiresHuman: true,
+        })),
+      });
+    }
+    return pass2;
+  }
+
+  /**
+   * Decision memory: given a conflict key, recall prior human rulings on the same
+   * key — their verdict, reason, and any distilled `futurePolicy`. The next agent
+   * (and the conflict UI) can reuse them instead of re-litigating.
+   */
+  async recallDecisions(conflictKey: string): Promise<{ reason: string; futurePolicy?: string; decidedBy: string }[]> {
+    const cid = conflictIdFor(conflictKey);
+    const decisions = await this.store.collect<Decision>("decision");
+    return decisions
+      .filter((d) => d.conflictId === cid || d.conflictId === conflictKey)
+      .map((d) => ({ reason: d.reason, futurePolicy: d.futurePolicy, decidedBy: d.decidedBy.id }));
+  }
+
+  /** All distilled `futurePolicy` rules a human has left behind — learned constraints. */
+  async learnedPolicies(): Promise<string[]> {
+    const decisions = await this.store.collect<Decision>("decision");
+    return [...new Set(decisions.map((d) => d.futurePolicy).filter((p): p is string => !!p))];
   }
 
   /**

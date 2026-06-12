@@ -42,6 +42,19 @@ export interface Conflict {
   reason: string;
 }
 
+/**
+ * A merge that is text-clean but meaning-broken: one op changed a public contract
+ * while another depends on the old one. Detected (and escalated) by the repo's
+ * semantic pass, not the core grouping.
+ */
+export interface SemanticConflict {
+  kind: "contract_break";
+  symbol: string; // "<file>#<name>"
+  breakingOp: string;
+  dependentOps: string[];
+  reason: string;
+}
+
 /** A contest the policy resolved by itself — recorded so auto-merges are auditable. */
 export interface AutoDecision {
   key: string;
@@ -59,6 +72,8 @@ export interface ReductionResult {
   statuses: Map<string, OperationStatus>;
   conflicts: Conflict[];
   autoDecisions: AutoDecision[];
+  /** Text-clean but meaning-broken merges, escalated by the repo's semantic pass. */
+  semanticConflicts: SemanticConflict[];
   /** Frontier op ids: accepted ops that no other accepted op descends from. */
   headOps: string[];
   /**
@@ -238,7 +253,7 @@ export function reduce(input: ReduceInput): ReductionResult {
     return true;
   });
 
-  return { tree, treeHash, statuses, conflicts, autoDecisions, headOps, synthBlobs };
+  return { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
 }
 
 function decideGroup(
