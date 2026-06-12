@@ -379,6 +379,35 @@ export class Repo {
     });
   }
 
+  /**
+   * M3 AST op: move a top-level symbol from one file to another. Contends on the
+   * symbol at both source and destination. Cross-file references are a follow-up.
+   */
+  async proposeMoveSymbol(args: {
+    sessionOid: string;
+    intentOid: string;
+    actor: Actor;
+    fromPath: string;
+    toPath: string;
+    symbolName: string;
+    declaredPurpose: string;
+    causalDeps?: string[];
+    line?: string;
+    signWith?: { keyId: string; privateKey: string };
+  }): Promise<string> {
+    return this.proposeOperation({
+      sessionOid: args.sessionOid,
+      intentOid: args.intentOid,
+      actor: args.actor,
+      target: { entityKind: "symbol", entityId: `${args.fromPath}#${args.symbolName}` },
+      body: { kind: "move_symbol", fromPath: args.fromPath, path: args.toPath, symbolName: args.symbolName },
+      declaredPurpose: args.declaredPurpose,
+      causalDeps: args.causalDeps,
+      line: args.line,
+      signWith: args.signWith,
+    });
+  }
+
   async attachEvidence(args: {
     forOps: string[];
     kind: EvidenceKind;

@@ -308,6 +308,12 @@ const TOOLS: ToolDef[] = [
     handler: (repo, i) => repo.repairContext(i.ops as string[]),
   },
   {
+    name: "avcs.metrics",
+    description: "In-process metrics snapshot for this server (reduce cache hit/miss, reduce.ms timing, materialize.calls).",
+    inputSchema: { type: "object", properties: {} },
+    handler: async (repo) => repo.metrics.snapshot(),
+  },
+  {
     name: "avcs.blame",
     description: "Who currently owns an entity (file:<path> or symbol:<path>#<name>) and WHY — the accepted head op with actor, intent title, and purpose. Stronger than git blame.",
     inputSchema: { type: "object", properties: { entityKey: { type: "string" }, line: { type: "string" } }, required: ["entityKey"] },
@@ -377,10 +383,13 @@ async function main(): Promise<void> {
     tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
   }));
 
+  // Reuse one Repo instance across tool calls so the reduce cache and metrics persist
+  // for the life of the server (the long-lived agent-facing process M1's cache targets).
+  let repo: Repo | null = null;
   server.setRequestHandler(typesMod.CallToolRequestSchema, async (req) => {
     const tool = TOOLS.find((t) => t.name === req.params.name);
     if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
-    const repo = await Repo.open(REPO_DIR);
+    if (!repo) repo = await Repo.open(REPO_DIR);
     const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   });
