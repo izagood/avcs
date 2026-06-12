@@ -11,7 +11,14 @@
 //   5. verified by evidence          (require_evidence gating + bonus)
 //   6. actor trust level             (actorTrust ladder)
 //   7. smaller blast radius          (advisory)
-//   8. recency (Lamport)             (final tie-break, never decisive on its own)
+//   8. recency (Lamport)             (final tie-break — applied in the reducer's
+//                                     ranking comparator, NOT added to the score;
+//                                     adding it lets time overwhelm the ladder)
+//
+// Evidence trust: an operation's own author cannot vouch for it. require_evidence
+// gates and the passing-test bonus only count evidence produced by a non-authoring
+// trusted actor (ci_bot / human). Self-reported ai_agent evidence is ignored until
+// signing lands (Phase 3). See docs/04-policy.md.
 
 import type {
   Actor,
@@ -101,6 +108,13 @@ export function evaluateOp(
     notes: [],
   };
 
+  // Only evidence the operation's own author did NOT produce can vouch for it.
+  const trusted = evidenceForOp.filter(
+    (e) => e.producedBy.kind !== "ai_agent" || e.producedBy.id !== op.actor.id,
+  );
+  const ignored = evidenceForOp.length - trusted.length;
+  if (ignored > 0) ev.notes.push(`${ignored} self-reported evidence ignored`);
+
   // Base signals.
   if (intentConstraintsSatisfied) {
     ev.score += 200;
@@ -109,12 +123,10 @@ export function evaluateOp(
     ev.notes.push("violates intent constraints");
   }
   // A passing test is worth more than self-reported confidence.
-  if (evidenceForOp.some((e) => e.result === "pass" && e.kind.endsWith("test"))) {
+  if (trusted.some((e) => e.result === "pass" && e.kind.endsWith("test"))) {
     ev.score += 150;
     ev.notes.push("has passing tests");
   }
-  // Smaller blast radius, advisory.
-  if (op.body.kind === "put_file") ev.score += 0;
 
   for (const rule of policy.rules) {
     if (!ruleMatches(rule, op, inConflict)) continue;
@@ -125,12 +137,10 @@ export function evaluateOp(
         ev.notes.push(`rule ${rule.name}: requires human decision`);
         break;
       case "require_evidence": {
-        const ok = evidenceForOp.some(
-          (x) => x.kind === e.evidence && x.result === e.result,
-        );
+        const ok = trusted.some((x) => x.kind === e.evidence && x.result === e.result);
         if (!ok) {
           ev.blocked = true;
-          ev.blockedReason = `rule ${rule.name}: missing ${e.evidence}=${e.result}`;
+          ev.blockedReason = `rule ${rule.name}: missing trusted ${e.evidence}=${e.result}`;
           ev.notes.push(ev.blockedReason);
         }
         break;
@@ -147,7 +157,7 @@ export function evaluateOp(
     }
   }
 
-  // Final, never-decisive-alone tie-break.
-  ev.score += op.lamport;
+  // NOTE: lamport is deliberately NOT added here. Recency is a tie-break only,
+  // applied by the reducer when scores are equal.
   return ev;
 }

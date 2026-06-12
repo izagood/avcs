@@ -5,9 +5,10 @@
 //   state = reduce(base, operationDAG, decisions, policy, materializer)
 //
 // a pure, deterministic function. Same objects + same policy + same materializer
-// on any replica ⇒ identical tree. This file implements the MVP (file-granular)
-// reducer; the algorithm is structured so the Phase-2 AST upgrade only swaps the
-// `conflictKey` derivation and the `applyOp` tree mutation.
+// on any replica ⇒ identical tree. Determinism does NOT depend on the order the
+// caller passes objects in: reduce canonically sorts its inputs first (this is the
+// fix for the filesystem-readdir-order bug). The algorithm is structured so the
+// Phase-2 AST upgrade only swaps `keysOf` (the unit of contention) and `applyOp`.
 
 import { sha256hex, canonicalize } from "../core/canonical.ts";
 import type {
@@ -18,7 +19,7 @@ import type {
   OperationStatus,
   Policy,
 } from "../objects/types.ts";
-import { evaluateOp } from "./policy.ts";
+import { evaluateOp, type OpEvaluation } from "./policy.ts";
 
 export interface ConflictOption {
   opOid: string;
@@ -31,13 +32,23 @@ export interface ConflictOption {
 }
 
 export interface Conflict {
-  id: string; // deterministic
+  id: string; // deterministic, stable under head-set changes (keyed on contended entity)
   key: string; // contended entity, e.g. "file:src/a.ts"
   kind: "concurrent_write" | "needs_human";
   options: ConflictOption[];
-  /** Policy's provisional recommendation (never applied if requiresHuman). */
+  /** Policy's provisional recommendation (never set when a human is required). */
   recommendedOp: string | null;
   reason: string;
+}
+
+/** A contest the policy resolved by itself — recorded so auto-merges are auditable. */
+export interface AutoDecision {
+  key: string;
+  conflictId: string;
+  chosenOp: string;
+  rejectedOps: string[];
+  reason: string;
+  policyVersion: string;
 }
 
 export interface ReductionResult {
@@ -46,7 +57,8 @@ export interface ReductionResult {
   treeHash: string;
   statuses: Map<string, OperationStatus>;
   conflicts: Conflict[];
-  /** Frontier op ids (latest accepted op per key). */
+  autoDecisions: AutoDecision[];
+  /** Frontier op ids: accepted ops that no other accepted op descends from. */
   headOps: string[];
 }
 
@@ -56,16 +68,45 @@ export interface ReduceInput {
   decisions: Decision[];
   intents: Map<string, Intent>;
   policy: Policy;
+  /** Which statuses get projected into the tree. Default: accepted only. */
+  materializeStatuses?: OperationStatus[];
 }
 
-function conflictKey(op: Operation): string {
-  // MVP: the file path is the unit of contention. The destination path for writes,
-  // the source path for deletes/renames so a delete contends with a concurrent edit.
-  const p = op.body.path ?? op.body.fromPath ?? op.target.entityId;
-  return `${op.target.entityKind}:${p}`;
+// Status precedence when an op belongs to several contended keys (rename touches
+// two). The strictest verdict across its groups wins.
+const PRECEDENCE: Record<string, number> = {
+  proposed: 0,
+  accepted: 1,
+  superseded: 2,
+  needs_decision: 3,
+  rejected: 4,
+  validating: 0,
+  quarantined: 4,
+};
+function stricter(a: OperationStatus, b: OperationStatus): OperationStatus {
+  return (PRECEDENCE[a] ?? 0) >= (PRECEDENCE[b] ?? 0) ? a : b;
 }
 
-/** Transitive causal-ancestor set for every op (over causalDeps restricted to the candidate set). */
+/**
+ * The contended keys an op occupies. A rename reads its source and writes its
+ * destination, so it contends on BOTH — otherwise a concurrent write to either
+ * path would slip through unmerged. note ops contend on nothing.
+ */
+function keysOf(op: Operation): string[] {
+  const k = (p: string) => `${op.target.entityKind}:${p}`;
+  switch (op.body.kind) {
+    case "put_file":
+      return [k(op.body.path ?? op.target.entityId)];
+    case "delete_file":
+      return [k(op.body.path ?? op.target.entityId)];
+    case "rename_file":
+      return [k(op.body.fromPath ?? op.target.entityId), k(op.body.path ?? op.target.entityId)];
+    case "note":
+      return [];
+  }
+}
+
+/** Transitive causal-ancestor set for every op (over causalDeps within the set). */
 function ancestry(ops: Operation[]): Map<string, Set<string>> {
   const byId = new Map(ops.map((o) => [o.oid as string, o]));
   const memo = new Map<string, Set<string>>();
@@ -73,7 +114,7 @@ function ancestry(ops: Operation[]): Map<string, Set<string>> {
     const cached = memo.get(id);
     if (cached) return cached;
     const set = new Set<string>();
-    memo.set(id, set); // guard against cycles (shouldn't happen in an append-only DAG)
+    memo.set(id, set); // cycle guard (shouldn't happen in an append-only DAG)
     const op = byId.get(id);
     if (op) {
       for (const dep of op.causalDeps) {
@@ -88,190 +129,209 @@ function ancestry(ops: Operation[]): Map<string, Set<string>> {
   return memo;
 }
 
-/** Does the op's declared effect respect its intent's constraints? MVP heuristic. */
+/** Does the op's declared effect respect its intent's constraints? */
 function intentSatisfied(op: Operation, intents: Map<string, Intent>): boolean {
   const intent = intents.get(op.intentOid);
   if (!intent) return true;
-  const constraints = intent.constraints.join(" ").toLowerCase();
+  // Structured constraints take precedence; NL constraints are a fallback heuristic.
+  if (intent.constraintKinds?.includes("forbid_public_api_break") && op.effects?.breaksPublicApi)
+    return false;
+  const nl = intent.constraints.join(" ").toLowerCase();
   const forbidsApiBreak =
-    constraints.includes("api") &&
-    (constraints.includes("금지") ||
-      constraints.includes("유지") ||
-      constraints.includes("no break") ||
-      constraints.includes("unchanged"));
+    nl.includes("api") &&
+    (nl.includes("금지") || nl.includes("유지") || nl.includes("no break") || nl.includes("unchanged"));
   if (forbidsApiBreak && op.effects?.breaksPublicApi) return false;
   return true;
 }
 
+/** opOid → human verdict, with later (canonical) decisions superseding earlier ones. */
+function verdictMap(decisions: Decision[]): Map<string, "accept" | "reject"> {
+  const m = new Map<string, "accept" | "reject">();
+  for (const d of decisions) {
+    for (const oid of d.rejectedOps) m.set(oid, "reject");
+    for (const oid of d.chosenOps) m.set(oid, "accept");
+  }
+  return m;
+}
+
+export function conflictIdFor(key: string): string {
+  // Stable under head-set churn: keyed only on the contended entity.
+  return `conflict_${sha256hex(key).slice(0, 24)}`;
+}
+
 export function reduce(input: ReduceInput): ReductionResult {
-  const { ops, evidence, decisions, intents, policy } = input;
+  const { intents, policy } = input;
+  const materializeStatuses = new Set(input.materializeStatuses ?? ["accepted"]);
+
+  // ── Canonical input ordering (determinism independent of caller order). ──
+  const ops = [...input.ops].sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid));
+  const decisions = [...input.decisions].sort((a, b) => cmp(a.createdAt, b.createdAt) || cmp(a.oid, b.oid));
+  const evidence = [...input.evidence].sort((a, b) => cmp(a.createdAt, b.createdAt) || cmp(a.oid, b.oid));
+
   const statuses = new Map<string, OperationStatus>();
   for (const o of ops) statuses.set(o.oid as string, "proposed");
 
   const anc = ancestry(ops);
+  const verdicts = verdictMap(decisions);
   const evByOp = new Map<string, Evidence[]>();
   for (const e of evidence)
-    for (const opId of e.forOps) {
-      const arr = evByOp.get(opId) ?? [];
-      arr.push(e);
-      evByOp.set(opId, arr);
-    }
+    for (const opId of e.forOps) (evByOp.get(opId) ?? evByOp.set(opId, []).get(opId)!).push(e);
 
-  // Group by contended key.
+  // Group ops by every key they contend on (note ops get a private singleton group).
   const groups = new Map<string, Operation[]>();
   for (const o of ops) {
-    const k = conflictKey(o);
-    const arr = groups.get(k) ?? [];
-    arr.push(o);
-    groups.set(k, arr);
+    const keys = keysOf(o);
+    const ks = keys.length ? keys : [`op:${o.oid}`];
+    for (const k of ks) (groups.get(k) ?? groups.set(k, []).get(k)!).push(o);
   }
 
-  const accepted: Operation[] = [];
   const conflicts: Conflict[] = [];
+  const autoDecisions: AutoDecision[] = [];
+  const evalCache = new Map<string, OpEvaluation>();
+  const evalOf = (op: Operation, inConflict: boolean): OpEvaluation => {
+    const cacheKey = `${op.oid}|${inConflict}`;
+    let e = evalCache.get(cacheKey);
+    if (!e) {
+      e = evaluateOp(policy, op, evByOp.get(op.oid as string) ?? [], inConflict, intentSatisfied(op, intents));
+      evalCache.set(cacheKey, e);
+    }
+    return e;
+  };
 
+  // Decide each group locally; aggregate the strictest verdict per op.
   for (const [key, groupOps] of groups) {
-    // Frontier: ops in this group that are not an ancestor of any other group op.
-    const inGroup = new Set(groupOps.map((o) => o.oid as string));
-    const heads = groupOps.filter((o) => {
-      for (const other of groupOps) {
-        if (other === o) continue;
-        if (anc.get(other.oid as string)?.has(o.oid as string)) return false;
-      }
-      return true;
-    });
-    // Non-head ops in this key are superseded by their descendants.
-    for (const o of groupOps)
-      if (!heads.includes(o)) statuses.set(o.oid as string, "superseded");
-    void inGroup;
-
-    const inConflict = heads.length > 1;
-    const evals = new Map(
-      heads.map((o) => [
-        o.oid as string,
-        evaluateOp(
-          policy,
-          o,
-          evByOp.get(o.oid as string) ?? [],
-          inConflict,
-          intentSatisfied(o, intents),
-        ),
-      ]),
-    );
-
-    if (!inConflict) {
-      const [op] = heads as [Operation];
-      const ev = evals.get(op.oid as string)!;
-      const verdict = decisionVerdict(op, decisions);
-      if (ev.blocked || verdict === "reject") {
-        statuses.set(op.oid as string, "rejected");
-      } else if (ev.requiresHuman && verdict === undefined) {
-        statuses.set(op.oid as string, "needs_decision");
-        conflicts.push(makeConflict(key, "needs_human", [op], evals, op, ev.notes.join("; ")));
-      } else {
-        // accepted: either clean, or a human explicitly accepted a human-gated op
-        statuses.set(op.oid as string, "accepted");
-        accepted.push(op);
-      }
-      continue;
-    }
-
-    // Contended key — try an explicit decision first.
-    const decision = decisions.find((d) => d.conflictId === conflictIdFor(key, heads));
-    if (decision) {
-      for (const o of heads) {
-        if (decision.chosenOps.includes(o.oid as string)) {
-          statuses.set(o.oid as string, "accepted");
-          accepted.push(o);
-        } else {
-          statuses.set(o.oid as string, "rejected");
-        }
-      }
-      continue;
-    }
-
-    // No decision: policy reduction.
-    const viable = heads.filter((o) => !evals.get(o.oid as string)!.blocked);
-    for (const o of heads)
-      if (!viable.includes(o)) statuses.set(o.oid as string, "rejected");
-
-    const needsHuman = viable.some((o) => evals.get(o.oid as string)!.requiresHuman);
-    const ranked = [...viable].sort(
-      (a, b) =>
-        evals.get(b.oid as string)!.score - evals.get(a.oid as string)!.score ||
-        (a.oid! < b.oid! ? -1 : 1),
-    );
-    const top = ranked[0];
-    const topScore = top ? evals.get(top.oid as string)!.score : -Infinity;
-    const tie = ranked.filter((o) => evals.get(o.oid as string)!.score === topScore).length > 1;
-
-    if (!top || needsHuman || tie) {
-      // Cannot auto-resolve: surface to the human queue, materialize nothing for the key.
-      for (const o of viable) statuses.set(o.oid as string, "needs_decision");
-      conflicts.push(
-        makeConflict(
-          key,
-          needsHuman ? "needs_human" : "concurrent_write",
-          viable,
-          evals,
-          top ?? null,
-          needsHuman ? "requires human decision per policy" : tie ? "score tie" : "no viable op",
-        ),
-      );
-      continue;
-    }
-
-    // Policy auto-decision.
-    statuses.set(top.oid as string, "accepted");
-    accepted.push(top);
-    for (const o of viable) if (o !== top) statuses.set(o.oid as string, "rejected");
+    const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, conflicts, autoDecisions);
+    for (const [oid, st] of local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
   }
 
-  // Materialize: apply accepted ops in causal then Lamport then oid order.
-  const ordered = topoOrder(accepted, anc);
+  // A note op is never grouped on an entity; promote any that stayed "proposed".
+  for (const o of ops)
+    if (keysOf(o).length === 0 && statuses.get(o.oid as string) === "proposed")
+      statuses.set(o.oid as string, "accepted");
+
+  // ── Materialize. ──
+  const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
+  const ordered = kahnOrder(projected, anc);
   const tree = new Map<string, string>();
   for (const op of ordered) applyOp(tree, op);
-
   const treeHash = sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
-  return {
-    tree,
-    treeHash,
-    statuses,
-    conflicts,
-    headOps: accepted.map((o) => o.oid as string),
-  };
+
+  // Frontier: accepted ops not an ancestor of another accepted op.
+  const acceptedIds = new Set(ops.filter((o) => statuses.get(o.oid as string) === "accepted").map((o) => o.oid as string));
+  const headOps = [...acceptedIds].filter((id) => {
+    for (const other of acceptedIds) if (other !== id && anc.get(other)?.has(id)) return false;
+    return true;
+  });
+
+  return { tree, treeHash, statuses, conflicts, autoDecisions, headOps };
 }
 
-function decisionVerdict(op: Operation, decisions: Decision[]): "accept" | "reject" | undefined {
-  for (const d of decisions) {
-    if (d.chosenOps.includes(op.oid as string)) return "accept";
-    if (d.rejectedOps.includes(op.oid as string)) return "reject";
+function decideGroup(
+  key: string,
+  groupOps: Operation[],
+  anc: Map<string, Set<string>>,
+  verdicts: Map<string, "accept" | "reject">,
+  evalOf: (op: Operation, inConflict: boolean) => OpEvaluation,
+  policy: Policy,
+  conflicts: Conflict[],
+  autoDecisions: AutoDecision[],
+): Map<string, OperationStatus> {
+  const out = new Map<string, OperationStatus>();
+  // Frontier of this group: ops not an ancestor of another group member.
+  const heads = groupOps.filter((o) => {
+    for (const other of groupOps) if (other !== o && anc.get(other.oid as string)?.has(o.oid as string)) return false;
+    return true;
+  });
+  for (const o of groupOps) if (!heads.includes(o)) out.set(o.oid as string, "superseded");
+
+  // 1) Honor explicit human decisions first (H1) — globally, regardless of grouping.
+  const forcedAccept = heads.filter((o) => verdicts.get(o.oid as string) === "accept");
+  const forcedReject = heads.filter((o) => verdicts.get(o.oid as string) === "reject");
+  for (const o of forcedReject) out.set(o.oid as string, "rejected");
+  if (forcedAccept.length) {
+    for (const o of forcedAccept) out.set(o.oid as string, "accepted");
+    for (const o of heads) if (!forcedAccept.includes(o)) out.set(o.oid as string, "rejected");
+    return out;
   }
-  return undefined;
-}
 
-export function conflictIdFor(key: string, ops: Operation[]): string {
-  const ids = ops.map((o) => o.oid as string).sort();
-  return `conflict_${sha256hex(`${key} ${ids.join(",")}`).slice(0, 24)}`;
+  const remaining = heads.filter((o) => !forcedReject.includes(o));
+  if (remaining.length === 0) return out;
+
+  const inConflict = remaining.length > 1;
+
+  // 2) Single uncontended head.
+  if (remaining.length === 1) {
+    const op = remaining[0]!;
+    const ev = evalOf(op, false);
+    if (ev.blocked) out.set(op.oid as string, "rejected");
+    else if (ev.requiresHuman) {
+      out.set(op.oid as string, "needs_decision");
+      conflicts.push(makeConflict(key, "needs_human", [op], (o) => evalOf(o, false), null, ev.notes.join("; ")));
+    } else out.set(op.oid as string, "accepted");
+    return out;
+  }
+
+  // 3) Contended: policy reduction.
+  const blocked = remaining.filter((o) => evalOf(o, inConflict).blocked);
+  for (const o of blocked) out.set(o.oid as string, "rejected");
+  const viable = remaining.filter((o) => !blocked.includes(o));
+
+  const needsHuman = viable.some((o) => evalOf(o, inConflict).requiresHuman);
+  const ranked = [...viable].sort((a, b) => {
+    const d = evalOf(b, inConflict).score - evalOf(a, inConflict).score;
+    if (d !== 0) return d;
+    return a.lamport - b.lamport || cmp(a.oid, b.oid); // lamport is a tie-break only
+  });
+  const top = ranked[0];
+  const topScore = top ? evalOf(top, inConflict).score : -Infinity;
+  const tie = ranked.filter((o) => evalOf(o, inConflict).score === topScore).length > 1;
+
+  if (!top || needsHuman || tie) {
+    for (const o of viable) out.set(o.oid as string, "needs_decision");
+    conflicts.push(
+      makeConflict(
+        key,
+        needsHuman ? "needs_human" : "concurrent_write",
+        viable,
+        (o) => evalOf(o, inConflict),
+        needsHuman ? null : top ?? null,
+        needsHuman ? "requires human decision per policy" : tie ? "score tie — needs a human" : "no viable op",
+      ),
+    );
+    return out;
+  }
+
+  // Policy auto-decision — recorded so the merge is auditable (H4).
+  out.set(top.oid as string, "accepted");
+  const losers = viable.filter((o) => o !== top).map((o) => o.oid as string);
+  for (const id of losers) out.set(id, "rejected");
+  autoDecisions.push({
+    key,
+    conflictId: conflictIdFor(key),
+    chosenOp: top.oid as string,
+    rejectedOps: losers,
+    reason: evalOf(top, inConflict).notes.join("; ") || "highest policy score",
+    policyVersion: policy.version,
+  });
+  return out;
 }
 
 function makeConflict(
   key: string,
   kind: Conflict["kind"],
   ops: Operation[],
-  evals: Map<string, ReturnType<typeof evaluateOp>>,
+  evalOf: (op: Operation) => OpEvaluation,
   recommended: Operation | null,
   reason: string,
 ): Conflict {
   return {
-    id: conflictIdFor(key, ops),
+    id: conflictIdFor(key),
     key,
     kind,
     reason,
-    recommendedOp: recommended && !evals.get(recommended.oid as string)!.requiresHuman
-      ? (recommended.oid as string)
-      : null,
+    recommendedOp: recommended ? (recommended.oid as string) : null,
     options: ops.map((o) => {
-      const ev = evals.get(o.oid as string)!;
+      const ev = evalOf(o);
       return {
         opOid: o.oid as string,
         actor: o.actor.id,
@@ -285,14 +345,43 @@ function makeConflict(
   };
 }
 
-function topoOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[] {
-  return [...ops].sort((a, b) => {
-    const aId = a.oid as string;
-    const bId = b.oid as string;
-    if (anc.get(bId)?.has(aId)) return -1; // a is ancestor of b
-    if (anc.get(aId)?.has(bId)) return 1;
-    return a.lamport - b.lamport || (aId < bId ? -1 : 1);
-  });
+/** Deterministic topological sort (Kahn): ready set ordered by (lamport, oid). */
+function kahnOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[] {
+  const ids = new Set(ops.map((o) => o.oid as string));
+  const byId = new Map(ops.map((o) => [o.oid as string, o]));
+  const indeg = new Map<string, number>();
+  const edges = new Map<string, string[]>(); // dep → dependents
+  for (const o of ops) {
+    const deps = o.causalDeps.filter((d) => ids.has(d));
+    indeg.set(o.oid as string, deps.length);
+    for (const d of deps) (edges.get(d) ?? edges.set(d, []).get(d)!).push(o.oid as string);
+  }
+  const ready = ops
+    .filter((o) => (indeg.get(o.oid as string) ?? 0) === 0)
+    .sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid));
+  const order: Operation[] = [];
+  while (ready.length) {
+    const op = ready.shift()!;
+    order.push(op);
+    for (const dep of edges.get(op.oid as string) ?? []) {
+      const n = (indeg.get(dep) ?? 0) - 1;
+      indeg.set(dep, n);
+      if (n === 0) {
+        const o = byId.get(dep)!;
+        // insert keeping (lamport, oid) order
+        let i = ready.length;
+        while (i > 0 && (ready[i - 1]!.lamport > o.lamport || (ready[i - 1]!.lamport === o.lamport && cmp(ready[i - 1]!.oid, o.oid) > 0))) i--;
+        ready.splice(i, 0, o);
+      }
+    }
+  }
+  // Any leftover (cycle — shouldn't happen) appended deterministically.
+  if (order.length < ops.length) {
+    const seen = new Set(order.map((o) => o.oid));
+    for (const o of [...ops].sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid)))
+      if (!seen.has(o.oid)) order.push(o);
+  }
+  return order;
 }
 
 function applyOp(tree: Map<string, string>, op: Operation): void {
@@ -302,8 +391,7 @@ function applyOp(tree: Map<string, string>, op: Operation): void {
       if (b.path && b.blobOid) tree.set(b.path, b.blobOid);
       break;
     case "delete_file":
-      if (b.path) tree.delete(b.path);
-      else if (op.target.entityId) tree.delete(op.target.entityId);
+      tree.delete(b.path ?? op.target.entityId);
       break;
     case "rename_file":
       if (b.fromPath && b.path) {
@@ -317,4 +405,10 @@ function applyOp(tree: Map<string, string>, op: Operation): void {
     case "note":
       break;
   }
+}
+
+function cmp(a: string | undefined, b: string | undefined): number {
+  const x = a ?? "";
+  const y = b ?? "";
+  return x < y ? -1 : x > y ? 1 : 0;
 }
