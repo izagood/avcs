@@ -9,6 +9,7 @@
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { rm } from "node:fs/promises";
 import { Repo } from "./api/repo.ts";
 import type { Actor } from "./objects/types.ts";
 
@@ -25,6 +26,10 @@ function hr(title: string): void {
 }
 
 async function main(): Promise<void> {
+  // Start from a clean slate so the run is reproducible. (Object payloads carry
+  // createdAt timestamps, so re-authoring "the same" intent across runs yields new
+  // oids; without this, repeated runs would accumulate cross-run operations.)
+  await rm(repoDir, { recursive: true, force: true });
   const repo = await Repo.init(repoDir);
 
   hr("Intent: UserService에 Redis cache 추가 (public API 유지 제약)");

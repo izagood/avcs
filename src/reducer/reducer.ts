@@ -161,12 +161,14 @@ export function reduce(input: ReduceInput): ReductionResult {
     if (!inConflict) {
       const [op] = heads as [Operation];
       const ev = evals.get(op.oid as string)!;
-      if (ev.blocked) {
+      const verdict = decisionVerdict(op, decisions);
+      if (ev.blocked || verdict === "reject") {
         statuses.set(op.oid as string, "rejected");
-      } else if (ev.requiresHuman && !resolvedByDecision(op, decisions)) {
+      } else if (ev.requiresHuman && verdict === undefined) {
         statuses.set(op.oid as string, "needs_decision");
         conflicts.push(makeConflict(key, "needs_human", [op], evals, op, ev.notes.join("; ")));
       } else {
+        // accepted: either clean, or a human explicitly accepted a human-gated op
         statuses.set(op.oid as string, "accepted");
         accepted.push(op);
       }
@@ -239,10 +241,12 @@ export function reduce(input: ReduceInput): ReductionResult {
   };
 }
 
-function resolvedByDecision(op: Operation, decisions: Decision[]): boolean {
-  return decisions.some(
-    (d) => d.chosenOps.includes(op.oid as string) || d.rejectedOps.includes(op.oid as string),
-  );
+function decisionVerdict(op: Operation, decisions: Decision[]): "accept" | "reject" | undefined {
+  for (const d of decisions) {
+    if (d.chosenOps.includes(op.oid as string)) return "accept";
+    if (d.rejectedOps.includes(op.oid as string)) return "reject";
+  }
+  return undefined;
 }
 
 export function conflictIdFor(key: string, ops: Operation[]): string {
