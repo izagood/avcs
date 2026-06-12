@@ -29,7 +29,9 @@ export type ObjectType =
   | "line"
   | "membership"
   | "protection"
-  | "promotion";
+  | "promotion"
+  | "redaction"
+  | "override";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -62,6 +64,9 @@ export interface Blob extends BaseObject {
   /** Base64 of the raw bytes. (MVP keeps it simple; large blobs get chunked later.) */
   data: string;
   encoding: "base64";
+  /** Phase 12: set once a Redaction evicted the original bytes (oid preserved). */
+  redacted?: boolean;
+  redactionOid?: string;
 }
 
 // ── intent ──────────────────────────────────────────────────────────────────
@@ -401,6 +406,34 @@ export interface Promotion extends BaseObject {
   createdAt: string;
 }
 
+// ── security (Phase 12) ───────────────────────────────────────────────────────
+/**
+ * Admin-signed tombstone that evicts a blob's bytes (e.g. a leaked secret) while
+ * preserving its oid — so the Merkle DAG, causalDeps, and treeHash references stay
+ * valid and verifiable, but the plaintext is gone from every replica. GitHub's
+ * secret-purge/BFG analog for an append-only, content-addressed store.
+ */
+export interface Redaction extends BaseObject {
+  type: "redaction";
+  blobOid: string;
+  sha256: string; // of the original bytes (provenance; the bytes themselves are gone)
+  length: number;
+  reason: string;
+  by: string; // actor id (role admin)
+  createdAt: string;
+}
+
+/** Break-glass: a signed, EXPIRING waiver of specific required checks for a view. */
+export interface Override extends BaseObject {
+  type: "override";
+  view: string;
+  waiveChecks: EvidenceKind[];
+  reason: string;
+  by: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -416,4 +449,6 @@ export type AnyObject =
   | Line
   | Membership
   | Protection
-  | Promotion;
+  | Promotion
+  | Redaction
+  | Override;

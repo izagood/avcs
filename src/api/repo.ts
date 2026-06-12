@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
-import { computeOid } from "../core/canonical.ts";
+import { computeOid, sha256hex } from "../core/canonical.ts";
 import { reduce, conflictIdFor, keysOf, type ReductionResult } from "../reducer/reducer.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
@@ -40,9 +40,11 @@ import type {
   Operation,
   OperationBody,
   OperationTarget,
+  Override,
   Policy,
   Promotion,
   Protection,
+  Redaction,
   RoleName,
   ScopeRef,
   Session,
@@ -622,14 +624,85 @@ export class Repo {
       if (prot && !(await this.hasRole(args.by, minRole))) {
         return { finalized: false as const, reason: `${args.by} lacks role ${minRole} to finalize ${args.view}` };
       }
-      // required checks
+      // required checks — unless an active break-glass Override waives them (Phase 12)
       const cp = await this.store.get<Checkpoint>(args.newCheckpoint);
+      const waived = await this.#activeWaivers(args.view);
       for (const k of prot?.requiredChecks ?? []) {
-        if (cp.evidence[k] !== "pass") return { finalized: false as const, reason: `required check ${k} not pass` };
+        if (cp.evidence[k] !== "pass" && !waived.has(k)) {
+          return { finalized: false as const, reason: `required check ${k} not pass` };
+        }
       }
       await this.store.setRef(`head:${args.view}`, args.newCheckpoint);
       return { finalized: true as const, head: args.newCheckpoint };
     });
+  }
+
+  // ── security (Phase 12) ────────────────────────────────────────────────────
+  /**
+   * Redact (tombstone) a blob's bytes — for a leaked secret. Admin-only. The oid is
+   * preserved so all references and the treeHash stay valid; the plaintext is evicted
+   * from this store (and, once a real sync ships, propagated to every replica).
+   */
+  async redact(blobOid: string, reason: string, by: string): Promise<string> {
+    if (!(await this.hasRole(by, "admin"))) {
+      throw new Error(`redact requires role admin; ${by} is ${await this.roleOf(by)}`);
+    }
+    const blob = await this.store.get<Blob>(blobOid);
+    const original = Buffer.from(blob.data, "base64");
+    const redaction: Redaction = {
+      type: "redaction",
+      blobOid,
+      sha256: sha256hex(original),
+      length: original.length,
+      reason,
+      by,
+      createdAt: new Date().toISOString(),
+    };
+    const redactionOid = await this.store.put(redaction);
+    // Evict the bytes: overwrite the blob object in place with a stub (oid preserved).
+    const stub: Blob = {
+      type: "blob",
+      data: Buffer.from(`[REDACTED: ${reason}]`).toString("base64"),
+      encoding: "base64",
+      redacted: true,
+      redactionOid,
+    };
+    await this.store.overwriteAt(blobOid, stub);
+    return redactionOid;
+  }
+
+  async #activeWaivers(view: string): Promise<Set<EvidenceKind>> {
+    const now = new Date().toISOString();
+    const out = new Set<EvidenceKind>();
+    for (const o of await this.store.collect<Override>("override")) {
+      if (o.view === view && o.expiresAt > now) for (const k of o.waiveChecks) out.add(k);
+    }
+    return out;
+  }
+
+  /** Break-glass: a maintainer/admin grants an expiring waiver of required checks. */
+  async grantOverride(args: { view: string; waiveChecks: EvidenceKind[]; reason: string; by: string; ttlMs?: number }): Promise<string> {
+    if (!(await this.hasRole(args.by, "maintainer"))) {
+      throw new Error(`override requires role >= maintainer; ${args.by} is ${await this.roleOf(args.by)}`);
+    }
+    const o: Override = {
+      type: "override",
+      view: args.view,
+      waiveChecks: args.waiveChecks,
+      reason: args.reason,
+      by: args.by,
+      expiresAt: new Date(Date.now() + (args.ttlMs ?? 30 * 60_000)).toISOString(),
+      createdAt: new Date().toISOString(),
+    };
+    return this.store.put(o);
+  }
+
+  /**
+   * Rollback a protected head to an earlier checkpoint — FORWARD-only: it advances the
+   * head (a new finalize CAS) to point at a prior state, never rewriting history.
+   */
+  async rollbackTo(view: string, checkpointOid: string, by: string): Promise<{ finalized: true; head: string } | { finalized: false; reason: string }> {
+    return this.finalize({ view, newCheckpoint: checkpointOid, parentHead: await this.protectedHead(view), by });
   }
 
   // ── sync: object gossip between two stores (Phase 7) ───────────────────────
