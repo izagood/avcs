@@ -28,11 +28,12 @@ async function indexIfOperation(store: ObjectStore, obj: AnyObject, oid: string)
  * missing ones. Private (stash) ops are local-only and never gossiped — same rule as
  * Repo.pull. Returns how many objects were pushed.
  */
-export async function pushToHub(localRepoDir: string, hubUrl: string): Promise<{ pushed: number }> {
+export async function pushToHub(localRepoDir: string, hubUrl: string): Promise<{ pushed: number; rejected: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
   const have = await hubHave(base);
   let pushed = 0;
+  let rejected = 0;
   for await (const obj of store.list()) {
     const oid = obj.oid as string;
     if (have.has(oid)) continue;
@@ -42,10 +43,14 @@ export async function pushToHub(localRepoDir: string, hubUrl: string): Promise<{
       headers: { "content-type": "application/json" },
       body: JSON.stringify(obj),
     });
+    if (res.status === 403) {
+      rejected++; // gated hub refused an unauthorized op
+      continue;
+    }
     if (!res.ok) throw new Error(`POST /objects failed for ${oid}: ${res.status} ${res.statusText}`);
     pushed++;
   }
-  return { pushed };
+  return { pushed, rejected };
 }
 
 /**
@@ -67,6 +72,18 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
     await store.put(obj as never);
     await indexIfOperation(store, obj, oid);
     pulled++;
+  }
+
+  // Governance distribution: adopt the hub's authoritative governance refs (policy,
+  // membership, protection, protected heads). The objects they point to were just
+  // pulled above, so the refs resolve. Working refs (view:*/checkpoint:*) stay local.
+  const refsRes = await fetch(`${base}/refs`);
+  if (refsRes.ok) {
+    const { refs } = (await refsRes.json()) as { refs: Record<string, string> };
+    for (const [name, refOid] of Object.entries(refs)) {
+      if (!/^(policy$|member:|protection:|head:)/.test(name)) continue;
+      if (await store.has(refOid)) await store.setRef(name, refOid);
+    }
   }
   return { pulled };
 }

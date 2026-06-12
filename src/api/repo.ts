@@ -301,6 +301,7 @@ export class Repo {
     causalDeps?: string[];
     effects?: Operation["effects"];
     line?: string;
+    signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const blobOid = await this.putBlob(args.content);
     return this.proposeOperation({
@@ -313,6 +314,7 @@ export class Repo {
       causalDeps: args.causalDeps,
       effects: args.effects,
       line: args.line,
+      signWith: args.signWith,
     });
   }
 
@@ -332,6 +334,7 @@ export class Repo {
     causalDeps?: string[];
     effects?: Operation["effects"];
     line?: string;
+    signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
     return this.proposeOperation({
@@ -344,6 +347,7 @@ export class Repo {
       causalDeps: args.causalDeps,
       effects: args.effects,
       line: args.line,
+      signWith: args.signWith,
     });
   }
 
@@ -812,7 +816,7 @@ export class Repo {
   }
 
   /** Push objects this repo holds that a network hub lacks (M2 / docs/10 WS-B). */
-  async pushHub(hubUrl: string): Promise<{ pushed: number }> {
+  async pushHub(hubUrl: string): Promise<{ pushed: number; rejected: number }> {
     const { pushToHub } = await import("../hub/hubClient.ts");
     return pushToHub(this.dir, hubUrl);
   }
