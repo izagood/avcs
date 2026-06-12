@@ -92,6 +92,7 @@ AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 - [06 — MCP / Skill 인터페이스](docs/06-mcp-interface.md)
 - [07 — 로드맵](docs/07-roadmap.md)
 - [08 — 거버넌스 & 합의 (avcshub)](docs/08-governance.md)
+- [09 — Git/GitHub 사용 사례 커버리지 & 설계 진화](docs/09-usecase-coverage.md)
 
 ## 상태
 
