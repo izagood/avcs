@@ -25,7 +25,8 @@ export type ObjectType =
   | "view"
   | "policy"
   | "lease"
-  | "release";
+  | "release"
+  | "line";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -149,6 +150,15 @@ export interface Operation extends BaseObject {
   createdAt: string;
   /** Self-reported confidence; advisory, never authoritative. */
   confidence?: number;
+  /**
+   * Lineage (Phase 8). Which line this op was authored on; absent ⇒ "main". A line
+   * materializes only its own ops + everything inherited from its fork checkpoint, so
+   * two lines can hold intentionally different content on the same entity without
+   * contending. See docs/09 G1.
+   */
+  line?: string;
+  /** Provenance for a ported/backported/cherry-picked op: the source op's oid. */
+  derivedFrom?: string;
 }
 
 // Operation lifecycle status is *not* stored on the immutable op. It is derived
@@ -209,6 +219,8 @@ export interface ViewQuery {
   sessionOids?: string[];
   /** Hard-exclude specific ops. */
   excludeOps?: string[];
+  /** Lineage (Phase 8): which line to materialize. Absent ⇒ "main". */
+  line?: string;
 }
 
 export interface View extends BaseObject {
@@ -327,6 +339,18 @@ export interface Release extends BaseObject {
   createdAt: string;
 }
 
+// ── line (Phase 8) ────────────────────────────────────────────────────────────
+// A long-lived lineage (e.g. "v1.x") that forked from a base line at a checkpoint.
+// It inherits the base's history up to the fork (the checkpoint's frontier) and then
+// diverges: ops authored on the base AFTER the fork are not part of this line.
+export interface Line extends BaseObject {
+  type: "line";
+  name: string;
+  baseLine: string | null; // the line it forked from; null for the root ("main")
+  forkCheckpointOid: string | null; // base line's frozen frontier at fork time
+  createdAt: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -338,4 +362,5 @@ export type AnyObject =
   | Checkpoint
   | Policy
   | WorkLease
-  | Release;
+  | Release
+  | Line;
