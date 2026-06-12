@@ -101,6 +101,7 @@ const TOOLS: ToolDef[] = [
         content: { type: "string" },
         declaredPurpose: { type: "string" },
         causalDeps: { type: "array", items: { type: "string" } },
+        line: { type: "string", description: "lineage to author on; default 'main' (Phase 8)" },
         effects: {
           type: "object",
           properties: {
@@ -122,7 +123,34 @@ const TOOLS: ToolDef[] = [
         declaredPurpose: String(i.declaredPurpose),
         causalDeps: i.causalDeps as string[] | undefined,
         effects: i.effects as never,
+        line: i.line as string | undefined,
       }),
+  },
+  {
+    name: "avcs.line.create",
+    description: "Fork a long-lived line (e.g. 'v1.x') from another line at its current state. The new line inherits history up to the fork and then diverges — same entity can hold different content per line with no conflict (Phase 8).",
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string" }, fromLine: { type: "string" }, atCheckpointOid: { type: "string" } },
+      required: ["name"],
+    },
+    handler: (repo, i) => repo.createLine(String(i.name), (i.fromLine as string) ?? "main", i.atCheckpointOid as string | undefined),
+  },
+  {
+    name: "avcs.line.list",
+    description: "List the lineage lines in the repo (besides the implicit 'main').",
+    inputSchema: { type: "object", properties: {} },
+    handler: (repo) => repo.listLines(),
+  },
+  {
+    name: "avcs.operation.backport",
+    description: "Port (cherry-pick / backport) an operation onto another line: mints a new op on the target line carrying the source's change, with derivedFrom provenance. Does not affect the source line.",
+    inputSchema: {
+      type: "object",
+      properties: { sourceOpOid: { type: "string" }, targetLine: { type: "string" }, actor: actorSchema },
+      required: ["sourceOpOid", "targetLine"],
+    },
+    handler: (repo, i) => repo.portOp(String(i.sourceOpOid), String(i.targetLine), i.actor ? actorOf(i) : undefined),
   },
   {
     name: "avcs.evidence.attach",
