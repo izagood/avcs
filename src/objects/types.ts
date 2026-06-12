@@ -28,7 +28,8 @@ export type ObjectType =
   | "release"
   | "line"
   | "membership"
-  | "protection";
+  | "protection"
+  | "promotion";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -195,6 +196,12 @@ export interface Evidence extends BaseObject {
   detail?: string;
   producedBy: Actor;
   createdAt: string;
+  /**
+   * Phase 11: produced by a secret-less, network-isolated runner over untrusted code.
+   * Such evidence is NOT trusted for the policy gate (you must re-run in the trusted
+   * lane after promotion) — it's the pull_request_target hazard guard.
+   */
+  fromUntrustedRunner?: boolean;
 }
 
 // ── decision ────────────────────────────────────────────────────────────────
@@ -382,6 +389,18 @@ export interface Protection extends BaseObject {
   createdAt: string;
 }
 
+/**
+ * Phase 11: a reviewer's promotion of quarantined (outsider) ops into the normal
+ * accepted flow — the GitHub "maintainer accepts a fork PR" moment.
+ */
+export interface Promotion extends BaseObject {
+  type: "promotion";
+  ops: string[];
+  by: string; // actor id (role ≥ reviewer)
+  reason?: string;
+  createdAt: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -396,4 +415,5 @@ export type AnyObject =
   | Release
   | Line
   | Membership
-  | Protection;
+  | Protection
+  | Promotion;
