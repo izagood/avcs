@@ -167,6 +167,12 @@ export interface Operation extends BaseObject {
   line?: string;
   /** Provenance for a ported/backported/cherry-picked op: the source op's oid. */
   derivedFrom?: string;
+  /** The op this one reverts (forward-only inverse). */
+  revertOf?: string;
+  /** Additional authors (git Co-authored-by). The signing `actor` stays single. */
+  coAuthors?: Actor[];
+  /** Stash: kept local — excluded from gossip/pull until promoted to shared. */
+  private?: boolean;
 }
 
 // Operation lifecycle status is *not* stored on the immutable op. It is derived
@@ -350,6 +356,9 @@ export interface Release extends BaseObject {
   /** Actor ids that signed off on this release. */
   signedBy: string[];
   status: "draft" | "released";
+  /** Semantic version + support lifecycle (Phase 6 follow-up). */
+  version?: string;
+  supportStatus?: "supported" | "maintenance" | "eol";
   createdAt: string;
 }
 
