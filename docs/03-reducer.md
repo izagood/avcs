@@ -54,13 +54,17 @@ B: findById가 항상 User를 반환한다고 가정하고 호출부 추가
 ## Conflict 객체 (유도)
 
 ```ts
-{ id,                       // = conflict_ + sha256(key + 정렬된 opOids)[:24]
+{ id,                       // = conflict_ + sha256(key)[:24] — 충돌 entity로만 결정
   key, kind: "concurrent_write"|"needs_human",
   options: [{ opOid, actor, purpose, evidence[], score, blocked, requiresHuman }],
   recommendedOp,            // 정책 추천 (requiresHuman이면 null — 자동 적용 금지)
   reason }
 ```
-`id`가 결정론적이므로, 사람이 같은 충돌에 대해 내린 decision은 재-materialize 시 자동 매칭된다.
+`id`는 충돌 entity(key)로만 결정되므로 head 집합이 바뀌어도 **안정적**이다. 단, Decision은 conflictId가 아니라 **op oid 단위**(chosenOps/rejectedOps)로 적용된다 — 그래서 사람이 거부한 연산은 이후 같은 키에 새 동시 연산이 추가돼도 부활하지 않는다(회귀 대상 `H1`). 같은 충돌에 모순된 decision이 둘이면 **정규 순서상 나중 것이 이긴다**(C2).
+
+### 정책 자동 결정도 기록된다 (autoDecision)
+
+L2에서 정책이 패자를 조용히 reject하지 않는다. 모든 자동 결정은 `ReductionResult.autoDecisions`에 `{ key, chosenOp, rejectedOps, reason, policyVersion }`로 남아 감사 가능하다(`H4`). 사람의 Decision과 동일한 추적성을 정책 결정에도 부여한다.
 
 ## 사람이 보는 것
 

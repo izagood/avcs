@@ -20,13 +20,18 @@
 ```
 score  = actorTrust(actor)            // kind별 사다리 * 100
        ± 200  (intent 제약 만족/위반)
-       + 150  (통과 테스트 보유)
+       + 150  (신뢰된 통과 테스트 보유)
        + Σ rule effects
-       + lamport                       // 최후 tie-break
+       // lamport는 score에 더하지 않는다. 점수 동률일 때만 reducer의
+       // 정렬 비교 단계에서 tie-break으로 쓴다 (lamport → oid).
 ```
 출력: `{ blocked, requiresHuman, score, notes[] }`.
 - `blocked` → accepted 불가 (require_evidence 미충족)
 - `requiresHuman` → 자동 accept 불가 (require_human 매칭)
+
+> **lamport를 점수에 더하면 안 되는 이유** — lamport는 무한히 증가하므로, 저장소에 연산이 수백 개만 쌓여도 "나중에 쓴 AI"가 `human_wins_conflicts`(+500)를 넘어선다. 즉 원칙 1(last-write-wins 금지)이 조용히 무너진다. 그래서 recency는 *오직 점수 동률일 때만* 비교에 쓴다. (회귀 테스트 `C1`)
+
+> **증거 신뢰** — 연산의 작성자는 자기 변경을 보증할 수 없다. `require_evidence` 게이트와 통과-테스트 보너스는 **작성자가 아닌 신뢰 actor(ci_bot/human)**가 생산한 증거만 센다. 같은 ai_agent가 자기 연산에 붙인 증거는 무시된다(서명은 Phase 3). (회귀 테스트 `H2`)
 
 ## 기본 정책 (`defaultPolicy`)
 
