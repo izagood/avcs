@@ -20,7 +20,7 @@ import type {
   Policy,
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
-import { spliceSymbol, renameSymbol } from "../semantic/symbols.ts";
+import { spliceSymbol, renameSymbol, extractSymbol } from "../semantic/symbols.ts";
 import { ownersFor } from "../policy/owners.ts";
 
 export interface ConflictOption {
@@ -139,6 +139,9 @@ export function keysOf(op: Operation): string[] {
     case "rename_symbol":
       // Contends on both the old and new symbol names within the file.
       return [`symbol:${b.path}#${b.symbolName}`, `symbol:${b.path}#${b.newName}`];
+    case "move_symbol":
+      // Contends on the symbol at its source and its destination.
+      return [`symbol:${b.fromPath}#${b.symbolName}`, `symbol:${b.path}#${b.symbolName}`];
     case "note":
       return [];
   }
@@ -538,6 +541,22 @@ function applyOp(
       const synthOid = `blob_${sha256hex(renamed).slice(0, 32)}`;
       synthBlobs.set(synthOid, renamed);
       tree.set(b.path, synthOid);
+      break;
+    }
+    case "move_symbol": {
+      if (!b.fromPath || !b.path || !b.symbolName) break;
+      const fromOid = tree.get(b.fromPath);
+      if (fromOid === undefined) break;
+      const extracted = extractSymbol(resolve(fromOid), b.symbolName);
+      if (!extracted) break;
+      const toContent = tree.get(b.path) !== undefined ? resolve(tree.get(b.path)!) : "";
+      const newTo = spliceSymbol(toContent, b.symbolName, extracted.text);
+      const fromSynth = `blob_${sha256hex(extracted.rest).slice(0, 32)}`;
+      const toSynth = `blob_${sha256hex(newTo).slice(0, 32)}`;
+      synthBlobs.set(fromSynth, extracted.rest);
+      synthBlobs.set(toSynth, newTo);
+      tree.set(b.fromPath, fromSynth);
+      tree.set(b.path, toSynth);
       break;
     }
     case "note":
