@@ -24,7 +24,8 @@ export type ObjectType =
   | "checkpoint"
   | "view"
   | "policy"
-  | "lease";
+  | "lease"
+  | "release";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -289,6 +290,43 @@ export interface WorkLease extends BaseObject {
   releasedAt?: string;
 }
 
+// ── release (Phase 6) ─────────────────────────────────────────────────────────
+// A Release is not a name tag (git's lightweight tag). It is a *verified checkpoint*
+// + the evidence that verified it + the SBOM of what shipped + signed-off artifacts.
+// This makes "what is in production and why is it trustworthy" answerable.
+export interface SbomComponent {
+  type: "file" | "library";
+  name: string;
+  version?: string;
+  /** sha256 of the file content, for "file" components. */
+  hash?: string;
+}
+export interface Sbom {
+  bomFormat: "CycloneDX";
+  specVersion: string;
+  components: SbomComponent[];
+}
+/** A built artifact tied to this release (container image, bundle, firmware…). */
+export interface ArtifactRef {
+  type: string; // e.g. "container_image", "npm_tarball"
+  ref: string; // e.g. "registry/app:1.2.3"
+  digest?: string; // e.g. "sha256:…"
+}
+
+export interface Release extends BaseObject {
+  type: "release";
+  checkpointOid: string;
+  treeHash: string;
+  sbom: Sbom;
+  artifacts: ArtifactRef[];
+  /** Aggregated evidence of the verified checkpoint. */
+  evidence: Partial<Record<EvidenceKind, EvidenceResult>>;
+  /** Actor ids that signed off on this release. */
+  signedBy: string[];
+  status: "draft" | "released";
+  createdAt: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -299,4 +337,5 @@ export type AnyObject =
   | View
   | Checkpoint
   | Policy
-  | WorkLease;
+  | WorkLease
+  | Release;

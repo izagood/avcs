@@ -105,6 +105,22 @@ async function main(): Promise<void> {
       console.log(oid);
       break;
     }
+    case "release": {
+      const repo = await Repo.open(cwd);
+      const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
+      const res = await repo.cutRelease(view, { summary: flag("-m") ?? `release of ${view}` });
+      if (!res.released) {
+        console.error(`cannot release: ${res.reason}`);
+        process.exitCode = 1;
+        break;
+      }
+      const rel = await repo.store.get(res.releaseOid) as { treeHash: string; sbom: { components: unknown[] }; evidence: Record<string, string> };
+      console.log(`released ${res.releaseOid}`);
+      console.log(`  treeHash : ${rel.treeHash}`);
+      console.log(`  sbom     : ${rel.sbom.components.length} components`);
+      console.log(`  evidence : ${JSON.stringify(rel.evidence)}`);
+      break;
+    }
     case "show": {
       const store = new ObjectStore(cwd);
       const oid = args[1];
@@ -121,6 +137,7 @@ async function main(): Promise<void> {
           "  log                         operation history\n" +
           "  materialize [view] [--out d]  project the code tree\n" +
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +
+          "  release [view] [-m msg]     cut a verified release + SBOM\n" +
           "  show <oid>                  dump an object\n",
       );
       if (cmd) process.exitCode = 1;
