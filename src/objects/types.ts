@@ -123,6 +123,7 @@ export type OperationKind =
   | "rename_file" // identity-preserving move
   | "set_symbol" // replace one named top-level symbol's text within a file
   | "rename_symbol" // rename a top-level symbol (decl + same-file references)
+  | "move_symbol" // move a top-level symbol from one file to another
   | "note"; // metadata-only op (e.g. record an effect), never mutates the tree
 
 export interface OperationTarget {

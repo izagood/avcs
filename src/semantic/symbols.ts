@@ -151,3 +151,20 @@ export function renameSymbol(content: string, from: string, to: string): string 
   const re = new RegExp(`(?<![A-Za-z0-9_$])${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_$])`, "g");
   return content.replace(re, to);
 }
+
+/**
+ * M3 AST op support: extract one top-level symbol's text and return it together with
+ * the file content that remains (symbol removed). Returns null if the symbol is absent.
+ */
+export function extractSymbol(
+  content: string,
+  symbolName: string,
+  indexer: EntityIndexer = tsIndexer,
+): { text: string; rest: string } | null {
+  const spans = indexer.parse(content);
+  const idx = spans.findIndex((s) => s.kind === "symbol" && s.name === symbolName);
+  if (idx === -1) return null;
+  const text = spans[idx]!.text;
+  const rest = indexer.reassemble(spans.filter((_, i) => i !== idx));
+  return { text, rest };
+}

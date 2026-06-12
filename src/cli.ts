@@ -72,6 +72,12 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "metrics": {
+      const repo = await Repo.open(cwd);
+      await repo.materialize(args[1] ?? "main"); // do some work so there's something to show
+      console.log(JSON.stringify(repo.metrics.snapshot(), null, 2));
+      break;
+    }
     case "blame": {
       const repo = await Repo.open(cwd);
       const key = args[1];
