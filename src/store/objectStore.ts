@@ -106,6 +106,18 @@ export class ObjectStore {
     return oid;
   }
 
+  /**
+   * Redaction exception (Phase 12): overwrite the object stored AT `oid` with new
+   * content that no longer hashes to it. This is the ONE place append-only/content-
+   * addressing yields — used only by an admin-signed Redaction to evict leaked bytes
+   * while keeping the oid (and every reference to it) valid.
+   */
+  async overwriteAt(oid: string, obj: AnyObject): Promise<void> {
+    const { oid: _drop, ...payload } = obj as AnyObject & { oid?: string };
+    void _drop;
+    await this.#writeAtomic(this.#pathFor(oid), canonicalize({ ...payload, oid }));
+  }
+
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
     const p = this.#pathFor(oid);
     const raw = await readFile(p, "utf8");
