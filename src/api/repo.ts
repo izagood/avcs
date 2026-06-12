@@ -347,6 +347,34 @@ export class Repo {
     });
   }
 
+  /**
+   * M3 AST op: rename a top-level symbol (declaration + same-file references). Contends
+   * on both the old and new symbol keys. Should causally depend on the op that
+   * established the file. Cross-file references are a follow-up (needs reference analysis).
+   */
+  async proposeRenameSymbol(args: {
+    sessionOid: string;
+    intentOid: string;
+    actor: Actor;
+    path: string;
+    from: string;
+    to: string;
+    declaredPurpose: string;
+    causalDeps?: string[];
+    line?: string;
+  }): Promise<string> {
+    return this.proposeOperation({
+      sessionOid: args.sessionOid,
+      intentOid: args.intentOid,
+      actor: args.actor,
+      target: { entityKind: "symbol", entityId: `${args.path}#${args.from}` },
+      body: { kind: "rename_symbol", path: args.path, symbolName: args.from, newName: args.to },
+      declaredPurpose: args.declaredPurpose,
+      causalDeps: args.causalDeps,
+      line: args.line,
+    });
+  }
+
   async attachEvidence(args: {
     forOps: string[];
     kind: EvidenceKind;

@@ -20,7 +20,7 @@ import type {
   Policy,
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
-import { spliceSymbol } from "../semantic/symbols.ts";
+import { spliceSymbol, renameSymbol } from "../semantic/symbols.ts";
 import { ownersFor } from "../policy/owners.ts";
 
 export interface ConflictOption {
@@ -136,6 +136,9 @@ export function keysOf(op: Operation): string[] {
     case "set_symbol":
       // Symbol-granular: two edits to different symbols of the same file auto-merge.
       return [`symbol:${b.path}#${b.symbolName}`];
+    case "rename_symbol":
+      // Contends on both the old and new symbol names within the file.
+      return [`symbol:${b.path}#${b.symbolName}`, `symbol:${b.path}#${b.newName}`];
     case "note":
       return [];
   }
@@ -524,6 +527,16 @@ function applyOp(
       const merged = spliceSymbol(current, b.symbolName, resolve(b.blobOid));
       const synthOid = `blob_${sha256hex(merged).slice(0, 32)}`;
       synthBlobs.set(synthOid, merged);
+      tree.set(b.path, synthOid);
+      break;
+    }
+    case "rename_symbol": {
+      if (!b.path || !b.symbolName || !b.newName) break;
+      const currentOid = tree.get(b.path);
+      if (currentOid === undefined) break;
+      const renamed = renameSymbol(resolve(currentOid), b.symbolName, b.newName);
+      const synthOid = `blob_${sha256hex(renamed).slice(0, 32)}`;
+      synthBlobs.set(synthOid, renamed);
       tree.set(b.path, synthOid);
       break;
     }

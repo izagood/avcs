@@ -122,6 +122,7 @@ export type OperationKind =
   | "delete_file"
   | "rename_file" // identity-preserving move
   | "set_symbol" // replace one named top-level symbol's text within a file
+  | "rename_symbol" // rename a top-level symbol (decl + same-file references)
   | "note"; // metadata-only op (e.g. record an effect), never mutates the tree
 
 export interface OperationTarget {
@@ -139,8 +140,10 @@ export interface OperationBody {
   fromPath?: string;
   /** put_file content, or set_symbol's new symbol text. */
   blobOid?: string;
-  /** set_symbol: the top-level symbol name being replaced. */
+  /** set_symbol / rename_symbol: the top-level symbol name (the OLD name for rename). */
   symbolName?: string;
+  /** rename_symbol: the new symbol name. */
+  newName?: string;
 }
 
 export interface Operation extends BaseObject {
