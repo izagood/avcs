@@ -13,12 +13,28 @@
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { ObjectStore } from "../store/objectStore.ts";
-import type { AnyObject } from "../objects/types.ts";
+import { verifyMessage } from "../core/identity.ts";
+import type { AnyObject, Membership, Operation } from "../objects/types.ts";
 
 export interface HubHandle {
   url: string;
   port: number;
   close(): Promise<void>;
+}
+
+/**
+ * Governance gate: an operation pushed to a gated hub must be signed by a key whose
+ * membership (resolved via the hub's `member:<actorId>` ref) grants role ≥ proposer
+ * and is not revoked. The hub is authoritative for membership — clients pull it.
+ */
+async function isAuthorizedOp(store: ObjectStore, op: Operation): Promise<boolean> {
+  const memRef = await store.getRef(`member:${op.actor.id}`);
+  if (!memRef || !(await store.has(memRef))) return false;
+  const m = await store.get<Membership>(memRef);
+  if (m.revokedAt || m.actorId !== op.actor.id) return false;
+  if (m.role === "reader") return false; // below proposer
+  if (!op.sig) return false;
+  return verifyMessage(m.publicKey, op.oid as string, op.sig.sig);
 }
 
 const MAX_BODY = 64 * 1024 * 1024; // 64 MiB guard against unbounded request bodies
@@ -53,12 +69,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
  * so an empty repo dir works. Pass `port: 0` (or omit) to get an OS-assigned port,
  * read back from the returned handle.
  */
-export async function startHub(opts: { repoDir: string; port?: number }): Promise<HubHandle> {
+export async function startHub(opts: { repoDir: string; port?: number; gated?: boolean }): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
+  const gated = opts.gated ?? false;
 
   const server: Server = createServer((req, res) => {
-    handle(store, req, res).catch((err) => {
+    handle(store, req, res, gated).catch((err) => {
       // Last-resort guard: never let a handler rejection crash the server.
       if (!res.headersSent) sendJson(res, 500, { error: String(err?.message ?? err) });
       else res.end();
@@ -85,7 +102,7 @@ export async function startHub(opts: { repoDir: string; port?: number }): Promis
   };
 }
 
-async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean): Promise<void> {
   // Parse path only (ignore query); the host is irrelevant for routing.
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -96,6 +113,13 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     const oids: string[] = [];
     for await (const obj of store.list()) oids.push(obj.oid as string);
     sendJson(res, 200, oids);
+    return;
+  }
+
+  // GET /refs → governance refs the hub is authoritative for (policy/membership/
+  // protection/head). Clients pull these to adopt the org's canonical governance.
+  if (method === "GET" && path === "/refs") {
+    sendJson(res, 200, { refs: Object.fromEntries(await store.listRefs()) });
     return;
   }
 
@@ -133,6 +157,14 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     if (typeof obj !== "object" || obj === null || typeof (obj as { type?: unknown }).type !== "string") {
       sendJson(res, 400, { error: "object must have a string `type`" });
       return;
+    }
+    // Gated hub: reject operations not signed by a member with role ≥ proposer.
+    // Non-operation objects (blobs/evidence/etc.) are content-addressed and harmless.
+    if (gated && (obj as AnyObject).type === "operation") {
+      if (!(await isAuthorizedOp(store, obj as Operation))) {
+        sendJson(res, 403, { error: "operation not signed by an authorized member" });
+        return;
+      }
     }
     // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
     // poison the store — it lands at its true content address (or is a no-op if present).
