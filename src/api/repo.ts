@@ -25,6 +25,7 @@ import {
   type Signature,
 } from "../core/identity.ts";
 import { checkLease, isActive, type LeaseConflict } from "../concurrency/lease.ts";
+import { Metrics } from "../observe/metrics.ts";
 import type {
   Actor,
   Blob,
@@ -57,6 +58,7 @@ export class Repo {
   readonly dir: string;
   readonly store: ObjectStore;
   readonly keyring = new Keyring();
+  readonly metrics = new Metrics();
   #clock = new LamportClock();
 
   private constructor(dir: string, store: ObjectStore) {
@@ -794,6 +796,7 @@ export class Repo {
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
   async materialize(viewName = "main"): Promise<ReductionResult> {
+    this.metrics.inc("materialize.calls");
     const view = await this.getView(viewName);
     const q = view.query;
     const exclude = new Set(q.excludeOps ?? []);
@@ -943,9 +946,15 @@ export class Repo {
       ].join("|"),
     );
     const hit = this.#reduceCache.get(sig);
-    if (hit) return this.#cloneResult(hit);
+    if (hit) {
+      this.metrics.inc("reduce.cache.hit");
+      return this.#cloneResult(hit);
+    }
+    this.metrics.inc("reduce.cache.miss");
 
-    const result = await this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions);
+    const result = await this.metrics.time("reduce.ms", () =>
+      this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions),
+    );
     if (this.#reduceCache.size >= Repo.REDUCE_CACHE_MAX) {
       this.#reduceCache.delete(this.#reduceCache.keys().next().value as string);
     }
