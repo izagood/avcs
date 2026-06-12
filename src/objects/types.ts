@@ -61,9 +61,16 @@ export interface Actor {
 // ── blob ────────────────────────────────────────────────────────────────────
 export interface Blob extends BaseObject {
   type: "blob";
-  /** Base64 of the raw bytes. (MVP keeps it simple; large blobs get chunked later.) */
+  /** Base64 of the raw bytes (empty for a chunked manifest). */
   data: string;
   encoding: "base64";
+  /**
+   * Phase 9b: a large blob is split into chunk blobs and stored as a manifest
+   * (data="", chunked=true, chunks=[oids]). Identical chunks dedup by oid, and
+   * reads stream chunk-by-chunk instead of inflating one huge JSON object.
+   */
+  chunked?: boolean;
+  chunks?: string[];
   /** Phase 12: set once a Redaction evicted the original bytes (oid preserved). */
   redacted?: boolean;
   redactionOid?: string;
