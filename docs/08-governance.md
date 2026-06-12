@@ -83,6 +83,8 @@ interface Protection {            // = branch protection rule
   requiredChecks: EvidenceKind[];// 서명된 pass 증거가 있어야 하는 검사
   finalizeRole: "maintainer"|"admin";
   requireSignedOps: boolean;     // 기본 true
+  requireUpToDate: boolean;      // 기본 true — stale finalize/decision 거부(§4.0, §6, §9)
+  allowForcePush: boolean;       // 기본 false — admin도 head 롤백 금지
 }
 interface Approval {              // = PR approve
   type: "approval";
@@ -98,15 +100,16 @@ interface Approval {              // = PR approve
 3. `finalizeRole` 권한자가 finalize
 충족 전까지 operation은 비승격(proposed) 상태 = **열린 PR**. avcshub만이 보호 view의 head를 전진시킨다.
 
-## 4. 결정 우선순위 = 권한 (H-4 해결, wall-clock 추방)
+## 4. 결정 우선순위 = 인과적 최신성 **그 다음** 권한 (H-4 해결, wall-clock 추방)
 
-`reducer`의 기존 "나중 createdAt이 이김"을 **권한 우선**으로 교체:
+`reducer`의 기존 "나중 createdAt이 이김"을 교체하되, **권한만으로는 부족하다**(§9 참조). 권한은 *최신 상태인 결정자들 사이의* tiebreaker이지, 못 본 것을 덮어쓰는 license가 아니다.
 
+0. **인과적 최신성 전제 (먼저 통과해야 함).** 같은 conflict key에 대해, 이 Decision이 **인과적으로 보지 못한** 더 나중 Decision이 이미 보호 head 히스토리에 있으면 → 이 Decision은 **stale**로 dismiss된다. **권한이 높아도 예외 없음.** (= GitHub "require up to date before merge" + "stale review dismissal")
 1. 유효 Decision = 역할 ≥ `reviewer` **이고** 해당 scope의 소유자(또는 역할 ≥ `maintainer` override). 비멤버/권한부족 결정은 무효.
-2. 모순된 유효 Decision 간 → **권한 가중치 높은 쪽이 이김** (admin > maintainer > reviewer). ← "권한 높은 사람이 합의 우선권"
-3. **같은 가중치 동률** → wall-clock으로 풀지 않는다. 충돌은 `needs_decision`으로 **막힌 채 상위 권한자에게 escalate**(또는 정족수 규칙). 명시적 supersede만 인정.
+2. **서로를 못 본 진짜 동시(concurrent)** 유효 Decision 간 → **권한 가중치 높은 쪽이 이김** (admin > maintainer > reviewer). ← "권한 높은 사람이 합의 우선권"
+3. **같은 가중치 동률** → wall-clock으로 풀지 않는다. `needs_decision`으로 **막힌 채 상위 권한자에게 escalate**(또는 정족수 규칙). 명시적 supersede만 인정.
 
-이로써 "두 사람이 반대로 결정 → 노트북 시계가 승자"가 사라지고, GitHub의 "merge 권한자/CODEOWNERS가 최종"과 동형이 된다.
+이로써 "두 사람이 반대로 결정 → 노트북 시계가 승자"도, "오래된 고권한자가 신선한 결정을 덮어씀"도 사라지고, GitHub의 "up-to-date + merge 권한자/CODEOWNERS가 최종"과 동형이 된다.
 
 ## 5. 정책 합의 (C-2 해결)
 
@@ -116,10 +119,21 @@ policy를 머신별 가변 ref로 두지 않는다:
 - 머신은 avcshub의 서명된 latest policy를 pull → **모두 같은 policy로 reduce** → 결정론 복구.
 - protection·membership도 동일하게 avcshub 권위. (content 객체는 여전히 분산 gossip.)
 
-## 6. finalize 직렬화 (merge queue) & causal-complete (C-3 연계)
+## 6. finalize = head에 대한 CAS (non-fast-forward 거부, lost-update 방지)
 
-- finalize는 "현재 보호 head"를 부모로 참조한다. head가 그사이 움직였으면 → 재평가(= 그냥 re-reduce, 객체 합집합이라 rebase가 trivial). avcshub가 head 전진을 **선형화**(merge queue).
-- avcshub는 finalize 전에 **causal-complete 검사**(모든 causalDep 객체 존재)를 통과시킨다 → 부분 sync로 인한 silent 오류(C-3) 차단.
+finalize는 보호 head 포인터를 전진시키는 유일한 연산이며, **compare-and-swap**다:
+
+```ts
+interface Finalize {                 // = git push / PR merge
+  type: "finalize"; view: "main";
+  parentHead: string;                // 이 finalize가 기반한 head oid
+  newCheckpoint: string;             // 전진시킬 checkpoint
+  by: string;                        // role ≥ Protection.finalizeRole, 서명됨
+}
+```
+- avcshub: `parentHead === 현재 head`일 때만 수락(원자적 CAS). 아니면 **거부** "head moved: X → Y, pull first" (= git non-fast-forward 거부). **권한 무관** — admin도 stale finalize는 못 한다(`requireUpToDate`가 force-push를 금지).
+- 거부받은 쪽은 pull → 그동안의 결정/op를 흡수 → 현재 head 위에서 re-reduce(객체 합집합이라 rebase가 trivial) → 다시 finalize. **operation은 유실되지 않는다**(append-only, union).
+- CAS가 head 전진을 자연히 **선형화**(merge queue). finalize 전 **causal-complete 검사**(모든 causalDep 객체 존재)로 부분 sync silent 오류(C-3)도 차단.
 
 ## 7. 무엇이 닫히고, 무엇이 분산으로 남나
 
@@ -139,12 +153,37 @@ policy를 머신별 가변 ref로 두지 않는다:
 - **Byzantine**: member 키 탈취 시 그 권한까지 위조 가능 → 키 폐기(revocation) 목록을 Membership에 `expiresAt`/`revokedAt`로. admin 키는 하드웨어/threshold 권장.
 - **scoped maintainer**: `Membership.scopes` + `OwnerRule`로 "이 패키지만 merge 가능" 표현.
 
+## 9. 권한 ≠ 최신성 — stale 고권한 결정 문제
+
+권한만 보면 치명적 구멍이 생긴다: **인과적으로 뒤처진 고권한자가 신선한 결정을 덮어쓴다.**
+
+> 시나리오: 원격(avcshub)은 D1→…→D10까지 진행. 로컬은 D1까지만 sync된 채 고권한자가 D1 위에 D2'를 만들어 push.
+
+권한만 적용하면:
+- 같은 conflict key를 D5와 D2'가 다르게 결정 → 권한 높은 D2'가 이김 → D2~D4 맥락을 **못 본 채** 8단계 결정을 덮어씀 (stale-clobber)
+- 보호 head를 순진하게 받으면 10 → 2로 **롤백** (lost-update)
+
+**핵심: 권한은 최신성을 대체하지 않는다.** 고권한자의 D2'는 D2~D10을 *본 적이 없다*. 해결은 §4.0(인과적 최신성 전제) + §6(head CAS)로, GitHub의 non-fast-forward 거부와 동형이다.
+
+```
+로컬:    D2'(parentHead=D1) push
+avcshub: 현재 head = D10 ≠ D1  →  ❌ REJECT "head moved D1→D10, pull first"
+로컬:    pull D2..D10  →  D2'의 ops는 합집합에 흡수, reduce가 D10 위에서 재평가
+         ├─ D2'가 D5와 다른 key  →  자동 합쳐짐 (override 없음)
+         └─ D2'가 D5와 같은 key  →  고권한자가 D2~D10을 *보고* 재결정
+                                   → 그제서야 권한 적용 (D5를 명시적 supersede, 히스토리 보존)
+로컬:    D11(parentHead=D10) finalize  →  ✅ 수락
+```
+
+- **operation은 유실되지 않는다** — append-only union이라 D2'의 코드는 살아서 현재 head 위에서 재평가될 뿐. (git push 거부돼도 로컬 커밋이 남아 rebase하는 것과 동일)
+- **고권한자의 최종 결정권은 보존** — 단 "informed 권한 우선": 정보를 갖춘 뒤에만 그 권한이 적용된다.
+
 ## 다음 단계 (구현 시 Phase 7에 포함)
 
 1. operation 서명 필수화 + avcshub push 게이트(서명/역할 검증)
-2. Membership/Protection/Approval 객체 + root 키 부트스트랩
-3. reducer 결정 우선순위를 createdAt → 권한 가중치로 교체
+2. Membership/Protection/Approval/**Finalize** 객체 + root 키 부트스트랩
+3. reducer 결정 우선순위: createdAt → **인과적 최신성 → 권한 가중치** (§4)
 4. canonical policy/protection을 avcshub가 게시, 클라이언트 pull
-5. finalize 선형화 + causal-complete 게이트
+5. **head CAS finalize**(non-fast-forward 거부, §6) + causal-complete 게이트
 
 → [07 — 로드맵](07-roadmap.md)의 Phase 7(sync)와 함께 구현. 이 문서는 **설계 합의용**이며 코드는 아직 미변경.
