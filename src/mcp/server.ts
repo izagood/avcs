@@ -1,0 +1,239 @@
+// AVCS MCP server — the primary, agent-facing interface.
+//
+// Agents do not run a CLI and they do not edit files directly into history. They
+// call these tools: read the intent, build context, propose operations, attach
+// evidence, ask whether things merge, and surface decisions to humans. The exact
+// same Repo facade backs the CLI and the demo, so behavior is identical.
+//
+// Run:  AVCS_REPO=/path/to/repo node --experimental-strip-types src/mcp/server.ts
+// Requires the optional dependency `@modelcontextprotocol/sdk` (npm i).
+//
+// Skill/system-prompt rules to inject into agents (see docs/06-mcp-interface.md):
+//   • Never write final files directly — submit avcs.operation.propose.
+//   • Declare effects (changesBehavior / breaksPublicApi) honestly.
+//   • A behavior change cannot be accepted without passing-test evidence.
+//   • On a conflict, produce options for a human; do not silently overwrite.
+
+import { Repo } from "../api/repo.ts";
+import type { Actor } from "../objects/types.ts";
+
+const REPO_DIR = process.env.AVCS_REPO ?? process.cwd();
+
+interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (repo: Repo, input: Record<string, unknown>) => Promise<unknown>;
+}
+
+function actorOf(input: Record<string, unknown>): Actor {
+  const a = (input.actor ?? {}) as Partial<Actor>;
+  return { kind: a.kind ?? "ai_agent", id: a.id ?? "ai:unknown", ...(a.model ? { model: a.model } : {}) };
+}
+
+const actorSchema = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["human", "ai_agent", "ci_bot"] },
+    id: { type: "string" },
+    model: { type: "string" },
+  },
+  required: ["id"],
+};
+
+const TOOLS: ToolDef[] = [
+  {
+    name: "avcs.intent.create",
+    description: "Open an intent: the goal + constraints + allowed scopes for a unit of work. Agents must work within an intent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        owner: { type: "string", description: "actor id, usually a human" },
+        kind: { type: "string", enum: ["feature", "bugfix", "refactor", "formatting", "generated"] },
+        priority: { type: "string", enum: ["low", "normal", "high", "critical"] },
+        constraints: { type: "array", items: { type: "string" } },
+        successCriteria: { type: "array", items: { type: "string" } },
+        allowedScopes: { type: "array", items: { type: "string" } },
+      },
+      required: ["title", "owner"],
+    },
+    handler: (repo, i) => repo.createIntent(i as never),
+  },
+  {
+    name: "avcs.session.start",
+    description: "Begin a work session for an agent/human against an intent. Returns a session id used on every operation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intentOid: { type: "string" },
+        actor: actorSchema,
+        summary: { type: "string" },
+        openedEntities: { type: "array", items: { type: "string" } },
+      },
+      required: ["intentOid", "actor"],
+    },
+    handler: (repo, i) =>
+      repo.startSession({ intentOid: String(i.intentOid), actor: actorOf(i), summary: i.summary as string }),
+  },
+  {
+    name: "avcs.operation.propose",
+    description: "Propose a semantic change. MVP supports file writes. DECLARE EFFECTS honestly (changesBehavior, breaksPublicApi) — policy gates on them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionOid: { type: "string" },
+        intentOid: { type: "string" },
+        actor: actorSchema,
+        path: { type: "string" },
+        content: { type: "string" },
+        declaredPurpose: { type: "string" },
+        causalDeps: { type: "array", items: { type: "string" } },
+        effects: {
+          type: "object",
+          properties: {
+            changesBehavior: { type: "boolean" },
+            breaksPublicApi: { type: "boolean" },
+            reads: { type: "array", items: { type: "string" } },
+          },
+        },
+      },
+      required: ["sessionOid", "intentOid", "actor", "path", "content", "declaredPurpose"],
+    },
+    handler: (repo, i) =>
+      repo.proposeFileWrite({
+        sessionOid: String(i.sessionOid),
+        intentOid: String(i.intentOid),
+        actor: actorOf(i),
+        path: String(i.path),
+        content: String(i.content),
+        declaredPurpose: String(i.declaredPurpose),
+        causalDeps: i.causalDeps as string[] | undefined,
+        effects: i.effects as never,
+      }),
+  },
+  {
+    name: "avcs.evidence.attach",
+    description: "Attach machine-checkable evidence (test/typecheck/lint/...) to operations. Behavior changes need a passing test to be accepted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        forOps: { type: "array", items: { type: "string" } },
+        kind: {
+          type: "string",
+          enum: ["parse", "typecheck", "lint", "unit_test", "integration_test", "benchmark", "security_scan", "api_compat"],
+        },
+        result: { type: "string", enum: ["pass", "fail", "partial", "not_run"] },
+        actor: actorSchema,
+        command: { type: "string" },
+        detail: { type: "string" },
+      },
+      required: ["forOps", "kind", "result"],
+    },
+    handler: (repo, i) =>
+      repo.attachEvidence({
+        forOps: i.forOps as string[],
+        kind: i.kind as never,
+        result: i.result as never,
+        producedBy: actorOf(i),
+        command: i.command as string | undefined,
+        detail: i.detail as string | undefined,
+      }),
+  },
+  {
+    name: "avcs.view.materialize",
+    description: "Reduce the operation graph for a view into a code tree + per-op status + open conflicts. This is how an agent checks whether its work merges.",
+    inputSchema: { type: "object", properties: { view: { type: "string" } } },
+    handler: async (repo, i) => {
+      const res = await repo.materialize((i.view as string) ?? "main");
+      const status: Record<string, string> = {};
+      for (const [oid, s] of res.statuses) status[oid] = s;
+      return {
+        treeHash: res.treeHash,
+        files: [...res.tree.keys()].sort(),
+        status,
+        conflicts: res.conflicts,
+      };
+    },
+  },
+  {
+    name: "avcs.conflict.list",
+    description: "List the conflicts that require a human/owner decision in a view.",
+    inputSchema: { type: "object", properties: { view: { type: "string" } } },
+    handler: async (repo, i) => (await repo.materialize((i.view as string) ?? "main")).conflicts,
+  },
+  {
+    name: "avcs.decision.record",
+    description: "Record a human/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        conflictId: { type: "string" },
+        chosenOps: { type: "array", items: { type: "string" } },
+        rejectedOps: { type: "array", items: { type: "string" } },
+        reason: { type: "string" },
+        actor: actorSchema,
+        futurePolicy: { type: "string" },
+      },
+      required: ["conflictId", "reason"],
+    },
+    handler: (repo, i) =>
+      repo.recordDecision({
+        conflictId: String(i.conflictId),
+        chosenOps: (i.chosenOps as string[]) ?? [],
+        rejectedOps: (i.rejectedOps as string[]) ?? [],
+        reason: String(i.reason),
+        decidedBy: actorOf(i),
+        futurePolicy: i.futurePolicy as string | undefined,
+      }),
+  },
+  {
+    name: "avcs.checkpoint.create",
+    description: "Freeze a verified (ops + policy + materializer + evidence) state vector for a view.",
+    inputSchema: {
+      type: "object",
+      properties: { view: { type: "string" }, summary: { type: "string" } },
+    },
+    handler: (repo, i) => repo.createCheckpoint((i.view as string) ?? "main", (i.summary as string) ?? "checkpoint"),
+  },
+];
+
+async function main(): Promise<void> {
+  let sdk: typeof import("@modelcontextprotocol/sdk/server/index.js");
+  let stdio: typeof import("@modelcontextprotocol/sdk/server/stdio.js");
+  let typesMod: typeof import("@modelcontextprotocol/sdk/types.js");
+  try {
+    sdk = await import("@modelcontextprotocol/sdk/server/index.js");
+    stdio = await import("@modelcontextprotocol/sdk/server/stdio.js");
+    typesMod = await import("@modelcontextprotocol/sdk/types.js");
+  } catch {
+    console.error(
+      "[avcs-mcp] @modelcontextprotocol/sdk is not installed.\n" +
+        "          Run `npm install` (it is an optionalDependency), then start again.\n" +
+        "          Tool surface is defined in src/mcp/server.ts regardless.",
+    );
+    process.exit(1);
+  }
+
+  const server = new sdk.Server({ name: "avcs", version: "0.0.1" }, { capabilities: { tools: {} } });
+
+  server.setRequestHandler(typesMod.ListToolsRequestSchema, async () => ({
+    tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+  }));
+
+  server.setRequestHandler(typesMod.CallToolRequestSchema, async (req) => {
+    const tool = TOOLS.find((t) => t.name === req.params.name);
+    if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
+    const repo = await Repo.open(REPO_DIR);
+    const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  });
+
+  await server.connect(new stdio.StdioServerTransport());
+  console.error(`[avcs-mcp] serving repo ${REPO_DIR} over stdio (${TOOLS.length} tools)`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
