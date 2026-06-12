@@ -115,9 +115,12 @@ export function evaluateOp(
     ev.notes.push(`reliability ${reliabilityBonus > 0 ? "+" : ""}${reliabilityBonus}`);
   }
 
-  // Only evidence the operation's own author did NOT produce can vouch for it.
+  // Only evidence the operation's own author did NOT produce can vouch for it, and
+  // evidence from an untrusted (outsider-CI) runner never counts until re-run (Phase 11).
   const trusted = evidenceForOp.filter(
-    (e) => e.producedBy.kind !== "ai_agent" || e.producedBy.id !== op.actor.id,
+    (e) =>
+      !e.fromUntrustedRunner &&
+      (e.producedBy.kind !== "ai_agent" || e.producedBy.id !== op.actor.id),
   );
   const ignored = evidenceForOp.length - trusted.length;
   if (ignored > 0) ev.notes.push(`${ignored} self-reported evidence ignored`);

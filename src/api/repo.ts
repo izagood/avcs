@@ -41,6 +41,7 @@ import type {
   OperationBody,
   OperationTarget,
   Policy,
+  Promotion,
   Protection,
   RoleName,
   ScopeRef,
@@ -328,6 +329,8 @@ export class Repo {
     producedBy: Actor;
     command?: string;
     detail?: string;
+    /** Produced by a secret-less isolated runner over untrusted code (Phase 11). */
+    fromUntrustedRunner?: boolean;
     /** Sign the evidence so the trust gate can verify it cryptographically. */
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
@@ -340,6 +343,7 @@ export class Repo {
       command: args.command,
       detail: args.detail,
       createdAt: new Date().toISOString(),
+      ...(args.fromUntrustedRunner ? { fromUntrustedRunner: true } : {}),
     };
     ev.sig = this.#sign("evidence", ev as unknown as Record<string, unknown>, args.signWith);
     return this.store.put(ev);
@@ -681,7 +685,55 @@ export class Repo {
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
       ops.push(op);
     }
-    return this.#reduceOpSet(ops, q.includeStatuses);
+    // Phase 11: in a governed repo, ops authored by non-members (outsiders) are
+    // quarantined — excluded from the materialized tree until a reviewer promotes them.
+    const { kept, quarantined } = await this.#partitionQuarantine(ops);
+    const res = await this.#reduceOpSet(kept, q.includeStatuses);
+    for (const oid of quarantined) res.statuses.set(oid, "quarantined");
+    return res;
+  }
+
+  /** Split ops into kept vs quarantined (outsider, not-yet-promoted) for a governed repo. */
+  async #partitionQuarantine(ops: Operation[]): Promise<{ kept: Operation[]; quarantined: Set<string> }> {
+    const memberships = await this.store.collect<Membership>("membership");
+    if (memberships.length === 0) return { kept: ops, quarantined: new Set() }; // governance off
+    const members = new Set(memberships.filter((m) => !m.revokedAt).map((m) => m.actorId));
+    const promoted = new Set((await this.store.collect<Promotion>("promotion")).flatMap((p) => p.ops));
+    const kept: Operation[] = [];
+    const quarantined = new Set<string>();
+    for (const op of ops) {
+      if (!members.has(op.actor.id) && !promoted.has(op.oid as string)) quarantined.add(op.oid as string);
+      else kept.push(op);
+    }
+    return { kept, quarantined };
+  }
+
+  /** List currently-quarantined ops (outsider contributions awaiting review). */
+  async quarantinedOps(line = "main"): Promise<string[]> {
+    const res = await this.materialize(line);
+    return [...res.statuses].filter(([, s]) => s === "quarantined").map(([oid]) => oid);
+  }
+
+  /**
+   * Phase 11: a non-member (external contributor) submits an op. It self-signs and
+   * lands quarantined. Admission control caps outstanding outsider ops per actor.
+   */
+  async proposeOutsider(
+    args: Parameters<Repo["proposeOperation"]>[0] & { maxOutstanding?: number },
+  ): Promise<string> {
+    const cap = args.maxOutstanding ?? 50;
+    const mine = (await this.store.collect<Operation>("operation")).filter((o) => o.actor.id === args.actor.id);
+    if (mine.length >= cap) throw new Error(`admission cap (${cap}) reached for outsider ${args.actor.id}`);
+    return this.proposeOperation(args);
+  }
+
+  /** A reviewer promotes quarantined outsider ops into the normal accepted flow. */
+  async promote(opOids: string[], byActor: string, reason?: string): Promise<string> {
+    if (!(await this.hasRole(byActor, "reviewer"))) {
+      throw new Error(`promote requires role >= reviewer; ${byActor} is ${await this.roleOf(byActor)}`);
+    }
+    const p: Promotion = { type: "promotion", ops: opOids, by: byActor, reason, createdAt: new Date().toISOString() };
+    return this.store.put(p);
   }
 
   /**
