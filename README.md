@@ -18,18 +18,23 @@ state = reduce(base, operationDAG, decisions, policy, materializer)
 5. **AI 출력은 신뢰된 코드가 아니라 증거가 붙은 제안된 연산이다.**
 6. **코드에 last-write-wins를 기본값으로 쓰지 않는다.** 우선순위는 정책이 정한다.
 
-## 지금 동작하는 것 (MVP / Phase 1)
+## 지금 동작하는 것 (Phase 1–6 구현 완료)
 
-- append-only, content-addressed 객체 저장소 (`.avcs/objects`)
-- 7+2 객체 모델: intent · session · operation · evidence · decision · checkpoint · view (+ blob · policy)
-- 결정론적 reducer + 정책 엔진. 충돌을 4단계로 분류:
-  - **L0/L1** 서로 다른 entity → 자동 병합
-  - **L2** 같은 파일 동시 변경 → 정책 자동 결정 (human 우선 등)
-  - **L3** 동작 변경인데 증거(테스트) 없음 → 차단
-  - **L4** public API 파괴 → 사람 결정 필요 (needs_decision)
-- branch 대신 **view**(연산 그래프에 대한 쿼리), commit 대신 **checkpoint**
-- 에이전트 1급 인터페이스인 **MCP 서버** (tool 8종)
-- 사람용 inspection **CLI**
+- **저장 코어** — append-only, content-addressed 객체 저장소(`.avcs/objects`), 8+2 객체 모델: intent · session · operation · evidence · decision · checkpoint · view · lease · release (+ blob · policy)
+- **결정론적 reducer + 정책 엔진** — 충돌 등급화:
+  - **L0/L1** 서로 다른 entity / 같은 파일 다른 **symbol** → 자동 병합
+  - **L2** 같은 슬롯 동시 변경 → 정책 자동 결정 (human 우선·신뢰도). 자동 결정도 `autoDecisions`로 기록
+  - **L3** 동작 변경인데 신뢰된 증거 없음 → 차단 / **선언 안 한 계약 변경 + 호출부** → 의미 충돌 자동 escalate
+  - **L4** public API 파괴 → 사람 결정 필요, **소유자에게 라우팅**
+- **의미(symbol) 단위 병합** (Phase 2) — tree-sitter 교체 가능한 `EntityIndexer`
+- **암호 신뢰** (Phase 3) — ed25519 서명된 evidence/decision, 위조 시 신뢰 게이트 탈락. 실제 검증 러너 · WorkLease · RepairContext
+- **의미 충돌 탐지 + 결정 메모리** (Phase 4) — 시그니처 drift 탐지, `recallDecisions`/`learnedPolicies`
+- **정책 심화** (Phase 5) — code-owner 라우팅 · 신뢰도 학습(bounded)
+- **Release & provenance** (Phase 6) — 검증된 checkpoint + SBOM(CycloneDX) + 서명된 아티팩트
+- branch 대신 **view**, commit 대신 **checkpoint**, tag 대신 **release**
+- 에이전트 1급 인터페이스 **MCP 서버**(tool 14종) · 사람용 **CLI** · **30개 테스트**(회귀 포함) 통과 · `tsc` clean
+
+> 깊이 표기: 각 phase는 **동작하는 MVP 깊이**다(파일/심볼 단위 머지, ed25519 서명, 휴리스틱 계약 분석). 실제 tree-sitter/타입체크 연동, 다중 서명, 분산 동기화는 [로드맵](docs/07-roadmap.md)의 후속 항목.
 
 ## 빠른 시작
 
@@ -39,8 +44,8 @@ state = reduce(base, operationDAG, decisions, policy, materializer)
 # 4가지 병합 시나리오를 한 번에 보여주는 데모
 node --experimental-strip-types src/demo.ts
 
-# 동작 계약 테스트
-node --experimental-strip-types --test test/reducer.test.ts
+# 동작 계약 테스트 (회귀 포함 30개)
+node --experimental-strip-types --test test/*.test.ts   # 또는: npm test
 
 # 사람용 CLI
 node --experimental-strip-types src/cli.ts init .
@@ -62,11 +67,18 @@ AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 | `src/objects/types.ts` | 객체 모델 정의 (단일 진실 공급원) |
 | `src/store/objectStore.ts` | append-only content-addressed 저장소 |
 | `src/core/canonical.ts` | 정규 직렬화 + content addressing(oid) |
+| `src/core/identity.ts` | ed25519 서명/검증 + Keyring (Phase 3) |
 | `src/reducer/reducer.ts` | 연산 그래프 → 코드 트리 환원 + 충돌 분류 |
-| `src/reducer/policy.ts` | 정책 엔진(우선순위 사다리) |
+| `src/reducer/policy.ts` | 정책 엔진(우선순위 사다리, 신뢰도 nudge) |
+| `src/semantic/symbols.ts` | symbol 파서(EntityIndexer) — symbol 단위 머지 (Phase 2) |
+| `src/semantic/contract.ts` | 시그니처 분석 + 의미 충돌 탐지 (Phase 4) |
+| `src/policy/owners.ts` · `reliability.ts` | code-owner 라우팅 · 신뢰도 학습 (Phase 5) |
+| `src/validation/runner.ts` · `repair.ts` | 검증 러너 · RepairContext (Phase 3) |
+| `src/concurrency/lease.ts` | WorkLease (Phase 3) |
+| `src/release/sbom.ts` | SBOM 생성 (Phase 6) |
 | `src/api/repo.ts` | 고수준 파사드 (CLI·demo·MCP 공용) |
-| `src/mcp/server.ts` | 에이전트용 MCP 인터페이스 |
-| `src/cli.ts` | 사람용 inspection CLI |
+| `src/mcp/server.ts` | 에이전트용 MCP 인터페이스 (tool 14종) |
+| `src/cli.ts` | 사람용 inspection/release CLI |
 | `src/demo.ts` | end-to-end 시나리오 |
 
 ## 설계 문서
