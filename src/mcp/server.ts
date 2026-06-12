@@ -279,6 +279,32 @@ const TOOLS: ToolDef[] = [
     inputSchema: { type: "object", properties: { ops: { type: "array", items: { type: "string" } } }, required: ["ops"] },
     handler: (repo, i) => repo.repairContext(i.ops as string[]),
   },
+  {
+    name: "avcs.release.cut",
+    description: "Cut a Release: a verified (conflict-free) checkpoint + its evidence + an SBOM of what shipped + artifact references. Refuses if the view has open or semantic conflicts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        view: { type: "string" },
+        summary: { type: "string" },
+        signedBy: { type: "array", items: { type: "string" }, description: "actor ids signing off" },
+        artifacts: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { type: { type: "string" }, ref: { type: "string" }, digest: { type: "string" } },
+            required: ["type", "ref"],
+          },
+        },
+      },
+    },
+    handler: (repo, i) =>
+      repo.cutRelease((i.view as string) ?? "main", {
+        summary: i.summary as string | undefined,
+        signedBy: i.signedBy as string[] | undefined,
+        artifacts: i.artifacts as never,
+      }),
+  },
 ];
 
 async function main(): Promise<void> {
