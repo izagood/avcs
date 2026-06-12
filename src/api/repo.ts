@@ -35,6 +35,7 @@ import type {
   EvidenceResult,
   Intent,
   IntentKind,
+  Line,
   Operation,
   OperationBody,
   OperationTarget,
@@ -231,6 +232,8 @@ export class Repo {
     causalDeps?: string[];
     effects?: Operation["effects"];
     confidence?: number;
+    line?: string;
+    derivedFrom?: string;
   }): Promise<string> {
     const op: Operation = {
       type: "operation",
@@ -245,6 +248,10 @@ export class Repo {
       lamport: this.#clock.tick(),
       createdAt: new Date().toISOString(),
       confidence: args.confidence,
+      // Only store `line` when it is non-default, so existing (line-less) repos and
+      // their oids stay byte-identical — backward compatibility with "main".
+      ...(args.line && args.line !== "main" ? { line: args.line } : {}),
+      ...(args.derivedFrom ? { derivedFrom: args.derivedFrom } : {}),
     };
     return this.store.put(op);
   }
@@ -259,6 +266,7 @@ export class Repo {
     declaredPurpose: string;
     causalDeps?: string[];
     effects?: Operation["effects"];
+    line?: string;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.content);
     return this.proposeOperation({
@@ -270,6 +278,7 @@ export class Repo {
       declaredPurpose: args.declaredPurpose,
       causalDeps: args.causalDeps,
       effects: args.effects,
+      line: args.line,
     });
   }
 
@@ -288,6 +297,7 @@ export class Repo {
     declaredPurpose: string;
     causalDeps?: string[];
     effects?: Operation["effects"];
+    line?: string;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
     return this.proposeOperation({
@@ -299,6 +309,7 @@ export class Repo {
       declaredPurpose: args.declaredPurpose,
       causalDeps: args.causalDeps,
       effects: args.effects,
+      line: args.line,
     });
   }
 
@@ -436,6 +447,82 @@ export class Repo {
     return oid;
   }
 
+  // ── lineage (Phase 8) ──────────────────────────────────────────────────────
+  async #getLine(name: string): Promise<Line | null> {
+    const oid = await this.store.getRef(`line:${name}`);
+    return oid ? this.store.get<Line>(oid) : null;
+  }
+
+  /** Oids inherited by a line: the causal closure of its fork checkpoint's frontier. */
+  async #inheritedOps(lineName: string, allOps: Operation[]): Promise<Set<string>> {
+    const line = await this.#getLine(lineName);
+    if (!line?.forkCheckpointOid) return new Set();
+    const cp = await this.store.get<Checkpoint>(line.forkCheckpointOid);
+    const byId = new Map(allOps.map((o) => [o.oid as string, o]));
+    const seen = new Set<string>();
+    const stack = [...cp.headOps];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const dep of byId.get(id)?.causalDeps ?? []) if (!seen.has(dep)) stack.push(dep);
+    }
+    return seen;
+  }
+
+  async listLines(): Promise<Line[]> {
+    return this.store.collect<Line>("line");
+  }
+
+  /**
+   * Fork a new line from `fromLine` at its current (or a given) checkpoint. The fork
+   * checkpoint freezes what the new line inherits; everything the base line does
+   * afterwards stays out of the new line. Also creates a same-named view selecting it.
+   */
+  async createLine(name: string, fromLine = "main", atCheckpointOid?: string): Promise<string> {
+    if (await this.#getLine(name)) throw new Error(`line already exists: ${name}`);
+    const forkCheckpointOid = atCheckpointOid ?? (await this.createCheckpoint(fromLine, `fork point for line ${name}`));
+    const line: Line = {
+      type: "line",
+      name,
+      baseLine: fromLine,
+      forkCheckpointOid,
+      createdAt: new Date().toISOString(),
+    };
+    const oid = await this.store.put(line);
+    await this.store.setRef(`line:${name}`, oid);
+    await this.createView(name, { includeStatuses: ["accepted"], line: name });
+    return oid;
+  }
+
+  /** Frontier (accepted head ops) of a line — the causalDeps a new op should build on. */
+  async lineFrontier(lineName: string): Promise<string[]> {
+    return (await this.materialize(lineName)).headOps;
+  }
+
+  /**
+   * Port (cherry-pick / backport) an operation onto another line: mint a NEW op on
+   * the target line carrying the source's body, based on the target line's current
+   * frontier, with `derivedFrom` provenance. set_symbol re-splices against the target
+   * line's content automatically at materialize; put_file replaces on the target line.
+   */
+  async portOp(sourceOpOid: string, targetLine: string, actor?: Actor): Promise<string> {
+    const src = await this.store.get<Operation>(sourceOpOid);
+    await this.getView(targetLine); // ensure the target line/view exists
+    return this.proposeOperation({
+      sessionOid: src.sessionOid,
+      intentOid: src.intentOid,
+      actor: actor ?? src.actor,
+      target: src.target,
+      body: src.body,
+      declaredPurpose: `backport ${sourceOpOid.slice(0, 16)} → ${targetLine}: ${src.declaredPurpose}`,
+      causalDeps: await this.lineFrontier(targetLine),
+      effects: src.effects,
+      line: targetLine,
+      derivedFrom: sourceOpOid,
+    });
+  }
+
   /** Resolve a view's query into the candidate operation set, then reduce. */
   async materialize(viewName = "main"): Promise<ReductionResult> {
     const view = await this.getView(viewName);
@@ -444,8 +531,17 @@ export class Repo {
     const intentFilter = q.intentOids && q.intentOids.length ? new Set(q.intentOids) : null;
     const sessionFilter = q.sessionOids && q.sessionOids.length ? new Set(q.sessionOids) : null;
 
+    // Lineage (Phase 8): a line materializes its own ops + everything inherited from
+    // its fork checkpoint (the base line's frozen frontier). Ops authored on the base
+    // line AFTER the fork are excluded, which is what keeps lines divergent.
+    const lineName = q.line ?? "main";
+    const allOps = await this.store.collect<Operation>("operation");
+    const inherited = await this.#inheritedOps(lineName, allOps);
+
     const ops: Operation[] = [];
-    for await (const op of this.store.list<Operation>("operation")) {
+    for (const op of allOps) {
+      const onLine = (op.line ?? "main") === lineName || inherited.has(op.oid as string);
+      if (!onLine) continue;
       if (exclude.has(op.oid as string)) continue;
       if (intentFilter && !intentFilter.has(op.intentOid)) continue;
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
