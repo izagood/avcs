@@ -202,6 +202,35 @@ export class Repo {
     });
   }
 
+  /**
+   * Phase 2: replace one named top-level symbol within a file. Two such edits to
+   * different symbols of the same file auto-merge. Should causally depend on the op
+   * that established the file (`causalDeps`) so reconstruction starts from it.
+   */
+  async proposeSymbolEdit(args: {
+    sessionOid: string;
+    intentOid: string;
+    actor: Actor;
+    path: string;
+    symbolName: string;
+    newText: string;
+    declaredPurpose: string;
+    causalDeps?: string[];
+    effects?: Operation["effects"];
+  }): Promise<string> {
+    const blobOid = await this.putBlob(args.newText);
+    return this.proposeOperation({
+      sessionOid: args.sessionOid,
+      intentOid: args.intentOid,
+      actor: args.actor,
+      target: { entityKind: "symbol", entityId: `${args.path}#${args.symbolName}` },
+      body: { kind: "set_symbol", path: args.path, symbolName: args.symbolName, blobOid },
+      declaredPurpose: args.declaredPurpose,
+      causalDeps: args.causalDeps,
+      effects: args.effects,
+    });
+  }
+
   async attachEvidence(args: {
     forOps: string[];
     kind: EvidenceKind;
@@ -284,6 +313,13 @@ export class Repo {
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
 
+    // Preload blob content needed by content-aware ops (set_symbol reconstructs text).
+    const blobContent = new Map<string, string>();
+    for (const op of ops) {
+      const oid = op.body.blobOid;
+      if (oid && !blobContent.has(oid)) blobContent.set(oid, (await this.readBlob(oid)).toString("utf8"));
+    }
+
     return reduce({
       ops,
       evidence,
@@ -291,6 +327,7 @@ export class Repo {
       intents,
       policy: await this.policy(),
       materializeStatuses: q.includeStatuses,
+      blobContent,
     });
   }
 
@@ -316,7 +353,9 @@ export class Repo {
     for (const [path, blobOid] of result.tree) {
       const full = join(targetDir, path);
       await mkdir(dirname(full), { recursive: true });
-      await writeFile(full, await this.readBlob(blobOid));
+      // Symbol-merged files are synthesized content, not a stored blob.
+      const synth = result.synthBlobs.get(blobOid);
+      await writeFile(full, synth !== undefined ? Buffer.from(synth, "utf8") : await this.readBlob(blobOid));
     }
   }
 

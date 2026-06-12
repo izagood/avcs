@@ -87,30 +87,33 @@ export interface Session extends BaseObject {
 }
 
 // ── operation ───────────────────────────────────────────────────────────────
-// MVP operations are file-granular but carry the full semantic envelope so the
-// Phase-2 AST upgrade is additive, not a rewrite. The reducer treats `conflictKey`
-// (derived from target) as the unit of contention.
+// Operations carry the full semantic envelope. `put_file` is whole-file (Phase 1);
+// `set_symbol` (Phase 2) edits one named top-level symbol so disjoint-symbol edits to
+// the same file auto-merge. The reducer keys contention on `keysOf(op)`.
 export type OperationKind =
   | "put_file" // create or replace whole file content
   | "delete_file"
   | "rename_file" // identity-preserving move
+  | "set_symbol" // replace one named top-level symbol's text within a file
   | "note"; // metadata-only op (e.g. record an effect), never mutates the tree
 
 export interface OperationTarget {
-  /** What conceptual entity this op changes. MVP: file; later: symbol/contract. */
+  /** What conceptual entity this op changes. */
   entityKind: "file" | "symbol" | "contract" | "config" | "test";
-  /** Stable entity id. MVP: the file path. */
+  /** Stable entity id. file: the path. symbol: `<path>#<symbolName>`. */
   entityId: string;
 }
 
 export interface OperationBody {
   kind: OperationKind;
-  /** put_file / rename_file destination path. */
+  /** put_file / rename_file / set_symbol destination path. */
   path?: string;
   /** rename_file source path. */
   fromPath?: string;
-  /** put_file content. */
+  /** put_file content, or set_symbol's new symbol text. */
   blobOid?: string;
+  /** set_symbol: the top-level symbol name being replaced. */
+  symbolName?: string;
 }
 
 export interface Operation extends BaseObject {

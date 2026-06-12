@@ -20,6 +20,7 @@ import type {
   Policy,
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
+import { spliceSymbol } from "../semantic/symbols.ts";
 
 export interface ConflictOption {
   opOid: string;
@@ -60,6 +61,13 @@ export interface ReductionResult {
   autoDecisions: AutoDecision[];
   /** Frontier op ids: accepted ops that no other accepted op descends from. */
   headOps: string[];
+  /**
+   * Content for blob oids synthesized during reduction (symbol-level merges produce
+   * file content that is not any single stored blob). oid → content. The caller
+   * persists or writes these directly. Synthetic oids are content-derived, so the
+   * treeHash that references them stays deterministic.
+   */
+  synthBlobs: Map<string, string>;
 }
 
 export interface ReduceInput {
@@ -70,6 +78,8 @@ export interface ReduceInput {
   policy: Policy;
   /** Which statuses get projected into the tree. Default: accepted only. */
   materializeStatuses?: OperationStatus[];
+  /** blob oid → content, for ops that need file text (set_symbol). */
+  blobContent?: Map<string, string>;
 }
 
 // Status precedence when an op belongs to several contended keys (rename touches
@@ -93,14 +103,17 @@ function stricter(a: OperationStatus, b: OperationStatus): OperationStatus {
  * path would slip through unmerged. note ops contend on nothing.
  */
 function keysOf(op: Operation): string[] {
-  const k = (p: string) => `${op.target.entityKind}:${p}`;
-  switch (op.body.kind) {
+  const b = op.body;
+  switch (b.kind) {
     case "put_file":
-      return [k(op.body.path ?? op.target.entityId)];
+      return [`file:${b.path ?? op.target.entityId}`];
     case "delete_file":
-      return [k(op.body.path ?? op.target.entityId)];
+      return [`file:${b.path ?? op.target.entityId}`];
     case "rename_file":
-      return [k(op.body.fromPath ?? op.target.entityId), k(op.body.path ?? op.target.entityId)];
+      return [`file:${b.fromPath ?? op.target.entityId}`, `file:${b.path ?? op.target.entityId}`];
+    case "set_symbol":
+      // Symbol-granular: two edits to different symbols of the same file auto-merge.
+      return [`symbol:${b.path}#${b.symbolName}`];
     case "note":
       return [];
   }
@@ -213,7 +226,9 @@ export function reduce(input: ReduceInput): ReductionResult {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
   const tree = new Map<string, string>();
-  for (const op of ordered) applyOp(tree, op);
+  const synthBlobs = new Map<string, string>();
+  const blobContent = input.blobContent ?? new Map<string, string>();
+  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
   const treeHash = sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
 
   // Frontier: accepted ops not an ancestor of another accepted op.
@@ -223,7 +238,7 @@ export function reduce(input: ReduceInput): ReductionResult {
     return true;
   });
 
-  return { tree, treeHash, statuses, conflicts, autoDecisions, headOps };
+  return { tree, treeHash, statuses, conflicts, autoDecisions, headOps, synthBlobs };
 }
 
 function decideGroup(
@@ -384,8 +399,14 @@ function kahnOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[]
   return order;
 }
 
-function applyOp(tree: Map<string, string>, op: Operation): void {
+function applyOp(
+  tree: Map<string, string>,
+  op: Operation,
+  blobContent: Map<string, string>,
+  synthBlobs: Map<string, string>,
+): void {
   const b = op.body;
+  const resolve = (oid: string): string => synthBlobs.get(oid) ?? blobContent.get(oid) ?? "";
   switch (b.kind) {
     case "put_file":
       if (b.path && b.blobOid) tree.set(b.path, b.blobOid);
@@ -402,6 +423,16 @@ function applyOp(tree: Map<string, string>, op: Operation): void {
         }
       }
       break;
+    case "set_symbol": {
+      if (!b.path || !b.symbolName || !b.blobOid) break;
+      const currentOid = tree.get(b.path);
+      const current = currentOid !== undefined ? resolve(currentOid) : "";
+      const merged = spliceSymbol(current, b.symbolName, resolve(b.blobOid));
+      const synthOid = `blob_${sha256hex(merged).slice(0, 32)}`;
+      synthBlobs.set(synthOid, merged);
+      tree.set(b.path, synthOid);
+      break;
+    }
     case "note":
       break;
   }
