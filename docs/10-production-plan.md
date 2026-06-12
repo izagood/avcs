@@ -2,6 +2,19 @@
 
 MVP(Phase 1–12)는 **모델이 옳다는 것**을 증명했다: 결정론적 reduce, 충돌-as-데이터, 의미(symbol) 머지, 거버넌스, 멀티머신 수렴. 단, 전부 **단일 프로세스 / 로컬 파일 / 휴리스틱** 깊이다. Production은 다른 축의 문제 — **성능·호스팅·내구 저장·의미 정확도·신뢰 강화·운영성** — 을 풀어야 한다. 본 문서는 그 격차를 6개 워크스트림과 4개 마일스톤으로 구조화한다.
 
+## 구현 현황 (M1–M4 MVP 슬라이스 + 통합 검증)
+
+PR #24–31로 각 마일스톤의 핵심 슬라이스를 구현했다(나머지 대형 인프라는 아래 워크스트림에 후속으로 명시):
+
+- **M1 성능** ✅ reduce 결과 캐시(입력 시그니처, clone-on-hit). + **결정론 property 하니스**가 실제 비결정론 버그(교차-granularity put_file∥set_symbol)를 발견→수정, 5/5 property로 결정론 강제. *후속: dirty-key incremental reduce(checkpoint base).*
+- **M2 호스팅** ✅ **네트워크 hub**(HTTP `/have`·`/objects`·`/refs`) + **거버넌스 배포**(hub가 policy/member/protection/head 게시, 클라이언트 pull) + **gated push**(멤버 서명 검증) + **권한가중 결정** + **키 revocation**. *후속: object-storage 백엔드·set reconciliation·mTLS.*
+- **M3 의미** ✅ `rename_symbol`·`move_symbol` AST op. *후속: 실제 tree-sitter 백엔드·cross-file 참조·typecheck-in-merge.*
+- **M4 운영** ✅ in-process metrics(cache hit/miss·reduce.ms) + MCP/CLI 노출 + MCP 서버 Repo 재사용(캐시·metrics 유지). *후속: OTel/Prometheus forward·sync lag/queue gauge.*
+
+**통합 검증** (`test/integration-multiuser-hub.test.ts`, 매 `npm test` 실행): 권한이 다른 다중 유저가 각자 repo에서 다중 에이전트로 작업하며 **실제 로컬 hub**로 push/pull — C1 분리작업 수렴 · C2 같은 symbol 충돌이 모든 replica에 동일 id · C3 권한(admin>reviewer) 결정 수렴 · C4 gated hub가 외부자 거부 · C5 quarantine→promote · C6 finalize CAS+head 배포. 전체 **89/89** 통과, tsc clean.
+
+대형 인프라(CBOR 전환·packing/compaction·object-storage·native tree-sitter·HSM/threshold 키)는 환경/범위상 후속으로 둔다.
+
 ## 0. MVP → Production 격차 요약
 
 | 축 | MVP 현재 | Production 목표 |
