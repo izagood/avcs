@@ -53,6 +53,11 @@ export interface Blob extends BaseObject {
 export type IntentKind = "feature" | "bugfix" | "refactor" | "formatting" | "generated";
 /** A symbol/file/glob scope the intent is allowed to touch. */
 export type ScopeRef = string; // e.g. "file:src/cache/*", "symbol:UserService.findById"
+/** Machine-checkable invariants. `constraints` (NL) is human prose; these are enforced. */
+export type ConstraintKind =
+  | "forbid_public_api_break"
+  | "forbid_behavior_change"
+  | "require_tests";
 
 export interface Intent extends BaseObject {
   type: "intent";
@@ -61,6 +66,8 @@ export interface Intent extends BaseObject {
   kind: IntentKind;
   priority: "low" | "normal" | "high" | "critical";
   constraints: string[]; // natural-language invariants the change must preserve
+  /** Structured, enforced invariants. Take precedence over NL `constraints`. */
+  constraintKinds?: ConstraintKind[];
   successCriteria: string[];
   allowedScopes: ScopeRef[];
   createdAt: string;

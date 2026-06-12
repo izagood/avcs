@@ -42,8 +42,10 @@ async function main(): Promise<void> {
       for (const s of res.statuses.values()) counts[s] = (counts[s] ?? 0) + 1;
       console.log(`view: ${view}`);
       console.log(`operations: ${JSON.stringify(counts)}`);
-      console.log(`files: ${res.tree.size}   conflicts: ${res.conflicts.length}`);
+      console.log(`files: ${res.tree.size}   conflicts: ${res.conflicts.length}   auto-merged: ${res.autoDecisions.length}`);
       console.log(`treeHash: ${res.treeHash}`);
+      for (const a of res.autoDecisions)
+        console.log(`  ✓ auto @ ${a.key}: chose ${a.chosenOp.slice(0, 16)} (policy ${a.policyVersion})`);
       if (res.conflicts.length) console.log(`\nrun \`avcs conflicts ${view}\` to review`);
       break;
     }
