@@ -149,6 +149,36 @@ async function main(): Promise<void> {
       console.log(h ? `${view}: ${h}` : `${view}: (not finalized)`);
       break;
     }
+    case "import": {
+      const repo = await Repo.open(cwd);
+      const src = args[1];
+      if (!src) throw new Error("usage: avcs import <source-dir> [-m message] [--author id]");
+      const message = flag("-m") ?? flag("--message") ?? `import ${src}`;
+      const author = flag("--author") ?? "human:cli";
+      const r = await repo.commitWorkingTree(src, { message, actor: { kind: "human", id: author } });
+      console.log(`imported ${r.ops.length} file(s) from ${src} (${r.added.length} new)`);
+      break;
+    }
+    case "bundle": {
+      const repo = await Repo.open(cwd);
+      const out = args[1];
+      if (!out) throw new Error("usage: avcs bundle <out-file>");
+      const { writeFile } = await import("node:fs/promises");
+      const b = await repo.exportBundle();
+      await writeFile(out, JSON.stringify(b), "utf8");
+      console.log(`bundled ${b.objects.length} object(s) + ${Object.keys(b.refs).length} ref(s) → ${out}`);
+      break;
+    }
+    case "unbundle": {
+      const repo = await Repo.open(cwd);
+      const file = args[1];
+      if (!file) throw new Error("usage: avcs unbundle <bundle-file>");
+      const { readFile } = await import("node:fs/promises");
+      const b = JSON.parse(await readFile(file, "utf8"));
+      const r = await repo.importBundle(b);
+      console.log(`unbundled ${r.objects} object(s), ${r.refs} ref(s)`);
+      break;
+    }
     case "checkout": {
       const repo = await Repo.open(cwd);
       const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
@@ -239,6 +269,9 @@ async function main(): Promise<void> {
           "  init [dir]                  create a repo\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
+          "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
+          "  bundle <file>               export the whole repo to a portable file\n" +
+          "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +

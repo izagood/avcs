@@ -28,6 +28,7 @@ import { checkLease, isActive, type LeaseConflict } from "../concurrency/lease.t
 import { Metrics } from "../observe/metrics.ts";
 import type {
   Actor,
+  AnyObject,
   Blob,
   Checkpoint,
   Decision,
@@ -1096,7 +1097,7 @@ export class Repo {
     for (const ent of await readdir(workDir, { recursive: true, withFileTypes: true })) {
       if (!ent.isFile()) continue;
       const rel = join(ent.parentPath ?? (ent as { path?: string }).path ?? workDir, ent.name).slice(workDir.length + 1);
-      if (rel.startsWith(".avcs") || rel === ".avcs-workspace") continue;
+      if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel.startsWith(".git")) continue;
       out.set(rel.split("\\").join("/"), await readFile(join(workDir, rel), "utf8"));
     }
     return out;
@@ -1151,6 +1152,30 @@ export class Repo {
       ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line }));
     }
     return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), intent };
+  }
+
+  // ── backup / transfer (docs/10 WS-F) ──────────────────────────────────────
+  /** Export the whole repo (all objects + refs) as a portable bundle for backup/transfer. */
+  async exportBundle(): Promise<{ version: number; objects: AnyObject[]; refs: Record<string, string> }> {
+    const objects: AnyObject[] = [];
+    for await (const o of this.store.list()) objects.push(o);
+    return { version: 1, objects, refs: Object.fromEntries(await this.store.listRefs()) };
+  }
+
+  /** Import a bundle into this repo (idempotent, content-addressed). Rebuilds the entity index. */
+  async importBundle(bundle: { objects: AnyObject[]; refs?: Record<string, string> }): Promise<{ objects: number; refs: number }> {
+    for (const o of bundle.objects) {
+      const oid = await this.store.put(o);
+      if (o.type === "operation") for (const k of keysOf(o as Operation)) await this.store.appendEntityIndex(k, oid);
+    }
+    let refs = 0;
+    for (const [name, oid] of Object.entries(bundle.refs ?? {})) {
+      if (await this.store.has(oid)) {
+        await this.store.setRef(name, oid);
+        refs++;
+      }
+    }
+    return { objects: bundle.objects.length, refs };
   }
 
   /**
