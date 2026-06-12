@@ -5,7 +5,8 @@
 // agent workflow: intent → session → propose op → attach evidence → materialize →
 // decide → checkpoint.
 
-import { mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdir, writeFile, rm, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
@@ -84,6 +85,14 @@ export class Repo {
     return this.store.get<Policy>(oid);
   }
 
+  // ── reading ──────────────────────────────────────────────────────────────
+  async readIntent(oid: string): Promise<Intent> {
+    return this.store.get<Intent>(oid);
+  }
+  async listIntents(): Promise<Intent[]> {
+    return this.store.collect<Intent>("intent");
+  }
+
   // ── authoring ──────────────────────────────────────────────────────────
   async createIntent(args: {
     title: string;
@@ -91,6 +100,7 @@ export class Repo {
     kind?: IntentKind;
     priority?: Intent["priority"];
     constraints?: string[];
+    constraintKinds?: Intent["constraintKinds"];
     successCriteria?: string[];
     allowedScopes?: ScopeRef[];
   }): Promise<string> {
@@ -101,6 +111,7 @@ export class Repo {
       kind: args.kind ?? "feature",
       priority: args.priority ?? "normal",
       constraints: args.constraints ?? [],
+      constraintKinds: args.constraintKinds,
       successCriteria: args.successCriteria ?? [],
       allowedScopes: args.allowedScopes ?? [],
       createdAt: new Date().toISOString(),
@@ -273,12 +284,35 @@ export class Repo {
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
 
-    return reduce({ ops, evidence, decisions, intents, policy: await this.policy() });
+    return reduce({
+      ops,
+      evidence,
+      decisions,
+      intents,
+      policy: await this.policy(),
+      materializeStatuses: q.includeStatuses,
+    });
   }
 
-  /** Write the materialized tree to a directory (the working projection). */
+  /**
+   * Write the materialized tree to a directory. Refuses to clobber an existing
+   * non-empty directory unless it carries our marker, so a stray `--out` can't
+   * `rm -rf` someone's source tree.
+   */
   async writeWorkspace(result: ReductionResult, targetDir: string): Promise<void> {
-    await rm(targetDir, { recursive: true, force: true });
+    const marker = join(targetDir, ".avcs-workspace");
+    if (existsSync(targetDir)) {
+      const entries = await readdir(targetDir);
+      const nonEmpty = entries.filter((e) => e !== "." && e !== "..");
+      if (nonEmpty.length > 0 && !existsSync(marker)) {
+        throw new Error(
+          `refusing to overwrite non-empty directory without an .avcs-workspace marker: ${targetDir}`,
+        );
+      }
+      await rm(targetDir, { recursive: true, force: true });
+    }
+    await mkdir(targetDir, { recursive: true });
+    await writeFile(marker, `materialized ${result.treeHash}\n`, "utf8");
     for (const [path, blobOid] of result.tree) {
       const full = join(targetDir, path);
       await mkdir(dirname(full), { recursive: true });
@@ -290,8 +324,16 @@ export class Repo {
     const view = await this.getView(viewName);
     const result = await this.materialize(viewName);
     const evidence: Checkpoint["evidence"] = {};
-    for (const ev of await this.store.collect<Evidence>("evidence")) {
-      // Only count evidence for accepted ops.
+    // Deterministic aggregation: process evidence in canonical (createdAt, oid) order
+    // so the "last result wins per kind" outcome is replica-independent.
+    const allEvidence = (await this.store.collect<Evidence>("evidence")).sort(
+      (a, b) =>
+        (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) ||
+        ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1),
+    );
+    for (const ev of allEvidence) {
+      // Only count trusted evidence for accepted ops.
+      if (ev.producedBy.kind === "ai_agent") continue;
       if (ev.forOps.some((o) => result.statuses.get(o) === "accepted")) {
         evidence[ev.kind] = ev.result;
       }

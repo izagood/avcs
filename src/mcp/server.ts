@@ -61,6 +61,18 @@ const TOOLS: ToolDef[] = [
     handler: (repo, i) => repo.createIntent(i as never),
   },
   {
+    name: "avcs.intent.read",
+    description: "Read an intent (goal, constraints, allowed scopes). An agent should read this BEFORE proposing operations so it works within the constraints.",
+    inputSchema: { type: "object", properties: { intentOid: { type: "string" } }, required: ["intentOid"] },
+    handler: (repo, i) => repo.readIntent(String(i.intentOid)),
+  },
+  {
+    name: "avcs.intent.list",
+    description: "List all intents in the repo.",
+    inputSchema: { type: "object", properties: {} },
+    handler: (repo) => repo.listIntents(),
+  },
+  {
     name: "avcs.session.start",
     description: "Begin a work session for an agent/human against an intent. Returns a session id used on every operation.",
     inputSchema: {
@@ -164,7 +176,7 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.decision.record",
-    description: "Record a human/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history.",
+    description: "Record a HUMAN/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history. Rejected unless actor.kind is 'human' (an agent may not decide its own conflicts; cryptographic enforcement lands in Phase 3).",
     inputSchema: {
       type: "object",
       properties: {
@@ -177,15 +189,20 @@ const TOOLS: ToolDef[] = [
       },
       required: ["conflictId", "reason"],
     },
-    handler: (repo, i) =>
-      repo.recordDecision({
+    handler: (repo, i) => {
+      const actor = actorOf(i);
+      if (actor.kind !== "human") {
+        throw new Error("avcs.decision.record requires a human actor; agents may not resolve their own conflicts");
+      }
+      return repo.recordDecision({
         conflictId: String(i.conflictId),
         chosenOps: (i.chosenOps as string[]) ?? [],
         rejectedOps: (i.rejectedOps as string[]) ?? [],
         reason: String(i.reason),
-        decidedBy: actorOf(i),
+        decidedBy: actor,
         futurePolicy: i.futurePolicy as string | undefined,
-      }),
+      });
+    },
   },
   {
     name: "avcs.checkpoint.create",
