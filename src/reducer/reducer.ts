@@ -209,6 +209,57 @@ export function conflictIdFor(key: string): string {
   return `conflict_${sha256hex(key).slice(0, 24)}`;
 }
 
+export interface CrossConflict {
+  file: string;
+  ops: string[]; // the concurrent whole-file + symbol ops on that file
+}
+
+/**
+ * A whole-file op (put_file/delete/rename) and a set_symbol on the SAME file are keyed
+ * differently (file:… vs symbol:…#…), so the reducer's grouping never makes them
+ * contend. When they are CONCURRENT (neither a causal ancestor of the other), letting
+ * both apply makes the result depend on kahnOrder's lamport (authoring-order) tie-break
+ * — non-deterministic. This finds those pairs among ACCEPTED ops so the repo can hold
+ * them back (re-reduce) and surface a conflict. Ancestor relations (scaffold→edit) are
+ * intentionally not flagged.
+ */
+export function detectCrossGranularity(ops: Operation[], result: ReductionResult): CrossConflict[] {
+  const anc = ancestry(ops);
+  const fileOf = (o: Operation): string | null => {
+    const b = o.body;
+    if (b.kind === "put_file" || b.kind === "delete_file") return b.path ?? o.target.entityId;
+    if (b.kind === "rename_file") return b.fromPath ?? o.target.entityId;
+    if (b.kind === "set_symbol") return b.path ?? null;
+    return null;
+  };
+  const isWhole = (o: Operation) =>
+    o.body.kind === "put_file" || o.body.kind === "delete_file" || o.body.kind === "rename_file";
+  const byFile = new Map<string, Operation[]>();
+  for (const o of ops) {
+    if (result.statuses.get(o.oid as string) !== "accepted") continue;
+    const f = fileOf(o);
+    if (f) (byFile.get(f) ?? byFile.set(f, []).get(f)!).push(o);
+  }
+  const out: CrossConflict[] = [];
+  for (const [file, fops] of byFile) {
+    const whole = fops.filter(isWhole);
+    const syms = fops.filter((o) => o.body.kind === "set_symbol");
+    if (!whole.length || !syms.length) continue;
+    const involved = new Set<string>();
+    for (const w of whole)
+      for (const s of syms) {
+        const wId = w.oid as string;
+        const sId = s.oid as string;
+        if (!anc.get(wId)?.has(sId) && !anc.get(sId)?.has(wId)) {
+          involved.add(wId);
+          involved.add(sId);
+        }
+      }
+    if (involved.size) out.push({ file, ops: [...involved].sort() });
+  }
+  return out;
+}
+
 export function reduce(input: ReduceInput): ReductionResult {
   const { intents, policy } = input;
   const materializeStatuses = new Set(input.materializeStatuses ?? ["accepted"]);
