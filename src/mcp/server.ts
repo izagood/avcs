@@ -213,6 +213,72 @@ const TOOLS: ToolDef[] = [
     },
     handler: (repo, i) => repo.createCheckpoint((i.view as string) ?? "main", (i.summary as string) ?? "checkpoint"),
   },
+  {
+    name: "avcs.lease.request",
+    description: "Request a soft write-lease over entity scopes BEFORE editing, to avoid duplicating another agent's in-flight work. Returns the lease oid, or the conflicting holders.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intentOid: { type: "string" },
+        sessionOid: { type: "string" },
+        actor: actorSchema,
+        writeScopes: { type: "array", items: { type: "string" }, description: "e.g. ['symbol:mod.ts#alpha','file:a.ts']" },
+        mode: { type: "string", enum: ["exclusive", "shared"] },
+        ttlMs: { type: "number" },
+      },
+      required: ["intentOid", "sessionOid", "actor", "writeScopes"],
+    },
+    handler: (repo, i) =>
+      repo.requestLease({
+        intentOid: String(i.intentOid),
+        sessionOid: String(i.sessionOid),
+        actor: actorOf(i),
+        writeScopes: i.writeScopes as string[],
+        mode: i.mode as "exclusive" | "shared" | undefined,
+        ttlMs: i.ttlMs as number | undefined,
+      }),
+  },
+  {
+    name: "avcs.validate.run",
+    description: "Run validation commands (test/lint/typecheck) against a materialized view and attach the results as signed-able Evidence. Behavior changes need passing evidence to be accepted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ops: { type: "array", items: { type: "string" } },
+        view: { type: "string" },
+        ciActor: actorSchema,
+        checks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { kind: { type: "string" }, command: { type: "string" } },
+            required: ["kind", "command"],
+          },
+        },
+      },
+      required: ["ops", "ciActor", "checks"],
+    },
+    handler: async (repo, i) => {
+      const { runChecks } = await import("../validation/runner.ts");
+      const { mkdtemp } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const workspaceDir = await mkdtemp(join(tmpdir(), "avcs-validate-"));
+      return runChecks(repo, {
+        ops: i.ops as string[],
+        view: i.view as string | undefined,
+        workspaceDir,
+        ciActor: actorOf(i),
+        checks: i.checks as { kind: never; command: string }[],
+      });
+    },
+  },
+  {
+    name: "avcs.repair.context",
+    description: "Get a MINIMAL repair packet for ops whose validation failed (the failing output + related prior decisions + a fix instruction). Use instead of re-reading the whole repo.",
+    inputSchema: { type: "object", properties: { ops: { type: "array", items: { type: "string" } } }, required: ["ops"] },
+    handler: (repo, i) => repo.repairContext(i.ops as string[]),
+  },
 ];
 
 async function main(): Promise<void> {

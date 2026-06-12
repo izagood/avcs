@@ -23,12 +23,22 @@ export type ObjectType =
   | "decision"
   | "checkpoint"
   | "view"
-  | "policy";
+  | "policy"
+  | "lease";
+
+/** ed25519 signature over an object's oid. Excluded from the oid hash. */
+export interface Signature {
+  keyId: string;
+  alg: "ed25519";
+  sig: string; // base64
+}
 
 export interface BaseObject {
   type: ObjectType;
   /** Content address. Filled in by the store on write; absent while building. */
   oid?: string;
+  /** Optional signature by the producing actor over this object's oid (Phase 3). */
+  sig?: Signature;
 }
 
 // ── Actors ──────────────────────────────────────────────────────────────────
@@ -253,6 +263,24 @@ export interface Policy extends BaseObject {
   createdAt: string;
 }
 
+// ── lease (Phase 3) ───────────────────────────────────────────────────────────
+// A soft, optimistic reservation over entity scopes. Reduces conflicts at the START
+// of work instead of resolving them after: an exclusive write-lease on a scope warns
+// the next writer before they duplicate effort. Not a hard lock — leases expire.
+export interface WorkLease extends BaseObject {
+  type: "lease";
+  intentOid: string;
+  sessionOid: string;
+  actor: Actor;
+  /** Scopes this lease reserves for writing, e.g. "symbol:mod.ts#alpha", "file:a.ts". */
+  writeScopes: ScopeRef[];
+  mode: "exclusive" | "shared";
+  acquiredAt: string;
+  expiresAt: string;
+  /** Set when explicitly released before expiry. */
+  releasedAt?: string;
+}
+
 export type AnyObject =
   | Blob
   | Intent
@@ -262,4 +290,5 @@ export type AnyObject =
   | Decision
   | View
   | Checkpoint
-  | Policy;
+  | Policy
+  | WorkLease;
