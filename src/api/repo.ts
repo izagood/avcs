@@ -12,7 +12,7 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex } from "../core/canonical.ts";
-import { reduce, conflictIdFor, keysOf, type ReductionResult } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, keysOf, detectCrossGranularity, type ReductionResult } from "../reducer/reducer.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
 import type { OwnerRule } from "../objects/types.ts";
@@ -984,18 +984,22 @@ export class Repo {
     const base = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability, authority };
     const pass1 = reduce(base);
 
-    // Phase 4: semantic-conflict pass. Find contract breaks that the text-clean
-    // grouping accepted, then re-reduce with the breaking ops held back so the tree
-    // stays safe and the break becomes a human decision.
+    // Second-pass conflicts that the text-clean grouping accepted but that must be
+    // held back (re-reduce excluding them so the tree stays safe — base content falls
+    // back in automatically): (a) Phase-4 semantic contract breaks, and (b) the
+    // cross-granularity determinism hole — a whole-file op concurrent with a symbol
+    // edit on the same file (found by the determinism harness).
     const semantic = detectSemanticConflicts(ops, pass1, evidence, blobContent);
-    if (semantic.length === 0) return pass1;
+    const cross = detectCrossGranularity(ops, pass1);
+    if (semantic.length === 0 && cross.length === 0) return pass1;
 
-    const breaking = new Set(semantic.map((s) => s.breakingOp));
-    const pass2 = reduce({ ...base, ops: ops.filter((o) => !breaking.has(o.oid as string)) });
+    const held = new Set<string>([...semantic.map((s) => s.breakingOp), ...cross.flatMap((c) => c.ops)]);
+    const pass2 = reduce({ ...base, ops: ops.filter((o) => !held.has(o.oid as string)) });
     for (const s of semantic) {
       pass2.statuses.set(s.breakingOp, "needs_decision");
       for (const d of s.dependentOps) pass2.statuses.set(d, pass2.statuses.get(d) ?? "needs_decision");
     }
+    for (const oid of cross.flatMap((c) => c.ops)) pass2.statuses.set(oid, "needs_decision");
     pass2.semanticConflicts = semantic;
     for (const s of semantic) {
       pass2.conflicts.push({
@@ -1008,6 +1012,16 @@ export class Repo {
           opOid: oid, actor: "", purpose: oid === s.breakingOp ? "contract change" : "depends on old contract",
           evidence: [], score: 0, blocked: false, requiresHuman: true,
         })),
+      });
+    }
+    for (const c of cross) {
+      pass2.conflicts.push({
+        id: conflictIdFor(`file:${c.file}`),
+        key: `file:${c.file}`,
+        kind: "concurrent_write",
+        reason: `whole-file write and symbol edit on ${c.file} are concurrent — can't both apply deterministically`,
+        recommendedOp: null,
+        options: c.ops.map((oid) => ({ opOid: oid, actor: "", purpose: "concurrent whole-file/symbol edit", evidence: [], score: 0, blocked: false, requiresHuman: false })),
       });
     }
     return pass2;
