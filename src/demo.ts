@@ -6,6 +6,9 @@
 //   • policy auto-decision on a contended file  (Level 2)
 //   • evidence gating of a behavior change      (Level 3)
 //   • human decision on a public-API break      (Level 4)
+// …then a multi-machine scene (Phase 7): two replicas work independently and
+// reconcile by object gossip (`pull`) — converging to the same treeHash, and
+// surfacing a genuine conflict as the SAME Decision on both sides (no merge step).
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +33,7 @@ async function main(): Promise<void> {
   // createdAt timestamps, so re-authoring "the same" intent across runs yields new
   // oids; without this, repeated runs would accumulate cross-run operations.)
   await rm(repoDir, { recursive: true, force: true });
+  await rm(workDir, { recursive: true, force: true });
   const repo = await Repo.init(repoDir);
 
   hr("Intent: UserService에 Redis cache 추가 (public API 유지 제약)");
@@ -139,6 +143,55 @@ async function main(): Promise<void> {
   await repo.writeWorkspace(final, workDir);
   console.log(`\nmaterialized files → ${workDir}`);
   for (const p of [...final.tree.keys()].sort()) console.log(`  ${p}`);
+
+  await multiMachineScene();
+}
+
+// ── Multi-machine sync (Phase 7) ────────────────────────────────────────────
+// Two machines work independently and reconcile by object gossip (`pull`). There is
+// no "merge" step: sync just makes both sides hold the same append-only object set,
+// and each side's deterministic reduce yields the same tree. A genuine conflict
+// becomes the SAME Decision on both replicas — data, not a broken working copy.
+const greet = (v: string) => `export function greet() {\n  return "${v}";\n}`;
+
+async function multiMachineScene(): Promise<void> {
+  const dirL = join(here, "..", "scratch", "demo-machine-L"); // dev jinbin's laptop
+  const dirR = join(here, "..", "scratch", "demo-machine-R"); // a remote teammate
+  await rm(dirL, { recursive: true, force: true });
+  await rm(dirR, { recursive: true, force: true });
+  const L = await Repo.init(dirL);
+  const R = await Repo.init(dirR);
+
+  hr("멀티머신 — 공유 base, 그리고 R이 L을 clone(pull)");
+  const intent = await L.createIntent({ title: "greeting 모듈", owner: human.id });
+  const sL = await L.startSession({ intentOid: intent, actor: agentA });
+  const base = await L.proposeFileWrite({ sessionOid: sL, intentOid: intent, actor: agentA, path: "src/mod.ts", content: greet("v0") + "\n", declaredPurpose: "scaffold greet" });
+  await R.pull(dirL);
+  console.log(`L scaffolds src/mod.ts → R.pull(L): R가 base를 받음`);
+
+  hr("Scene A — 서로 다른 파일 동시 작업 → gossip 후 같은 treeHash로 수렴");
+  await L.proposeFileWrite({ sessionOid: sL, intentOid: intent, actor: agentA, path: "src/cache.ts", content: "export class Cache {}\n", declaredPurpose: "L: cache", causalDeps: [base] });
+  const sR = await R.startSession({ intentOid: intent, actor: agentB });
+  await R.proposeFileWrite({ sessionOid: sR, intentOid: intent, actor: agentB, path: "src/config.ts", content: "export const cfg = {}\n", declaredPurpose: "R: config", causalDeps: [base] });
+  await L.pull(dirR);
+  await R.pull(dirL);
+  const ra = await L.materialize();
+  const rb = await R.materialize();
+  console.log(`L files: ${[...ra.tree.keys()].sort().join(", ")}`);
+  console.log(`R files: ${[...rb.tree.keys()].sort().join(", ")}`);
+  console.log(`treeHash L == R ? ${ra.treeHash === rb.treeHash ? "✅ 수렴 (충돌 단계 없음)" : "❌"}`);
+
+  hr("Scene B — 같은 symbol 동시 수정 → 양쪽에 동일한 Decision(충돌은 데이터)");
+  await L.proposeSymbolEdit({ sessionOid: sL, intentOid: intent, actor: agentA, path: "src/mod.ts", symbolName: "greet", newText: greet("L-version"), declaredPurpose: "L: greet 변경", causalDeps: [base] });
+  await R.proposeSymbolEdit({ sessionOid: sR, intentOid: intent, actor: agentB, path: "src/mod.ts", symbolName: "greet", newText: greet("R-version"), declaredPurpose: "R: greet 변경", causalDeps: [base] });
+  await L.pull(dirR);
+  await R.pull(dirL);
+  const ca = await L.materialize();
+  const cb = await R.materialize();
+  console.log(`L conflicts: ${ca.conflicts.length}  |  R conflicts: ${cb.conflicts.length}`);
+  console.log(`동일 conflict id? ${ca.conflicts[0]?.id === cb.conflicts[0]?.id ? `✅ ${ca.conflicts[0]?.id}` : "❌"}`);
+  console.log(`동일 materialized 상태(treeHash)? ${ca.treeHash === cb.treeHash ? "✅" : "❌"}`);
+  console.log("→ 사람이 한쪽에서 decision.record 하면, 다음 pull로 양쪽이 같은 해소 상태로 수렴");
 }
 
 async function report(repo: Repo) {
