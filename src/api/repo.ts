@@ -12,7 +12,7 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid } from "../core/canonical.ts";
-import { reduce, conflictIdFor, type ReductionResult } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, keysOf, type ReductionResult } from "../reducer/reducer.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
 import type { OwnerRule } from "../objects/types.ts";
@@ -253,7 +253,10 @@ export class Repo {
       ...(args.line && args.line !== "main" ? { line: args.line } : {}),
       ...(args.derivedFrom ? { derivedFrom: args.derivedFrom } : {}),
     };
-    return this.store.put(op);
+    const oid = await this.store.put(op);
+    // Maintain the entity index (Phase 9): key → op oids for fast history/blame.
+    for (const key of keysOf({ ...op, oid })) await this.store.appendEntityIndex(key, oid);
+    return oid;
   }
 
   /** Convenience: write file content as a blob + a put_file operation. */
@@ -547,6 +550,14 @@ export class Repo {
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
       ops.push(op);
     }
+    return this.#reduceOpSet(ops, q.includeStatuses);
+  }
+
+  /**
+   * Reduce an explicit operation set (with the semantic-conflict 2-pass). Shared by
+   * `materialize` (view-selected ops) and `materializeAt` (a frontier's closure).
+   */
+  async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"]): Promise<ReductionResult> {
     const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
     const decisions = await this.store.collect<Decision>("decision");
     const intents = new Map<string, Intent>();
@@ -561,7 +572,7 @@ export class Repo {
 
     const policy = await this.policy();
     const reliability = computeReliability(ops, evidence, decisions);
-    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: q.includeStatuses, blobContent, reliability };
+    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability };
     const pass1 = reduce(base);
 
     // Phase 4: semantic-conflict pass. Find contract breaks that the text-clean
@@ -591,6 +602,36 @@ export class Repo {
       });
     }
     return pass2;
+  }
+
+  /**
+   * Materialize the state AT a given frontier: reduce only the causal closure of
+   * `headOps`. The basis for time-travel — history, bisect, and diff-at-point all
+   * reduce over a prefix instead of the whole graph. (Phase 9 / Phase 10)
+   */
+  async materializeAt(headOps: string[], includeStatuses: ViewQuery["includeStatuses"] = ["accepted"]): Promise<ReductionResult> {
+    const allOps = await this.store.collect<Operation>("operation");
+    const byId = new Map(allOps.map((o) => [o.oid as string, o]));
+    const closure = new Set<string>();
+    const stack = [...headOps];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (closure.has(id)) continue;
+      closure.add(id);
+      for (const dep of byId.get(id)?.causalDeps ?? []) if (!closure.has(dep)) stack.push(dep);
+    }
+    return this.#reduceOpSet(allOps.filter((o) => closure.has(o.oid as string)), includeStatuses);
+  }
+
+  /**
+   * History of one entity (file path or `<path>#<symbol>`) in causal order, via the
+   * entity index — O(ops-on-that-entity), not a full-store scan. The basis for blame
+   * and `log -p`. (Phase 9 / Phase 10)
+   */
+  async historyOf(entityKey: string): Promise<Operation[]> {
+    const oids = await this.store.readEntityIndex(entityKey);
+    const ops = await Promise.all(oids.map((o) => this.store.get<Operation>(o)));
+    return ops.sort((a, b) => a.lamport - b.lamport || ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1));
   }
 
   /**
