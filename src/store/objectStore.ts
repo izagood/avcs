@@ -10,14 +10,16 @@
 // fully auditable: the entire causal history of how code reached its current state
 // is replayable.
 
-import { mkdir, readFile, writeFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, open, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { canonicalize, computeOid } from "../core/canonical.ts";
+import { withLock, type LockOptions } from "./lock.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
 
 export class ObjectStore {
   readonly root: string; // the .avcs directory
+  #wc = 0; // temp-file counter for atomic writes
   constructor(repoDir: string) {
     this.root = join(repoDir, ".avcs");
   }
@@ -25,9 +27,32 @@ export class ObjectStore {
   async init(): Promise<void> {
     await mkdir(join(this.root, "objects"), { recursive: true });
     await mkdir(join(this.root, "refs"), { recursive: true });
+    await mkdir(join(this.root, "locks"), { recursive: true });
     if (!existsSync(join(this.root, "HEAD"))) {
-      await writeFile(join(this.root, "HEAD"), "main", "utf8");
+      await this.#writeAtomic(join(this.root, "HEAD"), "main");
     }
+  }
+
+  /**
+   * Crash- and concurrency-safe write: write a unique temp file in the same dir,
+   * fsync it, then atomically rename over the target. A reader therefore sees either
+   * the old file or the complete new one — never a torn/partial read. (H-5)
+   */
+  async #writeAtomic(path: string, data: string): Promise<void> {
+    const tmp = `${path}.tmp-${process.pid}-${++this.#wc}`;
+    const fh = await open(tmp, "w");
+    try {
+      await fh.writeFile(data, "utf8");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, path); // atomic on the same filesystem
+  }
+
+  /** Run a critical section under a named cross-process lock (see lock.ts). */
+  async withLock<T>(name: string, fn: () => Promise<T>, opts?: LockOptions): Promise<T> {
+    return withLock(join(this.root, "locks"), name, fn, opts);
   }
 
   static isRepo(repoDir: string): boolean {
@@ -52,7 +77,9 @@ export class ObjectStore {
     const p = this.#pathFor(oid);
     if (!existsSync(p)) {
       await mkdir(dirname(p), { recursive: true });
-      await writeFile(p, canonicalize({ ...payload, oid }), "utf8");
+      // Atomic: concurrent writers of the same oid write distinct temp files and the
+      // rename is a no-op overwrite with identical content; never a torn object.
+      await this.#writeAtomic(p, canonicalize({ ...payload, oid }));
     }
     return oid;
   }
@@ -92,7 +119,7 @@ export class ObjectStore {
 
   // ── refs ────────────────────────────────────────────────────────────────
   async setRef(name: string, oid: string): Promise<void> {
-    await writeFile(join(this.root, "refs", name), oid, "utf8");
+    await this.#writeAtomic(join(this.root, "refs", name), oid);
   }
   async getRef(name: string): Promise<string | null> {
     const p = join(this.root, "refs", name);
@@ -100,7 +127,7 @@ export class ObjectStore {
     return (await readFile(p, "utf8")).trim();
   }
   async setHead(viewName: string): Promise<void> {
-    await writeFile(join(this.root, "HEAD"), viewName, "utf8");
+    await this.#writeAtomic(join(this.root, "HEAD"), viewName);
   }
   async getHead(): Promise<string> {
     return (await readFile(join(this.root, "HEAD"), "utf8")).trim();

@@ -368,20 +368,27 @@ export class Repo {
     ttlMs?: number;
   }): Promise<{ granted: true; leaseOid: string } | { granted: false; conflicts: LeaseConflict[] }> {
     const mode = args.mode ?? "exclusive";
-    const conflicts = checkLease({ writeScopes: args.writeScopes, mode, actorId: args.actor.id }, await this.activeLeases());
-    if (conflicts.length) return { granted: false, conflicts };
-    const now = Date.now();
-    const lease: WorkLease = {
-      type: "lease",
-      intentOid: args.intentOid,
-      sessionOid: args.sessionOid,
-      actor: args.actor,
-      writeScopes: args.writeScopes,
-      mode,
-      acquiredAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + (args.ttlMs ?? 30 * 60_000)).toISOString(),
-    };
-    return { granted: true, leaseOid: await this.store.put(lease) };
+    // H-6: check-then-write under a lock so two concurrent requesters cannot both
+    // read "no conflict" and both acquire an overlapping exclusive lease (TOCTOU).
+    return this.store.withLock("leases", async () => {
+      const conflicts = checkLease(
+        { writeScopes: args.writeScopes, mode, actorId: args.actor.id },
+        await this.activeLeases(),
+      );
+      if (conflicts.length) return { granted: false, conflicts };
+      const now = Date.now();
+      const lease: WorkLease = {
+        type: "lease",
+        intentOid: args.intentOid,
+        sessionOid: args.sessionOid,
+        actor: args.actor,
+        writeScopes: args.writeScopes,
+        mode,
+        acquiredAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + (args.ttlMs ?? 30 * 60_000)).toISOString(),
+      };
+      return { granted: true, leaseOid: await this.store.put(lease) };
+    });
   }
 
   /** Build a minimal repair packet for ops whose validation failed. */
