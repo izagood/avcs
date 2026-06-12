@@ -866,9 +866,62 @@ export class Repo {
    * Reduce an explicit operation set (with the semantic-conflict 2-pass). Shared by
    * `materialize` (view-selected ops) and `materializeAt` (a frontier's closure).
    */
+  // M1: cache reduction results keyed on a signature of the inputs. reduce() is a
+  // pure function of (ops, evidence, decisions, policy, materializer), so identical
+  // inputs ⇒ identical result — we skip the grouping/eval/semantic-2-pass/blob-load
+  // cost on repeat calls (the hundreds-of-agents-re-materialize case, and CLI/MCP
+  // repeats). A clone is returned so callers can mutate without corrupting the cache.
+  #reduceCache = new Map<string, ReductionResult>();
+  static readonly REDUCE_CACHE_MAX = 64;
+
+  #cloneResult(r: ReductionResult): ReductionResult {
+    return {
+      tree: new Map(r.tree),
+      treeHash: r.treeHash,
+      statuses: new Map(r.statuses),
+      conflicts: r.conflicts.map((c) => ({ ...c })),
+      autoDecisions: r.autoDecisions.map((a) => ({ ...a })),
+      semanticConflicts: r.semanticConflicts.map((s) => ({ ...s })),
+      headOps: [...r.headOps],
+      synthBlobs: new Map(r.synthBlobs),
+    };
+  }
+
   async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"]): Promise<ReductionResult> {
     const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
     const decisions = await this.store.collect<Decision>("decision");
+
+    // Redactions overwrite blob bytes while keeping the oid, so they don't change op
+    // oids — include them in the signature so a redaction invalidates the cache.
+    const redactions = await this.store.collect<Redaction>("redaction");
+    const sig = sha256hex(
+      [
+        ops.map((o) => o.oid).sort().join(","),
+        evidence.map((e) => e.oid).sort().join(","),
+        decisions.map((d) => d.oid).sort().join(","),
+        redactions.map((r) => r.oid).sort().join(","),
+        (await this.store.getRef("policy")) ?? "default",
+        MATERIALIZER_VERSION,
+        (includeStatuses ?? []).join("+"),
+      ].join("|"),
+    );
+    const hit = this.#reduceCache.get(sig);
+    if (hit) return this.#cloneResult(hit);
+
+    const result = await this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions);
+    if (this.#reduceCache.size >= Repo.REDUCE_CACHE_MAX) {
+      this.#reduceCache.delete(this.#reduceCache.keys().next().value as string);
+    }
+    this.#reduceCache.set(sig, result);
+    return this.#cloneResult(result);
+  }
+
+  async #reduceOpSetUncached(
+    ops: Operation[],
+    includeStatuses: ViewQuery["includeStatuses"],
+    evidence: Evidence[],
+    decisions: Decision[],
+  ): Promise<ReductionResult> {
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
 
