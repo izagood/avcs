@@ -5,14 +5,23 @@
 // agent workflow: intent → session → propose op → attach evidence → materialize →
 // decide → checkpoint.
 
-import { mkdir, writeFile, rm, readdir } from "node:fs/promises";
+import { mkdir, writeFile, rm, readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
+import { computeOid } from "../core/canonical.ts";
 import { reduce, type ReductionResult } from "../reducer/reducer.ts";
 import { defaultPolicy, MATERIALIZER_VERSION } from "../reducer/policy.ts";
+import {
+  Keyring,
+  generateKeypair,
+  signMessage,
+  type KeyRecord,
+  type Signature,
+} from "../core/identity.ts";
+import { checkLease, isActive, type LeaseConflict } from "../concurrency/lease.ts";
 import type {
   Actor,
   Blob,
@@ -31,11 +40,13 @@ import type {
   Session,
   View,
   ViewQuery,
+  WorkLease,
 } from "../objects/types.ts";
 
 export class Repo {
   readonly dir: string;
   readonly store: ObjectStore;
+  readonly keyring = new Keyring();
   #clock = new LamportClock();
 
   private constructor(dir: string, store: ObjectStore) {
@@ -76,6 +87,7 @@ export class Repo {
     let max = 0;
     for await (const op of store.list<Operation>("operation")) max = Math.max(max, op.lamport);
     repo.#clock = new LamportClock(max);
+    await repo.#loadKeyring();
     return repo;
   }
 
@@ -83,6 +95,41 @@ export class Repo {
     const oid = await this.store.getRef("policy");
     if (!oid) return defaultPolicy();
     return this.store.get<Policy>(oid);
+  }
+
+  // ── identity / keyring (Phase 3) ──────────────────────────────────────────
+  #keysDir(): string {
+    return join(this.store.root, "keys");
+  }
+  async #loadKeyring(): Promise<void> {
+    const dir = this.#keysDir();
+    if (!existsSync(dir)) return;
+    for (const f of await readdir(dir)) {
+      if (!f.endsWith(".json")) continue;
+      const rec = JSON.parse(await readFile(join(dir, f), "utf8")) as KeyRecord;
+      this.keyring.register(rec);
+    }
+  }
+  /** Persist a public key as trusted and load it into the keyring. */
+  async registerPublicKey(rec: KeyRecord): Promise<void> {
+    await mkdir(this.#keysDir(), { recursive: true });
+    await writeFile(join(this.#keysDir(), `${rec.keyId}.json`), JSON.stringify(rec), "utf8");
+    this.keyring.register(rec);
+  }
+  /**
+   * Mint a keypair for an actor, register the public half as trusted, and return
+   * the private half for the caller to hold. (MVP: a real deployment keeps private
+   * keys with the actor, never in the repo.)
+   */
+  async generateActorKey(actor: Actor, keyId = actor.id): Promise<{ keyId: string; privateKey: string; publicKey: string }> {
+    const { publicKey, privateKey } = generateKeypair();
+    await this.registerPublicKey({ keyId, publicKey, actorId: actor.id, actorKind: actor.kind });
+    return { keyId, privateKey, publicKey };
+  }
+  #sign(type: string, payload: Record<string, unknown>, signWith?: { keyId: string; privateKey: string }): Signature | undefined {
+    if (!signWith) return undefined;
+    const oid = computeOid(type, payload);
+    return { keyId: signWith.keyId, alg: "ed25519", sig: signMessage(signWith.privateKey, oid) };
   }
 
   // ── reading ──────────────────────────────────────────────────────────────
@@ -238,6 +285,8 @@ export class Repo {
     producedBy: Actor;
     command?: string;
     detail?: string;
+    /** Sign the evidence so the trust gate can verify it cryptographically. */
+    signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const ev: Evidence = {
       type: "evidence",
@@ -249,6 +298,7 @@ export class Repo {
       detail: args.detail,
       createdAt: new Date().toISOString(),
     };
+    ev.sig = this.#sign("evidence", ev as unknown as Record<string, unknown>, args.signWith);
     return this.store.put(ev);
   }
 
@@ -259,6 +309,7 @@ export class Repo {
     reason: string;
     decidedBy: Actor;
     futurePolicy?: string;
+    signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const dec: Decision = {
       type: "decision",
@@ -270,7 +321,68 @@ export class Repo {
       futurePolicy: args.futurePolicy,
       createdAt: new Date().toISOString(),
     };
+    dec.sig = this.#sign("decision", dec as unknown as Record<string, unknown>, args.signWith);
     return this.store.put(dec);
+  }
+
+  // ── leases (Phase 3) ───────────────────────────────────────────────────────
+  async activeLeases(): Promise<WorkLease[]> {
+    const now = new Date().toISOString();
+    return (await this.store.collect<WorkLease>("lease")).filter((l) => isActive(l, now));
+  }
+
+  /**
+   * Request a soft write-lease over scopes. Returns the granted lease oid, or the
+   * conflicts that block it (overlapping active exclusive lease held by another).
+   */
+  async requestLease(args: {
+    intentOid: string;
+    sessionOid: string;
+    actor: Actor;
+    writeScopes: ScopeRef[];
+    mode?: "exclusive" | "shared";
+    ttlMs?: number;
+  }): Promise<{ granted: true; leaseOid: string } | { granted: false; conflicts: LeaseConflict[] }> {
+    const mode = args.mode ?? "exclusive";
+    const conflicts = checkLease({ writeScopes: args.writeScopes, mode, actorId: args.actor.id }, await this.activeLeases());
+    if (conflicts.length) return { granted: false, conflicts };
+    const now = Date.now();
+    const lease: WorkLease = {
+      type: "lease",
+      intentOid: args.intentOid,
+      sessionOid: args.sessionOid,
+      actor: args.actor,
+      writeScopes: args.writeScopes,
+      mode,
+      acquiredAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + (args.ttlMs ?? 30 * 60_000)).toISOString(),
+    };
+    return { granted: true, leaseOid: await this.store.put(lease) };
+  }
+
+  /** Build a minimal repair packet for ops whose validation failed. */
+  async repairContext(opOids: string[]): Promise<import("../validation/repair.ts").RepairContext> {
+    const { buildRepairContext } = await import("../validation/repair.ts");
+    const ops: Operation[] = [];
+    for (const oid of opOids) ops.push(await this.store.get<Operation>(oid));
+    const evidence = await this.store.collect<Evidence>("evidence");
+    const decisions = await this.store.collect<Decision>("decision");
+    return buildRepairContext(ops, evidence, decisions);
+  }
+
+  /**
+   * When a keyring is configured, trust must be earned by signature: evidence that
+   * claims a trusted (non-agent) producer is dropped unless it carries a valid
+   * signature for that actor. Forged or tampered evidence simply disappears, so the
+   * op it vouched for stays gated. With no keyring, fall back to the Phase-1
+   * producedBy heuristic (keep everything; the policy ignores agent self-reports).
+   */
+  #verifiedEvidence(all: Evidence[]): Evidence[] {
+    if (this.keyring.size === 0) return all;
+    return all.filter((e) => {
+      if (e.producedBy.kind === "ai_agent") return true; // policy ignores these anyway
+      return this.keyring.verifyFor(e.producedBy.id, e.oid as string, e.sig);
+    });
   }
 
   // ── views & materialization ──────────────────────────────────────────────
@@ -308,7 +420,7 @@ export class Repo {
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
       ops.push(op);
     }
-    const evidence = await this.store.collect<Evidence>("evidence");
+    const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
     const decisions = await this.store.collect<Decision>("decision");
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
