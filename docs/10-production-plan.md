@@ -7,9 +7,9 @@ MVP(Phase 1–12)는 **모델이 옳다는 것**을 증명했다: 결정론적 r
 PR #24–31로 각 마일스톤의 핵심 슬라이스를 구현했다(나머지 대형 인프라는 아래 워크스트림에 후속으로 명시):
 
 - **M1 성능** ✅ reduce 결과 캐시(입력 시그니처, clone-on-hit). + **결정론 property 하니스**가 실제 비결정론 버그(교차-granularity put_file∥set_symbol)를 발견→수정, 5/5 property로 결정론 강제. *후속: dirty-key incremental reduce(checkpoint base).*
-- **M2 호스팅** ✅ **네트워크 hub**(HTTP `/have`·`/objects`·`/refs`) + **거버넌스 배포**(hub가 policy/member/protection/head 게시, 클라이언트 pull) + **gated push**(멤버 서명 검증) + **권한가중 결정** + **키 revocation**. *후속: object-storage 백엔드·set reconciliation·mTLS.*
+- **M2 호스팅** ✅ **네트워크 hub**(HTTP `/have`·`/objects`·`/refs` + **operability** `/healthz`·`/version`·`/metrics`) + **거버넌스 배포**(hub가 policy/member/protection/head 게시, 클라이언트 pull) + **gated push**(멤버 서명 검증) + **권한가중 결정** + **키 revocation**. hub는 malformed/oversized 입력을 4xx로 정연히 거부하고 요청당 status-class·지연 metric을 집계. *후속: object-storage 백엔드·set reconciliation·mTLS.*
 - **M3 의미** ✅ `rename_symbol`·`move_symbol` AST op. *후속: 실제 tree-sitter 백엔드·cross-file 참조·typecheck-in-merge.*
-- **M4 운영** ✅ in-process metrics(cache hit/miss·reduce.ms) + MCP/CLI 노출 + MCP 서버 Repo 재사용(캐시·metrics 유지). *후속: OTel/Prometheus forward·sync lag/queue gauge.*
+- **M4 운영** ✅ in-process metrics(cache hit/miss·reduce.ms) + MCP/CLI 노출 + MCP 서버 Repo 재사용(캐시·metrics 유지) + **구조화 JSON 로깅**(finalize/redact/promote/gc 거버넌스·보안 이벤트, hub 요청 로그; silent 기본·CLI serve는 consoleLogger). *후속: OTel/Prometheus forward·sync lag/queue gauge.*
 
 **통합 검증** (`test/integration-multiuser-hub.test.ts`, 매 `npm test` 실행): 권한이 다른 다중 유저가 각자 repo에서 다중 에이전트로 작업하며 **실제 로컬 hub**로 push/pull — C1 분리작업 수렴 · C2 같은 symbol 충돌이 모든 replica에 동일 id · C3 권한(admin>reviewer) 결정 수렴 · C4 gated hub가 외부자 거부 · C5 quarantine→promote · C6 finalize CAS+head 배포. 전체 **89/89** 통과, tsc clean.
 
