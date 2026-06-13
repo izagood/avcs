@@ -25,9 +25,12 @@ function decodeObject<T>(raw: Buffer): T {
   return (looksLikeCbor(raw) ? decodeCbor(raw) : JSON.parse(raw.toString("utf8"))) as T;
 }
 
+interface PackLoc { file: string; offset: number; length: number; }
+
 export class ObjectStore {
   readonly root: string; // the .avcs directory
   #wc = 0; // temp-file counter for atomic writes
+  #packLoc: Map<string, PackLoc> | null = null; // lazy oid → pack location index (B2)
   constructor(repoDir: string) {
     this.root = join(repoDir, ".avcs");
   }
@@ -175,27 +178,114 @@ export class ObjectStore {
 
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
     const p = this.#pathFor(oid);
-    return decodeObject<T>(await readFile(p));
+    if (existsSync(p)) return decodeObject<T>(await readFile(p)); // loose shadows packs
+    const loc = (await this.#packLocations()).get(oid);
+    if (loc) return decodeObject<T>(await this.#readPackSlice(loc));
+    return decodeObject<T>(await readFile(p)); // absent → throws ENOENT (prior behavior)
   }
 
   async has(oid: string): Promise<boolean> {
-    return existsSync(this.#pathFor(oid));
+    return existsSync(this.#pathFor(oid)) || (await this.#packLocations()).has(oid);
   }
 
-  /** Stream every object of a given type. */
+  /** Stream every object of a given type — loose objects first, then packed ones (B2). */
   async *list<T extends AnyObject = AnyObject>(type?: ObjectType): AsyncGenerator<T> {
+    const seen = new Set<string>();
     const objectsDir = join(this.root, "objects");
-    if (!existsSync(objectsDir)) return;
-    const shards = await readdir(objectsDir);
-    for (const shard of shards) {
-      const shardDir = join(objectsDir, shard);
-      if (!(await stat(shardDir)).isDirectory()) continue;
-      for (const file of await readdir(shardDir)) {
-        if (!file.endsWith(".json")) continue;
-        if (type && !file.startsWith(`${type}_`)) continue;
-        yield decodeObject<T>(await readFile(join(shardDir, file)));
+    if (existsSync(objectsDir)) {
+      for (const shard of await readdir(objectsDir)) {
+        const shardDir = join(objectsDir, shard);
+        if (!(await stat(shardDir)).isDirectory()) continue;
+        for (const file of await readdir(shardDir)) {
+          if (!file.endsWith(".json")) continue;
+          if (type && !file.startsWith(`${type}_`)) continue;
+          seen.add(file.slice(0, -".json".length));
+          yield decodeObject<T>(await readFile(join(shardDir, file)));
+        }
       }
     }
+    for (const [oid, loc] of await this.#packLocations()) {
+      if (seen.has(oid)) continue; // a re-added loose copy already yielded
+      if (type && !oid.startsWith(`${type}_`)) continue;
+      yield decodeObject<T>(await this.#readPackSlice(loc));
+    }
+  }
+
+  // ── packing (docs/11 B2) ──────────────────────────────────────────────────
+  // Many tiny loose object files are inode-heavy and slow to scan. `pack` folds them
+  // into a single append-only packfile + index (oid → offset,length). Reads check loose
+  // first, then packs, so packing is a transparent read optimization. BLOBS are never
+  // packed: redaction overwrites a blob's bytes in place (overwriteAt), and rewriting a
+  // packfile to evict bytes is costly — keeping blobs loose makes redaction always able
+  // to scrub plaintext. (Operations/evidence/decisions/etc. are append-only & immutable.)
+  async #packLocations(): Promise<Map<string, PackLoc>> {
+    if (this.#packLoc) return this.#packLoc;
+    const m = new Map<string, PackLoc>();
+    const dir = join(this.root, "packs");
+    if (existsSync(dir)) {
+      for (const f of await readdir(dir)) {
+        if (!f.endsWith(".idx")) continue;
+        const packFile = join(dir, `${f.slice(0, -".idx".length)}.pack`);
+        for (const line of (await readFile(join(dir, f), "utf8")).split("\n")) {
+          if (!line) continue;
+          const [oid, off, len] = line.split(" "); // oids contain no spaces
+          if (oid) m.set(oid, { file: packFile, offset: Number(off), length: Number(len) });
+        }
+      }
+    }
+    this.#packLoc = m;
+    return m;
+  }
+
+  async #readPackSlice(loc: PackLoc): Promise<Buffer> {
+    const fh = await open(loc.file, "r");
+    try {
+      const buf = Buffer.alloc(loc.length);
+      await fh.read(buf, 0, loc.length, loc.offset);
+      return buf;
+    } finally {
+      await fh.close();
+    }
+  }
+
+  /**
+   * Fold all loose NON-blob objects into a new packfile (+ index), then delete the loose
+   * copies. Idempotent in effect (already-packed objects have no loose file). Reads stay
+   * correct throughout (loose-first, then packs). Returns how many objects were packed.
+   */
+  async pack(): Promise<{ packed: number }> {
+    return this.withLock("pack", async () => {
+      const objectsDir = join(this.root, "objects");
+      if (!existsSync(objectsDir)) return { packed: 0 };
+      const entries: { oid: string; bytes: Buffer }[] = [];
+      for (const shard of await readdir(objectsDir)) {
+        const shardDir = join(objectsDir, shard);
+        if (!(await stat(shardDir)).isDirectory()) continue;
+        for (const file of await readdir(shardDir)) {
+          if (!file.endsWith(".json") || file.startsWith("blob_")) continue; // blobs stay loose
+          entries.push({ oid: file.slice(0, -".json".length), bytes: await readFile(join(shardDir, file)) });
+        }
+      }
+      if (entries.length === 0) return { packed: 0 };
+      entries.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0)); // deterministic layout
+      const packDir = join(this.root, "packs");
+      await mkdir(packDir, { recursive: true });
+      const n = (await readdir(packDir)).filter((f) => f.endsWith(".pack")).length;
+      const base = `pack-${n}`;
+      const idxLines: string[] = [];
+      let offset = 0;
+      for (const e of entries) {
+        idxLines.push(`${e.oid} ${offset} ${e.bytes.length}`);
+        offset += e.bytes.length;
+      }
+      // Write the packfile + index BEFORE removing loose copies (crash-safe: a crash
+      // leaves both, and reads prefer loose — never a lost object).
+      await this.#writeAtomic(join(packDir, `${base}.pack`), Buffer.concat(entries.map((e) => e.bytes)));
+      await this.#writeAtomic(join(packDir, `${base}.idx`), `${idxLines.join("\n")}\n`);
+      for (const e of entries) await rm(this.#pathFor(e.oid), { force: true });
+      this.#packLoc = null; // invalidate the index cache
+      return { packed: entries.length };
+    });
   }
 
   async collect<T extends AnyObject = AnyObject>(type?: ObjectType): Promise<T[]> {

@@ -168,6 +168,12 @@ async function main(): Promise<void> {
       console.log(`${dryRun ? "would collect" : "collected"} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
       break;
     }
+    case "pack": {
+      const repo = await Repo.open(cwd);
+      const r = await repo.pack();
+      console.log(`packed ${r.packed} loose object(s) into a packfile (blobs left loose)`);
+      break;
+    }
     case "bundle": {
       const repo = await Repo.open(cwd);
       const out = args[1];
@@ -280,6 +286,7 @@ async function main(): Promise<void> {
           "  conflicts [view]            list decisions a human owes\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
+          "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
           "  bundle <file>               export the whole repo to a portable file\n" +
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
