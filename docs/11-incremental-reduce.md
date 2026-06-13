@@ -79,10 +79,16 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   (ingress 누락으로 인한 조용한 분기 원천 차단). `readOpLog()`(first-write 순서·dedup)·`rebuildOpLog()`(구
   스토어/손상 backfill). 불변식 `oplog ⊇ 현재 operations`를 테스트로 강제(저작·pull·import·rebuild). GC로
   지워진 op oid는 로그에 남을 수 있어 reader가 missing object를 tolerate(스토어가 진실의 원천).
-- **A6 — repo.materialize 배선 + 자가검증 가드.** `oplog` tail-read로 캐시된 `ReduceSnapshot` 이후 append분만
-  읽어 `reduceIncremental` 호출(전제 미충족·2-pass held·filter 변경 시 full fallback). `AVCS_VERIFY_INCREMENTAL=1`
-  (CI/테스트 ON)일 때 fast 경로가 full도 돌려 treeHash+statuses 동일성 assert·불일치 throw. prod OFF. 기존
-  테스트가 구체 해시를 단언하므로 분기 즉시 검출. ⬜ *다음.*
+- **A6 — repo.materialize IO tail-read (인메모리 op·blob 캐시).** ✅ `materialize`가 `collect("operation")`
+  전체 샤드 스캔 대신 `oplog`를 tail-read해 캐시에 없는 oid만 디스크에서 읽음(+1op = 새 객체 1개만 읽기).
+  블롭은 content-addressed·불변(redaction 예외)이라 oid로 캐시. 둘 다 디스크에 대한 순수 최적화 — 정확성은
+  의존하지 않고, 무효화 트리거(gc 삭제·redaction/pull의 바이트 덮어쓰기)에서만 비움. **측정(N=3000): +1op
+  708→220ms(3.2x), warm 333→92ms(3.6x), cold 변화 없음.** 잔여 220ms는 디스크 IO가 아닌 **여러 O(N) 컴퓨트
+  패스**(sig 빌드·reliability·2-pass ancestry·reduce). warm==cold 동치를 저작·gc·redaction에 대해 테스트.
+- **A6b (follow-up, 한계이득) — reduceIncremental 컴퓨트 배선 + 자가검증 가드.** frontier 수정으로 reduce가
+  이미 O(N)·~25ms라, repo의 per-materialize 비용은 reduce 외 다수 O(N) 패스에 분산됨. `reduceIncremental`만
+  배선하면 그중 reduce 패스(~20ms)만 절감 → 현 시점 한계이득. 큰 N(수만 ops)에서 reduce가 다시 지배하면
+  의미. 배선 시 `AVCS_VERIFY_INCREMENTAL=1`(CI ON)로 full 교차검증 throw 가드. **상태: 의도적 후순위.**
 
 **Fallback(언제나 정답):** policy/authority/materializeStatuses 변경, line/filter 변경, next ⊉ prev,
 캐시 부재, reliability 광역 무효화 임계 초과 → full `reduce`.
