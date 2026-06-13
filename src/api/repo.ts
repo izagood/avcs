@@ -12,7 +12,8 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex } from "../core/canonical.ts";
-import { reduce, conflictIdFor, keysOf, detectCrossGranularity, type ReductionResult } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, keysOf, detectCrossGranularity, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
+import { reduceIncremental, snapshotReduce, NonIncrementalError, type ReduceSnapshot } from "../reducer/incremental.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
 import type { OwnerRule } from "../objects/types.ts";
@@ -72,6 +73,12 @@ export class Repo {
   // the rare mutations that can invalidate them (gc deletes; redaction overwrites bytes).
   #opCache = new Map<string, Operation>();
   #blobCache = new Map<string, Buffer>();
+  // Last full reduction's snapshot, for opt-in incremental reduce (docs/11 A6b). Only the
+  // main materialize path updates it; reduceIncremental is correct for ANY append-superset
+  // (harness-proven) and throws NonIncrementalError otherwise (→ fall back to full reduce),
+  // so no filter key is needed. Opt-in via AVCS_INCREMENTAL=1 (default off = full reduce);
+  // AVCS_VERIFY_INCREMENTAL=1 cross-checks every incremental result against a full reduce.
+  #incSnap: ReduceSnapshot | null = null;
 
   private constructor(dir: string, store: ObjectStore) {
     this.dir = dir;
@@ -1014,7 +1021,7 @@ export class Repo {
     // Phase 11: in a governed repo, ops authored by non-members (outsiders) are
     // quarantined — excluded from the materialized tree until a reviewer promotes them.
     const { kept, quarantined } = await this.#partitionQuarantine(ops);
-    const res = await this.#reduceOpSet(kept, q.includeStatuses);
+    const res = await this.#reduceOpSet(kept, q.includeStatuses, true); // main path: opt-in incremental
     for (const oid of quarantined) res.statuses.set(oid, "quarantined");
     return res;
   }
@@ -1119,7 +1126,53 @@ export class Repo {
     };
   }
 
-  async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"]): Promise<ReductionResult> {
+  /**
+   * Pass-1 reduce (docs/11 A6b). With AVCS_INCREMENTAL=1 and a prior snapshot, re-reduce
+   * only the delta via `reduceIncremental` (falling back to a full `snapshotReduce` if the
+   * preconditions don't hold — e.g. policy changed, or `base` is not an append-superset of
+   * the snapshot). Default (flag off) is the plain full `reduce`, untouched. Only the main
+   * materialize path passes `useInc`, so subset reducers (materializeAt/history/bisect)
+   * never read or pollute the snapshot. AVCS_VERIFY_INCREMENTAL=1 cross-checks each
+   * incremental result against a full reduce and throws on any divergence (CI safety net).
+   */
+  #pass1Reduce(base: ReduceInput, useInc: boolean): ReductionResult {
+    if (!(useInc && process.env.AVCS_INCREMENTAL === "1")) return reduce(base);
+    let snap: ReduceSnapshot;
+    if (this.#incSnap) {
+      try {
+        snap = reduceIncremental(this.#incSnap, base);
+      } catch (e) {
+        if (!(e instanceof NonIncrementalError)) throw e;
+        snap = snapshotReduce(base);
+        this.metrics.inc("reduce.incremental.fallback");
+      }
+    } else {
+      snap = snapshotReduce(base);
+    }
+    if (process.env.AVCS_VERIFY_INCREMENTAL === "1") {
+      this.#assertReduceEqual(snap.result, snapshotReduce(base).result);
+    }
+    this.#incSnap = snap;
+    return snap.result;
+  }
+
+  /** Throw if an incremental reduction diverges from the full one (treeHash/statuses/
+   *  conflicts/headOps) — incremental reduce must NEVER break the determinism invariant. */
+  #assertReduceEqual(inc: ReductionResult, full: ReductionResult): void {
+    const norm = (r: ReductionResult) => JSON.stringify({
+      treeHash: r.treeHash,
+      statuses: [...r.statuses].sort(),
+      conflicts: r.conflicts,
+      autoDecisions: r.autoDecisions,
+      headOps: [...r.headOps].sort(),
+      synth: [...r.synthBlobs.keys()].sort(),
+    });
+    if (norm(inc) !== norm(full)) {
+      throw new Error(`incremental reduce diverged from full reduce (treeHash inc=${inc.treeHash} full=${full.treeHash}) — determinism invariant violated`);
+    }
+  }
+
+  async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"], useInc = false): Promise<ReductionResult> {
     const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
     const decisions = await this.store.collect<Decision>("decision");
 
@@ -1147,7 +1200,7 @@ export class Repo {
     this.metrics.inc("reduce.cache.miss");
 
     const result = await this.metrics.time("reduce.ms", () =>
-      this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions),
+      this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions, useInc),
     );
     if (this.#reduceCache.size >= Repo.REDUCE_CACHE_MAX) {
       this.#reduceCache.delete(this.#reduceCache.keys().next().value as string);
@@ -1161,6 +1214,7 @@ export class Repo {
     includeStatuses: ViewQuery["includeStatuses"],
     evidence: Evidence[],
     decisions: Decision[],
+    useInc = false,
   ): Promise<ReductionResult> {
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
@@ -1175,8 +1229,8 @@ export class Repo {
     const policy = await this.policy();
     const reliability = computeReliability(ops, evidence, decisions);
     const authority = await this.#authorityMap();
-    const base = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability, authority };
-    const pass1 = reduce(base);
+    const base: ReduceInput = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability, authority };
+    const pass1 = this.#pass1Reduce(base, useInc);
 
     // Second-pass conflicts that the text-clean grouping accepted but that must be
     // held back (re-reduce excluding them so the tree stays safe — base content falls

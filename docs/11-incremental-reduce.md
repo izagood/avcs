@@ -85,10 +85,13 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   의존하지 않고, 무효화 트리거(gc 삭제·redaction/pull의 바이트 덮어쓰기)에서만 비움. **측정(N=3000): +1op
   708→220ms(3.2x), warm 333→92ms(3.6x), cold 변화 없음.** 잔여 220ms는 디스크 IO가 아닌 **여러 O(N) 컴퓨트
   패스**(sig 빌드·reliability·2-pass ancestry·reduce). warm==cold 동치를 저작·gc·redaction에 대해 테스트.
-- **A6b (follow-up, 한계이득) — reduceIncremental 컴퓨트 배선 + 자가검증 가드.** frontier 수정으로 reduce가
-  이미 O(N)·~25ms라, repo의 per-materialize 비용은 reduce 외 다수 O(N) 패스에 분산됨. `reduceIncremental`만
-  배선하면 그중 reduce 패스(~20ms)만 절감 → 현 시점 한계이득. 큰 N(수만 ops)에서 reduce가 다시 지배하면
-  의미. 배선 시 `AVCS_VERIFY_INCREMENTAL=1`(CI ON)로 full 교차검증 throw 가드. **상태: 의도적 후순위.**
+- **A6b — reduceIncremental opt-in 배선 + 자가검증 가드.** ✅ 메인 `materialize`가 `AVCS_INCREMENTAL=1`일 때
+  마지막 스냅샷에서 delta만 `reduceIncremental`(전제 미충족 시 full `snapshotReduce` fallback). 키 불필요 —
+  reduceIncremental은 **임의 append-superset에 정확**(하니스 증명)하고 아니면 throw→fallback. 서브셋 reducer
+  (materializeAt/history/bisect)는 스냅샷을 읽지도 오염시키지도 않음. **기본 OFF = 기존 full reduce(안전).**
+  `AVCS_VERIFY_INCREMENTAL=1`이면 매 incremental 결과를 full과 교차검증해 불일치 시 throw — `npm test`를 두
+  플래그 ON으로 돌려 **114개 전 시나리오에서 wired 경로 == full** 입증(가드 미발화). 한계이득(reduce 패스만
+  절감)이라 prod 기본 OFF가 합리적이며, 큰 N에서 reduce가 다시 지배하면 켜서 이득. **Track A 완료.**
 
 **Fallback(언제나 정답):** policy/authority/materializeStatuses 변경, line/filter 변경, next ⊉ prev,
 캐시 부재, reliability 광역 무효화 임계 초과 → full `reduce`.
