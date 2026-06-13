@@ -266,9 +266,83 @@ export function detectCrossGranularity(ops: Operation[], result: ReductionResult
   return out;
 }
 
+/** A single group's locally-decided statuses + the conflicts/autoDecisions it emitted. */
+export interface PerKeyDecision {
+  local: Map<string, OperationStatus>;
+  conflicts: Conflict[];
+  autoDecisions: AutoDecision[];
+}
+
+/**
+ * A full reduce plus the per-group bookkeeping an incremental re-reduce needs to reuse
+ * clean groups (see incremental.ts / docs/11). The `result` is exactly `reduce(input)`.
+ */
+export interface ReduceSnapshot {
+  input: ReduceInput;
+  result: ReductionResult;
+  perKey: Map<string, PerKeyDecision>;
+  groupOrder: string[]; // group-map insertion order (= conflict emission order)
+  groupMembers: Map<string, string[]>; // key → member op oids
+}
+
 export function reduce(input: ReduceInput): ReductionResult {
+  return snapshotReduce(input).result;
+}
+
+/** Build the per-op evidence index used by `evaluateOp`. */
+function buildEvByOp(evidence: Evidence[]): Map<string, Evidence[]> {
+  const evByOp = new Map<string, Evidence[]>();
+  for (const e of evidence)
+    for (const opId of e.forOps) (evByOp.get(opId) ?? evByOp.set(opId, []).get(opId)!).push(e);
+  return evByOp;
+}
+
+/** A memoizing `evaluateOp` closure (pure given its captured inputs). */
+function makeEvalOf(
+  policy: Policy,
+  intents: Map<string, Intent>,
+  evByOp: Map<string, Evidence[]>,
+  reliability: Map<string, number>,
+): (op: Operation, inConflict: boolean) => OpEvaluation {
+  const evalCache = new Map<string, OpEvaluation>();
+  return (op, inConflict) => {
+    const cacheKey = `${op.oid}|${inConflict}`;
+    let e = evalCache.get(cacheKey);
+    if (!e) {
+      e = evaluateOp(policy, op, evByOp.get(op.oid as string) ?? [], inConflict, intentSatisfied(op, intents), reliability.get(op.actor.id) ?? 0);
+      evalCache.set(cacheKey, e);
+    }
+    return e;
+  };
+}
+
+/** Project decided statuses into a tree (+ treeHash, frontier headOps, synth blobs). */
+function materializeProjection(
+  ops: Operation[],
+  statuses: Map<string, OperationStatus>,
+  anc: Map<string, Set<string>>,
+  materializeStatuses: Set<OperationStatus>,
+  blobContent: Map<string, string>,
+): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, string> } {
+  const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
+  const ordered = kahnOrder(projected, anc);
+  const tree = new Map<string, string>();
+  const synthBlobs = new Map<string, string>();
+  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
+  const treeHash = sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
+
+  // Frontier: accepted ops not an ancestor of another accepted op.
+  const acceptedIds = new Set(ops.filter((o) => statuses.get(o.oid as string) === "accepted").map((o) => o.oid as string));
+  const headOps = [...acceptedIds].filter((id) => {
+    for (const other of acceptedIds) if (other !== id && anc.get(other)?.has(id)) return false;
+    return true;
+  });
+  return { tree, treeHash, headOps, synthBlobs };
+}
+
+export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
   const { intents, policy } = input;
-  const materializeStatuses = new Set(input.materializeStatuses ?? ["accepted"]);
+  const materializeStatuses = new Set<OperationStatus>(input.materializeStatuses ?? ["accepted"]);
 
   // ── Canonical input ordering (determinism independent of caller order). ──
   const ops = [...input.ops].sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid));
@@ -280,9 +354,7 @@ export function reduce(input: ReduceInput): ReductionResult {
 
   const anc = ancestry(ops);
   const verdicts = verdictMap(decisions, input.authority);
-  const evByOp = new Map<string, Evidence[]>();
-  for (const e of evidence)
-    for (const opId of e.forOps) (evByOp.get(opId) ?? evByOp.set(opId, []).get(opId)!).push(e);
+  const evByOp = buildEvByOp(evidence);
 
   // Group ops by every key they contend on (note ops get a private singleton group).
   const groups = new Map<string, Operation[]>();
@@ -292,26 +364,31 @@ export function reduce(input: ReduceInput): ReductionResult {
     for (const k of ks) (groups.get(k) ?? groups.set(k, []).get(k)!).push(o);
   }
 
+  const reliability = input.reliability ?? new Map<string, number>();
+  const evalOf = makeEvalOf(policy, intents, evByOp, reliability);
+
+  // Decide each group locally; aggregate the strictest verdict per op. Capture each
+  // group's emitted conflicts/autoDecisions separately so an incremental re-reduce can
+  // reuse a clean group verbatim (incremental.ts), while the final arrays preserve the
+  // exact group-iteration order.
   const conflicts: Conflict[] = [];
   const autoDecisions: AutoDecision[] = [];
-  const evalCache = new Map<string, OpEvaluation>();
-  const reliability = input.reliability ?? new Map<string, number>();
-  const evalOf = (op: Operation, inConflict: boolean): OpEvaluation => {
-    const cacheKey = `${op.oid}|${inConflict}`;
-    let e = evalCache.get(cacheKey);
-    if (!e) {
-      e = evaluateOp(policy, op, evByOp.get(op.oid as string) ?? [], inConflict, intentSatisfied(op, intents), reliability.get(op.actor.id) ?? 0);
-      evalCache.set(cacheKey, e);
-    }
-    return e;
-  };
-
-  // Decide each group locally; aggregate the strictest verdict per op.
+  const perKey = new Map<string, PerKeyDecision>();
+  const groupOrder: string[] = [];
+  const groupMembers = new Map<string, string[]>();
   for (const [key, groupOps] of groups) {
-    const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, conflicts, autoDecisions);
+    groupOrder.push(key);
+    groupMembers.set(key, groupOps.map((o) => o.oid as string));
+    const kc: Conflict[] = [];
+    const ka: AutoDecision[] = [];
+    const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, kc, ka);
+    perKey.set(key, { local, conflicts: kc, autoDecisions: ka });
     for (const [oid, st] of local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
+    conflicts.push(...kc);
+    autoDecisions.push(...ka);
   }
   // Phase 5: annotate needs_human conflicts with the scope owners who should decide.
+  // Mutates the same Conflict objects held in `perKey`, so the cache stays consistent.
   for (const c of conflicts) {
     const o = ownersFor(c.key, policy.owners ?? []);
     if (o.length) c.requiredOwners = o;
@@ -322,23 +399,189 @@ export function reduce(input: ReduceInput): ReductionResult {
     if (keysOf(o).length === 0 && statuses.get(o.oid as string) === "proposed")
       statuses.set(o.oid as string, "accepted");
 
-  // ── Materialize. ──
-  const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
-  const ordered = kahnOrder(projected, anc);
-  const tree = new Map<string, string>();
-  const synthBlobs = new Map<string, string>();
-  const blobContent = input.blobContent ?? new Map<string, string>();
-  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
-  const treeHash = sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
+  const { tree, treeHash, headOps, synthBlobs } = materializeProjection(
+    ops,
+    statuses,
+    anc,
+    materializeStatuses,
+    input.blobContent ?? new Map<string, string>(),
+  );
 
-  // Frontier: accepted ops not an ancestor of another accepted op.
-  const acceptedIds = new Set(ops.filter((o) => statuses.get(o.oid as string) === "accepted").map((o) => o.oid as string));
-  const headOps = [...acceptedIds].filter((id) => {
-    for (const other of acceptedIds) if (other !== id && anc.get(other)?.has(id)) return false;
-    return true;
-  });
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
+  return { input, result, perKey, groupOrder, groupMembers };
+}
 
-  return { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
+/** Thrown when an incremental re-reduce's preconditions don't hold; the caller must
+ *  fall back to a full `reduce`. Never indicates a correctness failure — only that the
+ *  fast path doesn't apply (policy/authority/materializeStatuses changed, or `next` is
+ *  not an append-superset of the snapshot's input). */
+export class NonIncrementalError extends Error {
+  constructor(reason: string) {
+    super(`non-incremental: ${reason}`);
+    this.name = "NonIncrementalError";
+  }
+}
+
+function sameStatusSet(a: OperationStatus[] | undefined, b: OperationStatus[] | undefined): boolean {
+  const sa = new Set(a ?? ["accepted"]);
+  const sb = new Set(b ?? ["accepted"]);
+  if (sa.size !== sb.size) return false;
+  for (const x of sa) if (!sb.has(x)) return false;
+  return true;
+}
+
+function sameNumberMap(a: Map<string, number> | undefined, b: Map<string, number> | undefined): boolean {
+  const ma = a ?? new Map();
+  const mb = b ?? new Map();
+  const keys = new Set([...ma.keys(), ...mb.keys()]);
+  for (const k of keys) if ((ma.get(k) ?? 0) !== (mb.get(k) ?? 0)) return false;
+  return true;
+}
+
+/**
+ * Incremental re-reduce (docs/11 Track A). Given a prior `snapshotReduce` and a `next`
+ * input that is an APPEND-SUPERSET of the snapshot's input (same policy/authority/
+ * materializeStatuses; ops/decisions/evidence only added), recompute only the groups
+ * whose decision could have changed (the "dirty set") and reuse every clean group's
+ * cached decision verbatim. The returned result is structurally identical to
+ * `reduce(next)` — this is the invariant the differential harness enforces.
+ *
+ * Dirty keys (see docs/11): keys of new ops; keys of ops targeted by new decisions or
+ * new evidence (these can flip blocked/accept regardless of contention); keys whose
+ * group membership changed or are brand new; and the keys of any op whose actor's
+ * reliability changed (a needs_human conflict embeds the op's reliability-derived score,
+ * so reliability changes are not gated by contention here — A1 may tighten this).
+ *
+ * Throws {@link NonIncrementalError} when the preconditions don't hold; the caller then
+ * falls back to a full reduce. tree/headOps are rebuilt fully (cheap, in-memory) in A0;
+ * A3 will make the tree update incremental too.
+ */
+export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): ReduceSnapshot {
+  const prev = snap.input;
+  // ── Preconditions: invariants that the clean-group reuse assumes. ──
+  if (!sameStatusSet(prev.materializeStatuses, next.materializeStatuses)) throw new NonIncrementalError("materializeStatuses changed");
+  if (!sameNumberMap(prev.authority, next.authority)) throw new NonIncrementalError("authority changed");
+  if (prev.policy !== next.policy && canonicalize(prev.policy as unknown) !== canonicalize(next.policy as unknown)) {
+    throw new NonIncrementalError("policy changed");
+  }
+
+  const materializeStatuses = new Set<OperationStatus>(next.materializeStatuses ?? ["accepted"]);
+  const ops = [...next.ops].sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid));
+  const decisions = [...next.decisions].sort((a, b) => cmp(a.createdAt, b.createdAt) || cmp(a.oid, b.oid));
+  const evidence = [...next.evidence].sort((a, b) => cmp(a.createdAt, b.createdAt) || cmp(a.oid, b.oid));
+
+  // ── Require next ⊇ prev (append-only); else the fast path can't apply. ──
+  const nextOpIds = new Set(ops.map((o) => o.oid as string));
+  for (const o of prev.ops) if (!nextOpIds.has(o.oid as string)) throw new NonIncrementalError("an op was removed");
+  const nextDecIds = new Set(decisions.map((d) => d.oid as string));
+  for (const d of prev.decisions) if (!nextDecIds.has(d.oid as string)) throw new NonIncrementalError("a decision was removed");
+  const nextEvIds = new Set(evidence.map((e) => e.oid as string));
+  for (const e of prev.evidence) if (!nextEvIds.has(e.oid as string)) throw new NonIncrementalError("an evidence was removed");
+
+  const statuses = new Map<string, OperationStatus>();
+  for (const o of ops) statuses.set(o.oid as string, "proposed");
+
+  const anc = ancestry(ops);
+  const verdicts = verdictMap(decisions, next.authority);
+  const evByOp = buildEvByOp(evidence);
+  const reliability = next.reliability ?? new Map<string, number>();
+  const evalOf = makeEvalOf(next.policy, next.intents, evByOp, reliability);
+  const opById = new Map(ops.map((o) => [o.oid as string, o]));
+
+  // ── Groups for `next` (insertion order = canonical sorted-op order). ──
+  const groups = new Map<string, Operation[]>();
+  for (const o of ops) {
+    const keys = keysOf(o);
+    const ks = keys.length ? keys : [`op:${o.oid}`];
+    for (const k of ks) (groups.get(k) ?? groups.set(k, []).get(k)!).push(o);
+  }
+
+  // ── Dirty-key set. ──
+  const prevOpIds = new Set(prev.ops.map((o) => o.oid as string));
+  const prevDecIds = new Set(prev.decisions.map((d) => d.oid as string));
+  const prevEvIds = new Set(prev.evidence.map((e) => e.oid as string));
+  const prevRel = prev.reliability ?? new Map<string, number>();
+  const changedActors = new Set<string>();
+  for (const a of new Set([...prevRel.keys(), ...reliability.keys()]))
+    if ((prevRel.get(a) ?? 0) !== (reliability.get(a) ?? 0)) changedActors.add(a);
+
+  const dirty = new Set<string>();
+  const dirtyKeysOfOp = (oid: string): void => {
+    const o = opById.get(oid);
+    if (!o) return;
+    const ks = keysOf(o);
+    if (ks.length) for (const k of ks) dirty.add(k);
+    else dirty.add(`op:${oid}`);
+  };
+  const deltaOpIds = new Set(ops.filter((o) => !prevOpIds.has(o.oid as string)).map((o) => o.oid as string));
+  for (const oid of deltaOpIds) dirtyKeysOfOp(oid); // new ops
+  // Ancestry extension: a delta op can be a (transitive) causal ancestor of a PRE-EXISTING
+  // op — sync delivers ops out of causal order (base={X} with X→Y missing, next adds Y).
+  // That changes the ancestor relations inside any group whose member is downstream of a
+  // delta op, so those groups must be recomputed even though their membership is unchanged.
+  if (deltaOpIds.size)
+    for (const m of ops) {
+      const a = anc.get(m.oid as string);
+      if (!a) continue;
+      for (const d of deltaOpIds)
+        if (a.has(d)) { dirtyKeysOfOp(m.oid as string); break; }
+    }
+  for (const d of decisions)
+    if (!prevDecIds.has(d.oid as string)) for (const oid of [...d.chosenOps, ...d.rejectedOps]) dirtyKeysOfOp(oid); // new decisions
+  for (const e of evidence)
+    if (!prevEvIds.has(e.oid as string)) for (const oid of e.forOps) dirtyKeysOfOp(oid); // new evidence
+  // membership change / brand-new key, and reliability-changed actors.
+  for (const [k, members] of groups) {
+    const prevMembers = snap.groupMembers.get(k);
+    if (!prevMembers) { dirty.add(k); continue; }
+    if (prevMembers.length !== members.length) { dirty.add(k); continue; }
+    const cur = new Set(members.map((o) => o.oid as string));
+    if (prevMembers.some((id) => !cur.has(id))) { dirty.add(k); continue; }
+    if (changedActors.size && members.some((o) => changedActors.has(o.actor.id))) dirty.add(k);
+  }
+
+  // ── Decide each group: recompute the dirty ones, reuse the clean ones. ──
+  const conflicts: Conflict[] = [];
+  const autoDecisions: AutoDecision[] = [];
+  const perKey = new Map<string, PerKeyDecision>();
+  const groupOrder: string[] = [];
+  const groupMembers = new Map<string, string[]>();
+  for (const [key, groupOps] of groups) {
+    groupOrder.push(key);
+    groupMembers.set(key, groupOps.map((o) => o.oid as string));
+    let dec: PerKeyDecision;
+    if (dirty.has(key)) {
+      const kc: Conflict[] = [];
+      const ka: AutoDecision[] = [];
+      const local = decideGroup(key, groupOps, anc, verdicts, evalOf, next.policy, kc, ka);
+      dec = { local, conflicts: kc, autoDecisions: ka };
+    } else {
+      dec = snap.perKey.get(key)!; // clean group: inputs unchanged ⇒ decision unchanged
+    }
+    perKey.set(key, dec);
+    for (const [oid, st] of dec.local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
+    conflicts.push(...dec.conflicts);
+    autoDecisions.push(...dec.autoDecisions);
+  }
+  for (const c of conflicts) {
+    const o = ownersFor(c.key, next.policy.owners ?? []);
+    if (o.length) c.requiredOwners = o;
+  }
+
+  for (const o of ops)
+    if (keysOf(o).length === 0 && statuses.get(o.oid as string) === "proposed")
+      statuses.set(o.oid as string, "accepted");
+
+  const { tree, treeHash, headOps, synthBlobs } = materializeProjection(
+    ops,
+    statuses,
+    anc,
+    materializeStatuses,
+    next.blobContent ?? new Map<string, string>(),
+  );
+
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
+  return { input: next, result, perKey, groupOrder, groupMembers };
 }
 
 function decideGroup(
