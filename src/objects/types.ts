@@ -31,7 +31,8 @@ export type ObjectType =
   | "protection"
   | "promotion"
   | "redaction"
-  | "override";
+  | "override"
+  | "approval";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -443,6 +444,16 @@ export interface Redaction extends BaseObject {
   createdAt: string;
 }
 
+/** A reviewer's sign-off on a checkpoint (= PR approve). Gates finalize. */
+export interface Approval extends BaseObject {
+  type: "approval";
+  checkpointOid: string;
+  by: string; // actor id (role ≥ reviewer)
+  verdict: "approve" | "request_changes";
+  reason?: string;
+  createdAt: string;
+}
+
 /** Break-glass: a signed, EXPIRING waiver of specific required checks for a view. */
 export interface Override extends BaseObject {
   type: "override";
@@ -471,4 +482,5 @@ export type AnyObject =
   | Protection
   | Promotion
   | Redaction
-  | Override;
+  | Override
+  | Approval;
