@@ -98,8 +98,11 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
 
 ## Track B — 저장 포맷 (CBOR / packing / compaction)
 
-- **B1 — CBOR (oid-중립).** `core/canonical.ts`만 격리. oid는 canonical-JSON 바이트 해시 유지(사실 2),
-  CBOR은 디스크/전송 인코딩만. 동치: 무작위 객체 N개 JSON↔CBOR↔객체 라운드트립, **oid 불변**.
+- **B1 — CBOR (oid-중립 disk 인코딩).** ✅ 무의존 canonical CBOR codec(`core/cbor.ts`)으로 디스크 객체를
+  CBOR 저장. **oid는 canonical-JSON 해시 유지**(`computeOid` 불변) → content-addressing·서명·treeHash 무영향.
+  `ObjectStore`가 첫 바이트로 CBOR(major 5)/legacy JSON(`{`)을 sniff해 **dual-read** → 기존 저장소 무중단
+  호환. **와이어·번들은 JSON 유지**(hub은 deserialized 객체를 `JSON.stringify`) → blast radius 최소. 검증:
+  2000-seed 코덱 라운드트립 + oid-중립 + dual-read + full-repo warm==cold. **측정: operation 객체 16.9% 작음.**
 - **B2 — packing.** loose→packfile, 읽기는 pack→loose. 순수 저장. GC·읽기 동치 테스트.
 - **B3 — compaction (최고위험).** checkpoint 뒤 superseded 저수준 op를 semantic op로 fold. 그래프를
   건드리므로 **모든 checkpoint에서 materialize(after)≡materialize(before)** + append-only 감사 보존을
