@@ -1365,6 +1365,17 @@ export class Repo {
   }
 
   /**
+   * Pack loose objects into a packfile (docs/11 B2) — a maintenance op that reduces inode
+   * count and speeds full scans. Reads stay correct throughout (loose-first, then packs);
+   * blobs are intentionally left loose so redaction can always scrub their bytes.
+   */
+  async pack(): Promise<{ packed: number }> {
+    const r = await this.store.pack();
+    this.logger.info("pack", { packed: r.packed });
+    return r;
+  }
+
+  /**
    * Garbage-collect (docs/10 WS-C). Reclaims only objects UNREACHABLE from the
    * authoritative graph — never the append-only audit history of accepted ops:
    *  - orphan blobs: stored blobs no remaining op references (incl. chunk blobs whose
