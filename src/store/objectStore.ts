@@ -10,7 +10,7 @@
 // fully auditable: the entire causal history of how code reached its current state
 // is replayable.
 
-import { mkdir, readFile, readdir, stat, open, rename, appendFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, open, rename, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { canonicalize, computeOid, sha256hex } from "../core/canonical.ts";
@@ -116,6 +116,16 @@ export class ObjectStore {
     const { oid: _drop, ...payload } = obj as AnyObject & { oid?: string };
     void _drop;
     await this.#writeAtomic(this.#pathFor(oid), canonicalize({ ...payload, oid }));
+  }
+
+  /**
+   * GC exception: delete an object file. Used only by `repo.gc` to reclaim objects
+   * that are unreachable from the authoritative graph (orphan blobs, expired
+   * quarantined ops). The append-only audit history of accepted ops is never removed.
+   */
+  async deleteObject(oid: string): Promise<void> {
+    const p = this.#pathFor(oid);
+    if (existsSync(p)) await rm(p, { force: true });
   }
 
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
