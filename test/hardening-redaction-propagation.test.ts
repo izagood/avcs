@@ -37,7 +37,7 @@ test("redaction propagates: a peer who pulled the secret evicts it after the red
 
     // admin redacts on the central/authoritative repo, pushes the redaction
     const central2 = await Repo.open(centralDir);
-    await central2.redact(blobOid, "leaked AWS key", "human:admin");
+    await central2.redact(blobOid, "leaked AWS key", "human:admin", { keyId: "human:admin", privateKey: admin.privateKey });
     await central2.pushHub(hub.url); // redaction object → hub evicts its own blob too
 
     // hub no longer serves the plaintext
@@ -56,4 +56,24 @@ test("redaction propagates: a peer who pulled the secret evicts it after the red
     await rm(centralDir, { recursive: true, force: true });
     await rm(peerDir, { recursive: true, force: true });
   }
+});
+
+test("a forged (unsigned/non-admin) redaction is NOT applied under governance", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-"));
+  const repo = await Repo.init(dir);
+  const root = generateKeypair();
+  const admin = generateKeypair();
+  await repo.registerMembership({ actorId: "human:admin", publicKey: admin.publicKey, role: "admin", root: { keyId: "root", privateKey: root.privateKey } });
+  await repo.registerMembership({ actorId: "ai:a", publicKey: generateKeypair().publicKey, role: "proposer", root: { keyId: "root", privateKey: root.privateKey } });
+  const intent = await repo.createIntent({ title: "t", owner: "human:admin" });
+  const sess = await repo.startSession({ intentOid: intent, actor: ai });
+  await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "x.ts", content: "important = 1\n", declaredPurpose: "x" });
+  const blobOid = (await repo.materialize()).tree.get("x.ts")!;
+
+  // An attacker crafts a redaction (claims admin, but has no valid signature).
+  await repo.store.put({ type: "redaction", blobOid, sha256: "x", length: 0, reason: "DoS", by: "human:admin", createdAt: "2026-01-01T00:00:00Z" } as never);
+  const applied = await repo.applyRedactions();
+  assert.equal(applied, 0, "forged redaction skipped");
+  assert.match((await repo.readBlob(blobOid)).toString("utf8"), /important/, "blob NOT evicted by a forged redaction");
+  await rm(dir, { recursive: true, force: true });
 });
