@@ -169,6 +169,12 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
     // poison the store — it lands at its true content address (or is a no-op if present).
     const oid = await store.put(obj as AnyObject);
+    // A pushed redaction evicts the hub's own copy of the blob too (so no replica can
+    // re-fetch the plaintext from the hub).
+    if ((obj as AnyObject).type === "redaction") {
+      const { applyRedactions } = await import("../store/applyRedactions.ts");
+      await applyRedactions(store);
+    }
     sendJson(res, 200, { oid });
     return;
   }
