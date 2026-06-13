@@ -11,9 +11,10 @@ import { join, dirname } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
-import { computeOid, sha256hex } from "../core/canonical.ts";
+import { computeOid, sha256hex, canonicalize } from "../core/canonical.ts";
 import { reduce, conflictIdFor, keysOf, detectCrossGranularity, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
-import { reduceIncremental, snapshotReduce, NonIncrementalError, type ReduceSnapshot } from "../reducer/incremental.ts";
+import { reduceIncremental, snapshotReduce, NonIncrementalError, serializeSnapshot, deserializeSnapshot, type ReduceSnapshot } from "../reducer/incremental.ts";
+import { encodeCbor, decodeCbor } from "../core/cbor.ts";
 import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
 import type { OwnerRule } from "../objects/types.ts";
@@ -79,6 +80,7 @@ export class Repo {
   // so no filter key is needed. Opt-in via AVCS_INCREMENTAL=1 (default off = full reduce);
   // AVCS_VERIFY_INCREMENTAL=1 cross-checks every incremental result against a full reduce.
   #incSnap: ReduceSnapshot | null = null;
+  #forceSnapshot = false; // set by compact() to capture a snapshot regardless of env flags
 
   private constructor(dir: string, store: ObjectStore) {
     this.dir = dir;
@@ -996,6 +998,9 @@ export class Repo {
   /** Resolve a view's query into the candidate operation set, then reduce. */
   async materialize(viewName = "main"): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
+    // Compaction (B3): on a cold instance, seed the incremental base from the persisted
+    // snapshot so this materialize re-reduces only ops added since it, not all history.
+    if (process.env.AVCS_COMPACT === "1" && !this.#incSnap) await this.#loadPersistedSnapshot(viewName);
     const view = await this.getView(viewName);
     const q = view.query;
     const exclude = new Set(q.excludeOps ?? []);
@@ -1136,7 +1141,10 @@ export class Repo {
    * incremental result against a full reduce and throws on any divergence (CI safety net).
    */
   #pass1Reduce(base: ReduceInput, useInc: boolean): ReductionResult {
-    if (!(useInc && process.env.AVCS_INCREMENTAL === "1")) return reduce(base);
+    // Opt-in incremental: AVCS_INCREMENTAL (warm in-process delta), AVCS_COMPACT (cold start
+    // from a persisted snapshot base, B3), or compact() capturing a fresh snapshot.
+    const optIn = useInc && (process.env.AVCS_INCREMENTAL === "1" || process.env.AVCS_COMPACT === "1" || this.#forceSnapshot);
+    if (!optIn) return reduce(base);
     let snap: ReduceSnapshot;
     if (this.#incSnap) {
       try {
@@ -1159,7 +1167,10 @@ export class Repo {
   /** Throw if an incremental reduction diverges from the full one (treeHash/statuses/
    *  conflicts/headOps) — incremental reduce must NEVER break the determinism invariant. */
   #assertReduceEqual(inc: ReductionResult, full: ReductionResult): void {
-    const norm = (r: ReductionResult) => JSON.stringify({
+    // canonicalize (recursive key-sort) so the compare is key-order-insensitive — a
+    // CBOR-deserialized base (B3) yields sorted-key objects vs freshly-built insertion
+    // order, which are logically identical.
+    const norm = (r: ReductionResult) => canonicalize({
       treeHash: r.treeHash,
       statuses: [...r.statuses].sort(),
       conflicts: r.conflicts,
@@ -1373,6 +1384,41 @@ export class Repo {
     const r = await this.store.pack();
     this.logger.info("pack", { packed: r.packed });
     return r;
+  }
+
+  /**
+   * Compaction (docs/11 B3): persist the current reduction of `view` as a durable base
+   * snapshot. A later COLD materialize (with AVCS_COMPACT=1) loads it and `reduceIncremental`s
+   * only the ops added since — folding settled history into the base instead of replaying
+   * it — while the original ops stay on disk (append-only audit preserved). Correctness is
+   * the same invariant as Track A: reduceIncremental(base, current) ≡ full reduce, gated by
+   * the property harness and (with AVCS_VERIFY_INCREMENTAL=1) a per-call self-check.
+   */
+  async compact(view = "main"): Promise<{ baseOps: number }> {
+    this.#forceSnapshot = true;
+    try {
+      await this.materialize(view); // produces & stores #incSnap via #pass1Reduce
+    } finally {
+      this.#forceSnapshot = false;
+    }
+    if (!this.#incSnap) return { baseOps: 0 };
+    const dir = join(this.dir, ".avcs", "snapshot");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${view}.cbor`), encodeCbor(serializeSnapshot(this.#incSnap)));
+    const baseOps = this.#incSnap.input.ops.length;
+    this.logger.info("compact", { view, baseOps });
+    return { baseOps };
+  }
+
+  /** Load a persisted compaction base into the in-memory incremental snapshot (B3). */
+  async #loadPersistedSnapshot(view: string): Promise<void> {
+    const p = join(this.dir, ".avcs", "snapshot", `${view}.cbor`);
+    if (!existsSync(p)) return;
+    try {
+      this.#incSnap = deserializeSnapshot(decodeCbor(await readFile(p)));
+    } catch {
+      this.#incSnap = null; // corrupt/incompatible snapshot → full reduce (always correct)
+    }
   }
 
   /**

@@ -174,6 +174,13 @@ async function main(): Promise<void> {
       console.log(`packed ${r.packed} loose object(s) into a packfile (blobs left loose)`);
       break;
     }
+    case "compact": {
+      const repo = await Repo.open(cwd);
+      const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
+      const r = await repo.compact(view);
+      console.log(`compacted ${view}: persisted a base snapshot over ${r.baseOps} op(s) (run with AVCS_COMPACT=1 to use it)`);
+      break;
+    }
     case "bundle": {
       const repo = await Repo.open(cwd);
       const out = args[1];
@@ -287,6 +294,7 @@ async function main(): Promise<void> {
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
+          "  compact [view]              persist a base snapshot (cold materialize folds history)\n" +
           "  bundle <file>               export the whole repo to a portable file\n" +
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
