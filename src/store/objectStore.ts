@@ -13,9 +13,17 @@
 import { mkdir, readFile, readdir, stat, open, rename, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { canonicalize, computeOid, sha256hex } from "../core/canonical.ts";
+import { Buffer } from "node:buffer";
+import { computeOid, sha256hex } from "../core/canonical.ts";
+import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
 import { withLock, type LockOptions } from "./lock.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
+
+/** Deserialize a stored object: CBOR (new format) or legacy canonical-JSON, sniffed by
+ *  the first byte. oids are JSON-derived so both formats address identically (B1). */
+function decodeObject<T>(raw: Buffer): T {
+  return (looksLikeCbor(raw) ? decodeCbor(raw) : JSON.parse(raw.toString("utf8"))) as T;
+}
 
 export class ObjectStore {
   readonly root: string; // the .avcs directory
@@ -39,11 +47,11 @@ export class ObjectStore {
    * fsync it, then atomically rename over the target. A reader therefore sees either
    * the old file or the complete new one — never a torn/partial read. (H-5)
    */
-  async #writeAtomic(path: string, data: string): Promise<void> {
+  async #writeAtomic(path: string, data: string | Buffer): Promise<void> {
     const tmp = `${path}.tmp-${process.pid}-${++this.#wc}`;
     const fh = await open(tmp, "w");
     try {
-      await fh.writeFile(data, "utf8");
+      await fh.writeFile(data);
       await fh.sync();
     } finally {
       await fh.close();
@@ -101,7 +109,8 @@ export class ObjectStore {
       await mkdir(dirname(p), { recursive: true });
       // Atomic: concurrent writers of the same oid write distinct temp files and the
       // rename is a no-op overwrite with identical content; never a torn object.
-      await this.#writeAtomic(p, canonicalize({ ...payload, oid }));
+      // Stored as canonical CBOR (B1) — oid stays JSON-derived, so this is oid-neutral.
+      await this.#writeAtomic(p, encodeCbor({ ...payload, oid }));
       // Op-log (docs/11 A5): append the oid of every NEWLY-written operation to a single
       // append-only log, AFTER the object is durable. This is the choke point through
       // which every op enters the store — authoring, pull, importBundle, hub push — so
@@ -151,7 +160,7 @@ export class ObjectStore {
     void _drop;
     const p = this.#pathFor(oid);
     await mkdir(dirname(p), { recursive: true }); // shard dir may not exist yet on a fresh clone
-    await this.#writeAtomic(p, canonicalize({ ...payload, oid }));
+    await this.#writeAtomic(p, encodeCbor({ ...payload, oid }));
   }
 
   /**
@@ -166,8 +175,7 @@ export class ObjectStore {
 
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
     const p = this.#pathFor(oid);
-    const raw = await readFile(p, "utf8");
-    return JSON.parse(raw) as T;
+    return decodeObject<T>(await readFile(p));
   }
 
   async has(oid: string): Promise<boolean> {
@@ -185,8 +193,7 @@ export class ObjectStore {
       for (const file of await readdir(shardDir)) {
         if (!file.endsWith(".json")) continue;
         if (type && !file.startsWith(`${type}_`)) continue;
-        const obj = JSON.parse(await readFile(join(shardDir, file), "utf8")) as T;
-        yield obj;
+        yield decodeObject<T>(await readFile(join(shardDir, file)));
       }
     }
   }
