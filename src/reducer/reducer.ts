@@ -701,6 +701,79 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
   return { input: next, result, perKey, groupOrder, groupMembers, stats };
 }
 
+// ── snapshot persistence (docs/11 B3 compaction) ──────────────────────────────
+// A ReduceSnapshot can be persisted as a durable "compacted base": a later cold
+// materialize loads it and `reduceIncremental`s only the ops added since, instead of
+// reducing the whole history from scratch. reduceIncremental reads ONLY `.oid` from
+// `prev.ops`/`decisions`/`evidence`, so the persisted input keeps just oids (stubs on
+// reload) — the heavy op/blob content is not duplicated. Maps are stored as entry arrays.
+type Entries<V> = [string, V][];
+const mapToEntries = <V>(m: Map<string, V>): Entries<V> => [...m];
+const entriesToMap = <V>(e: Entries<V>): Map<string, V> => new Map(e);
+
+export function serializeSnapshot(snap: ReduceSnapshot): unknown {
+  const inp = snap.input;
+  const r = snap.result;
+  return {
+    v: 1,
+    input: {
+      ops: inp.ops.map((o) => o.oid as string),
+      decisions: inp.decisions.map((d) => d.oid as string),
+      evidence: inp.evidence.map((e) => e.oid as string),
+      reliability: mapToEntries(inp.reliability ?? new Map()),
+      authority: mapToEntries(inp.authority ?? new Map()),
+      policy: inp.policy,
+      materializeStatuses: inp.materializeStatuses ?? null,
+    },
+    result: {
+      tree: mapToEntries(r.tree),
+      treeHash: r.treeHash,
+      statuses: mapToEntries(r.statuses),
+      conflicts: r.conflicts,
+      autoDecisions: r.autoDecisions,
+      semanticConflicts: r.semanticConflicts,
+      headOps: r.headOps,
+      synthBlobs: mapToEntries(r.synthBlobs),
+    },
+    perKey: [...snap.perKey].map(([k, d]) => [k, { local: mapToEntries(d.local), conflicts: d.conflicts, autoDecisions: d.autoDecisions }]),
+    groupOrder: snap.groupOrder,
+    groupMembers: mapToEntries(snap.groupMembers),
+  };
+}
+
+export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
+  const s = raw as ReturnType<typeof serializeSnapshot> & Record<string, any>;
+  const inp = s.input;
+  // Stub ops/decisions/evidence: reduceIncremental only reads their `.oid`.
+  const stub = (oid: string) => ({ oid }) as unknown as Operation;
+  const input: ReduceInput = {
+    ops: (inp.ops as string[]).map(stub),
+    decisions: (inp.decisions as string[]).map((oid) => ({ oid }) as unknown as Decision),
+    evidence: (inp.evidence as string[]).map((oid) => ({ oid }) as unknown as Evidence),
+    intents: new Map(),
+    policy: inp.policy as Policy,
+    materializeStatuses: (inp.materializeStatuses as OperationStatus[] | null) ?? undefined,
+    reliability: entriesToMap(inp.reliability as Entries<number>),
+    authority: entriesToMap(inp.authority as Entries<number>),
+  };
+  const r = s.result;
+  const result: ReductionResult = {
+    tree: entriesToMap(r.tree as Entries<string>),
+    treeHash: r.treeHash as string,
+    statuses: entriesToMap(r.statuses as Entries<OperationStatus>),
+    conflicts: r.conflicts as Conflict[],
+    autoDecisions: r.autoDecisions as AutoDecision[],
+    semanticConflicts: r.semanticConflicts as ReductionResult["semanticConflicts"],
+    headOps: r.headOps as string[],
+    synthBlobs: entriesToMap(r.synthBlobs as Entries<string>),
+  };
+  const perKey = new Map<string, PerKeyDecision>(
+    (s.perKey as [string, any][]).map(([k, d]) => [k, { local: entriesToMap(d.local), conflicts: d.conflicts, autoDecisions: d.autoDecisions }]),
+  );
+  const stats: IncrementalStats = { groupsTotal: perKey.size, groupsRecomputed: 0, groupsReused: perKey.size, dirtyKeys: 0 };
+  return { input, result, perKey, groupOrder: s.groupOrder as string[], groupMembers: entriesToMap(s.groupMembers as Entries<string[]>), stats };
+}
+
 function decideGroup(
   key: string,
   groupOps: Operation[],

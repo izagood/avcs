@@ -109,9 +109,15 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   평문 잔존 위험 차단). crash-safe(packfile 먼저 쓰고 loose 삭제). `repo.pack()`·CLI `pack` 노출. 검증:
   pack 후 materialize 동일(cold reopen)·non-blob loose 0·blob loose 유지·pack 후 redaction scrub. *GC는 loose만
   회수(packed 객체는 materialize 정확성엔 무영향, 공간은 향후 repack에서) — 문서화된 한계.*
-- **B3 — compaction (최고위험).** checkpoint 뒤 superseded 저수준 op를 semantic op로 fold. 그래프를
-  건드리므로 **모든 checkpoint에서 materialize(after)≡materialize(before)** + append-only 감사 보존을
-  무작위 히스토리로 게이트. B 트랙 마지막.
+- **B3 — compaction (persisted-snapshot base).** ✅ `compact(view)`가 현재 reduction을 직렬화(`serializeSnapshot`,
+  CBOR)해 `.avcs/snapshot/<view>.cbor`에 **durable base**로 저장. cold materialize는 `AVCS_COMPACT=1`일 때 이
+  base를 로드해 **그 이후 추가된 op만 `reduceIncremental`** — 정착된 히스토리를 base로 fold하고 재replay 회피.
+  원본 op는 디스크에 그대로(append-only 감사 보존). 정직한 한계: reduceIncremental은 `prev.ops`의 `.oid`만
+  읽으므로 base에 op 본문을 중복 저장하지 않고, cold IO(전체 op 스캔)는 여전 — 진짜 이득은 reduce **컴퓨트**
+  fold(큰 N에서 의미). **정확성 = Track A 불변식**: `reduceIncremental(base,current) ≡ full`. CBOR 역직렬화
+  객체는 키 정렬되므로 자가검증 가드를 `canonicalize`(키 순서 무관) 비교로 강화. 검증: compact→cold reopen
+  materialize==full(충돌/결정 히스토리 포함), base+delta==full, 그리고 **INCREMENTAL+COMPACT+VERIFY 3플래그
+  ON으로 전체 122 테스트 통과**(가드 미발화). opt-in(prod 기본 OFF). **Track B 완료.**
 
 ## Track C — 인프라 의존 (sandbox 밖, 인터페이스만)
 
