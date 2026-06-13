@@ -130,10 +130,12 @@ async function main(): Promise<void> {
     }
     case "serve": {
       const { startHub } = await import("./hub/hubServer.ts");
+      const { consoleLogger } = await import("./observe/logger.ts");
       const dir = args[1] && !args[1].startsWith("--") ? args[1] : cwd;
       const port = Number(flag("--port") ?? 0);
       const gated = args.includes("--gated");
-      const hub = await startHub({ repoDir: dir, port, gated });
+      const quiet = args.includes("--quiet");
+      const hub = await startHub({ repoDir: dir, port, gated, logger: quiet ? undefined : consoleLogger("info") });
       console.log(`avcs hub serving ${dir} at ${hub.url}${gated ? " (gated: member-signed ops only)" : ""}`);
       console.log("press Ctrl-C to stop");
       const stop = async () => { await hub.close(); process.exit(0); };
