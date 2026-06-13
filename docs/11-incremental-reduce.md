@@ -103,7 +103,12 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   `ObjectStore`가 첫 바이트로 CBOR(major 5)/legacy JSON(`{`)을 sniff해 **dual-read** → 기존 저장소 무중단
   호환. **와이어·번들은 JSON 유지**(hub은 deserialized 객체를 `JSON.stringify`) → blast radius 최소. 검증:
   2000-seed 코덱 라운드트립 + oid-중립 + dual-read + full-repo warm==cold. **측정: operation 객체 16.9% 작음.**
-- **B2 — packing.** loose→packfile, 읽기는 pack→loose. 순수 저장. GC·읽기 동치 테스트.
+- **B2 — packing.** ✅ `ObjectStore.pack()`가 loose **non-blob** 객체를 packfile(+`oid offset length` 인덱스)로
+  접고 loose를 삭제. 읽기는 **loose→pack** fallback(loose가 pack을 shadow) → 투명한 읽기 최적화. **blob은 pack
+  제외** — redaction이 blob 바이트만 overwriteAt로 덮으므로 blob을 loose로 둬야 평문 scrub이 항상 가능(pack
+  평문 잔존 위험 차단). crash-safe(packfile 먼저 쓰고 loose 삭제). `repo.pack()`·CLI `pack` 노출. 검증:
+  pack 후 materialize 동일(cold reopen)·non-blob loose 0·blob loose 유지·pack 후 redaction scrub. *GC는 loose만
+  회수(packed 객체는 materialize 정확성엔 무영향, 공간은 향후 repack에서) — 문서화된 한계.*
 - **B3 — compaction (최고위험).** checkpoint 뒤 superseded 저수준 op를 semantic op로 fold. 그래프를
   건드리므로 **모든 checkpoint에서 materialize(after)≡materialize(before)** + append-only 감사 보존을
   무작위 히스토리로 게이트. B 트랙 마지막.
