@@ -15,11 +15,17 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { ObjectStore } from "../store/objectStore.ts";
 import { verifyMessage } from "../core/identity.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
+import { Metrics } from "../observe/metrics.ts";
+import { MATERIALIZER_VERSION } from "../reducer/policy.ts";
 import type { AnyObject, Membership, Operation } from "../objects/types.ts";
+
+/** Wire-protocol version the hub speaks (have/objects/refs gossip). Bumped on breaking changes. */
+export const HUB_PROTOCOL_VERSION = 1;
 
 export interface HubHandle {
   url: string;
   port: number;
+  metrics: Metrics;
   close(): Promise<void>;
 }
 
@@ -70,21 +76,27 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
  * so an empty repo dir works. Pass `port: 0` (or omit) to get an OS-assigned port,
  * read back from the returned handle.
  */
-export async function startHub(opts: { repoDir: string; port?: number; gated?: boolean; logger?: Logger }): Promise<HubHandle> {
+export async function startHub(opts: { repoDir: string; port?: number; gated?: boolean; logger?: Logger; metrics?: Metrics }): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
   const gated = opts.gated ?? false;
   const logger = opts.logger ?? silentLogger();
+  const metrics = opts.metrics ?? new Metrics();
 
   const server: Server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
+    const path = (req.url ?? "/").split("?")[0]!;
+    metrics.inc("hub.requests");
     res.on("finish", () => {
       const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
-      logger.info("hub.request", { method: req.method, path: (req.url ?? "/").split("?")[0], status: res.statusCode, ms: Math.round(ms * 100) / 100 });
+      metrics.observe("hub.request.ms", ms);
+      metrics.inc(`hub.status.${Math.floor(res.statusCode / 100)}xx`);
+      logger.info("hub.request", { method: req.method, path, status: res.statusCode, ms: Math.round(ms * 100) / 100 });
     });
-    handle(store, req, res, gated).catch((err) => {
+    handle(store, req, res, gated, metrics).catch((err) => {
       // Last-resort guard: never let a handler rejection crash the server.
-      logger.error("hub.error", { method: req.method, path: (req.url ?? "/").split("?")[0], error: String(err?.message ?? err) });
+      metrics.inc("hub.errors");
+      logger.error("hub.error", { method: req.method, path, error: String(err?.message ?? err) });
       if (!res.headersSent) sendJson(res, 500, { error: String(err?.message ?? err) });
       else res.end();
     });
@@ -102,6 +114,7 @@ export async function startHub(opts: { repoDir: string; port?: number; gated?: b
   return {
     url,
     port,
+    metrics,
     close(): Promise<void> {
       return new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -110,11 +123,31 @@ export async function startHub(opts: { repoDir: string; port?: number; gated?: b
   };
 }
 
-async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean): Promise<void> {
+async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics): Promise<void> {
   // Parse path only (ignore query); the host is irrelevant for routing.
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
   const method = req.method ?? "GET";
+
+  // GET /healthz → liveness/readiness probe (O(1), no store scan) for LBs/orchestrators.
+  if (method === "GET" && (path === "/healthz" || path === "/health")) {
+    sendJson(res, 200, { status: "ok", gated });
+    return;
+  }
+
+  // GET /version → identify the hub and the gossip protocol/materializer it speaks, so a
+  // client can refuse to sync against an incompatible peer.
+  if (method === "GET" && path === "/version") {
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated });
+    return;
+  }
+
+  // GET /metrics → in-process counters/timings snapshot (request counts, status classes,
+  // latency). Production forwards this to Prometheus/OTel; here it's a scrapeable JSON.
+  if (method === "GET" && path === "/metrics") {
+    sendJson(res, 200, metrics.snapshot());
+    return;
+  }
 
   // GET /have → all oids the hub holds.
   if (method === "GET" && path === "/have") {
