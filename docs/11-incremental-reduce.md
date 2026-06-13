@@ -64,10 +64,16 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   재계산 + (b) tree materialization(`kahnOrder`+`applyOp`) + (c) treeHash 전체 재해시** — A0가 무조건 수행하는
   세 가지다. ⇒ A3 범위를 "tree 증분"에서 **"ancestry·tree·treeHash 3종 증분"**으로 재정의(아래).
 - **A2 — 클린 그룹 conflicts/autoDecisions 캐시 재방출.** (A0에 포함.)
-- **A3 — 증분 ancestry + tree + treeHash (A1이 식별한 진짜 병목).**
-  - *ancestry*: 새 op의 조상 = deps의 조상 합집합으로 base 맵 확장; 기존 op는 ancestry-extension 대상만 갱신.
-  - *tree*: accepted 집합·순서가 안 바뀐 경로는 base tree 재사용, 영향 경로만 재적용.
-  - *treeHash*: 경로별 Merkle/누적 해시로 전체 재직렬화 회피(O(Δ) 해시). 동치는 A0 하니스가 강제.
+- **A3 — 증분 tree + 공유 hot-path 수정.** ✅ 증분 tree를 구현하던 중 instrumentation으로 **진짜 지배 비용**을
+  발견: `decideGroup`·splice가 아니라 **`headOps` frontier 계산의 O(accepted²) all-pairs 스캔**이었다.
+  - *frontier 수정(헤드라인)*: "covered = 어떤 accepted op의 조상에 든 op" 집합을 O(Σancestors)로 모아
+    `accepted \ covered`. **출력 동일**, full `reduce`가 N=3000에서 **172ms→25ms (6.7x)** — 모든 materialize에
+    공통 이득(repo cold도 ~859→680ms). 이게 A1이 가리킨 "O(N) 바닥"의 실체였다.
+  - *증분 tree*: 변경 없는 경로는 base tree 재사용, dirty 경로만 global kahn 순서로 replay → set_symbol splice
+    스킵. dirty 경로 = projected-멤버십 변경 op의 경로 ∪ projected cross-path(rename/move) 양 경로 ∪
+    ancestry-extension 경로. `synthBlobs`는 최종 tree 참조분만 유지(`pruneSynth`)해 base 재사용을 정확히.
+  - *잔여*: frontier 수정 후 full reduce가 이미 빨라 증분 추가 이득은 1.2–1.6x. ancestry/treeHash 증분(Merkle)은
+    절대 시간이 작아 후순위. 진짜 end-to-end 이득은 A5(disk re-read 제거)+A6(배선)에서. 동치는 A0 하니스가 강제.
 - **A5 — Repo IO 계층: persistent op-log + tail read.** 모든 op-ingress(`proposeOperation`·pull/
   hubClient·importBundle)에 append-only op-log 유지, 마지막 `ReductionResult`를 (line,filter,op-log
   merkle)로 캐시해 append분만 읽음. ⚠️ ingress 누락 = 조용한 분기 → rebuild-동치 테스트로 완화.
