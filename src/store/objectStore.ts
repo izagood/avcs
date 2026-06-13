@@ -115,7 +115,9 @@ export class ObjectStore {
   async overwriteAt(oid: string, obj: AnyObject): Promise<void> {
     const { oid: _drop, ...payload } = obj as AnyObject & { oid?: string };
     void _drop;
-    await this.#writeAtomic(this.#pathFor(oid), canonicalize({ ...payload, oid }));
+    const p = this.#pathFor(oid);
+    await mkdir(dirname(p), { recursive: true }); // shard dir may not exist yet on a fresh clone
+    await this.#writeAtomic(p, canonicalize({ ...payload, oid }));
   }
 
   /**
