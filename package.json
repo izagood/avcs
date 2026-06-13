@@ -12,7 +12,8 @@
     "demo": "node --experimental-strip-types src/demo.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "mcp": "node --experimental-strip-types src/mcp/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bench": "node --experimental-strip-types bench/materialize-bench.ts"
   },
   "engines": {
     "node": ">=22.6"
