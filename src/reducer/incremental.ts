@@ -14,6 +14,8 @@ export {
   reduceIncremental,
   snapshotReduce,
   NonIncrementalError,
+  serializeSnapshot,
+  deserializeSnapshot,
   type ReduceSnapshot,
   type PerKeyDecision,
   type IncrementalStats,
