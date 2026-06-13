@@ -159,6 +159,13 @@ async function main(): Promise<void> {
       console.log(`imported ${r.ops.length} file(s) from ${src} (${r.added.length} new)`);
       break;
     }
+    case "gc": {
+      const repo = await Repo.open(cwd);
+      const dryRun = args.includes("--dry-run");
+      const r = await repo.gc({ dryRun });
+      console.log(`${dryRun ? "would collect" : "collected"} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
+      break;
+    }
     case "bundle": {
       const repo = await Repo.open(cwd);
       const out = args[1];
@@ -270,6 +277,7 @@ async function main(): Promise<void> {
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
+          "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
           "  bundle <file>               export the whole repo to a portable file\n" +
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
