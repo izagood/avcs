@@ -65,6 +65,13 @@ export class Repo {
   /** Structured logger (silent by default; CLI/hub/MCP wire a console/OTel sink). */
   logger: Logger = silentLogger();
   #clock = new LamportClock();
+  // Warm in-memory caches (docs/11 A6). Operations are tailed from the append-only op-log
+  // (so a +1op materialize reads one new object, not every shard); blobs are content-
+  // addressed and immutable except via redaction, so they cache by oid. Both are pure
+  // optimizations over disk — correctness never depends on them, and they are cleared on
+  // the rare mutations that can invalidate them (gc deletes; redaction overwrites bytes).
+  #opCache = new Map<string, Operation>();
+  #blobCache = new Map<string, Buffer>();
 
   private constructor(dir: string, store: ObjectStore) {
     this.dir = dir;
@@ -243,11 +250,44 @@ export class Repo {
   }
 
   async readBlob(oid: string): Promise<Buffer> {
+    const cached = this.#blobCache.get(oid);
+    if (cached) return cached;
     const blob = await this.store.get<Blob>(oid);
-    if (blob.chunked && blob.chunks) {
-      return Buffer.concat(await Promise.all(blob.chunks.map((c) => this.readBlob(c))));
+    const buf = blob.chunked && blob.chunks
+      ? Buffer.concat(await Promise.all(blob.chunks.map((c) => this.readBlob(c))))
+      : Buffer.from(blob.data, "base64");
+    this.#blobCache.set(oid, buf);
+    return buf;
+  }
+
+  /**
+   * All operations, tailed from the op-log (docs/11 A6): read only oids not already in
+   * the warm cache, in first-write order. Replaces a full `collect("operation")` shard
+   * scan on every materialize — a +1op materialize touches one new object file. Tolerates
+   * op-log entries whose object was GC'd (skips them; the store is the source of truth)
+   * and backfills the log for a store created before A5.
+   */
+  async #allOpsTailed(): Promise<Operation[]> {
+    let log = await this.store.readOpLog();
+    if (log.length === 0) {
+      // Pre-A5 store (no log yet) — scan once, backfill the log, warm the cache.
+      const scanned = await this.store.collect<Operation>("operation");
+      if (scanned.length === 0) return [];
+      await this.store.rebuildOpLog();
+      for (const o of scanned) this.#opCache.set(o.oid as string, o);
+      log = await this.store.readOpLog();
     }
-    return Buffer.from(blob.data, "base64");
+    const ops: Operation[] = [];
+    for (const oid of log) {
+      let op = this.#opCache.get(oid);
+      if (!op) {
+        if (!(await this.store.has(oid))) continue; // GC'd since logged — skip
+        op = await this.store.get<Operation>(oid);
+        this.#opCache.set(oid, op);
+      }
+      ops.push(op);
+    }
+    return ops;
   }
 
   async proposeOperation(args: {
@@ -806,6 +846,7 @@ export class Repo {
     // Evict the bytes: overwrite the blob in place with the (deterministic) stub.
     const { redactedStub } = await import("../store/applyRedactions.ts");
     await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
+    this.#blobCache.delete(blobOid); // bytes changed under a stable oid — evict the cache
     this.logger.warn("redact.applied", { blobOid, redactionOid, by, reason, length: original.length });
     return redactionOid;
   }
@@ -925,7 +966,9 @@ export class Repo {
   /** Apply all known redaction tombstones locally (evict bytes; oids preserved). */
   async applyRedactions(): Promise<number> {
     const { applyRedactions } = await import("../store/applyRedactions.ts");
-    return applyRedactions(this.store);
+    const n = await applyRedactions(this.store);
+    if (n > 0) this.#blobCache.clear(); // bytes changed under stable oids — evict the cache
+    return n;
   }
 
   /** Push objects this repo holds that a network hub lacks (M2 / docs/10 WS-B). */
@@ -936,7 +979,11 @@ export class Repo {
   /** Pull objects a network hub holds that this repo lacks. */
   async pullHub(hubUrl: string): Promise<{ pulled: number }> {
     const { pullFromHub } = await import("../hub/hubClient.ts");
-    return pullFromHub(this.dir, hubUrl);
+    const r = await pullFromHub(this.dir, hubUrl);
+    // pull may have applied redactions (blob bytes overwritten under stable oids) and
+    // wrote through a separate ObjectStore; drop the warm blob cache so reads re-hit disk.
+    this.#blobCache.clear();
+    return r;
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
@@ -952,7 +999,7 @@ export class Repo {
     // its fork checkpoint (the base line's frozen frontier). Ops authored on the base
     // line AFTER the fork are excluded, which is what keeps lines divergent.
     const lineName = q.line ?? "main";
-    const allOps = await this.store.collect<Operation>("operation");
+    const allOps = await this.#allOpsTailed();
     const inherited = await this.#inheritedOps(lineName, allOps);
 
     const ops: Operation[] = [];
@@ -1313,6 +1360,10 @@ export class Repo {
     if (!opts.dryRun) {
       for (const oid of quarantinedOps) await this.store.deleteObject(oid);
       for (const oid of blobs) await this.store.deleteObject(oid);
+      // Objects were deleted from under the warm caches — drop them so the next
+      // materialize re-tails from disk (GC'd op-log entries are then skipped).
+      for (const oid of quarantinedOps) this.#opCache.delete(oid);
+      for (const oid of blobs) this.#blobCache.delete(oid);
     }
     this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length });
     return { blobs, quarantinedOps };
