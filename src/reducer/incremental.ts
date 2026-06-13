@@ -16,4 +16,5 @@ export {
   NonIncrementalError,
   type ReduceSnapshot,
   type PerKeyDecision,
+  type IncrementalStats,
 } from "./reducer.ts";

@@ -13,7 +13,8 @@
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "mcp": "node --experimental-strip-types src/mcp/server.ts",
     "typecheck": "tsc --noEmit",
-    "bench": "node --experimental-strip-types bench/materialize-bench.ts"
+    "bench": "node --experimental-strip-types bench/materialize-bench.ts",
+    "bench:incremental": "node --experimental-strip-types bench/incremental-bench.ts"
   },
   "engines": {
     "node": ">=22.6"
