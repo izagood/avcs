@@ -26,6 +26,7 @@ import {
 } from "../core/identity.ts";
 import { checkLease, isActive, type LeaseConflict } from "../concurrency/lease.ts";
 import { Metrics } from "../observe/metrics.ts";
+import { silentLogger, type Logger } from "../observe/logger.ts";
 import type {
   Actor,
   AnyObject,
@@ -61,6 +62,8 @@ export class Repo {
   readonly store: ObjectStore;
   readonly keyring = new Keyring();
   readonly metrics = new Metrics();
+  /** Structured logger (silent by default; CLI/hub/MCP wire a console/OTel sink). */
+  logger: Logger = silentLogger();
   #clock = new LamportClock();
 
   private constructor(dir: string, store: ObjectStore) {
@@ -722,7 +725,7 @@ export class Repo {
     parentHead: string | null;
     by: string; // actor id
   }): Promise<{ finalized: true; head: string } | { finalized: false; reason: string }> {
-    return this.store.withLock(`finalize:${args.view}`, async () => {
+    const result = await this.store.withLock(`finalize:${args.view}`, async () => {
       const prot = await this.getProtection(args.view);
       const current = await this.protectedHead(args.view);
       // CAS / non-fast-forward check
@@ -767,6 +770,12 @@ export class Repo {
       await this.store.setRef(`head:${args.view}`, args.newCheckpoint);
       return { finalized: true as const, head: args.newCheckpoint };
     });
+    if (result.finalized) {
+      this.logger.info("finalize.accepted", { view: args.view, head: result.head, parentHead: args.parentHead, by: args.by });
+    } else {
+      this.logger.warn("finalize.rejected", { view: args.view, by: args.by, reason: result.reason });
+    }
+    return result;
   }
 
   // ── security (Phase 12) ────────────────────────────────────────────────────
@@ -797,6 +806,7 @@ export class Repo {
     // Evict the bytes: overwrite the blob in place with the (deterministic) stub.
     const { redactedStub } = await import("../store/applyRedactions.ts");
     await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
+    this.logger.warn("redact.applied", { blobOid, redactionOid, by, reason, length: original.length });
     return redactionOid;
   }
 
@@ -1002,7 +1012,9 @@ export class Repo {
       throw new Error(`promote requires role >= reviewer; ${byActor} is ${await this.roleOf(byActor)}`);
     }
     const p: Promotion = { type: "promotion", ops: opOids, by: byActor, reason, createdAt: new Date().toISOString() };
-    return this.store.put(p);
+    const oid = await this.store.put(p);
+    this.logger.info("promote", { promotionOid: oid, ops: opOids.length, by: byActor, reason });
+    return oid;
   }
 
   /**
@@ -1302,6 +1314,7 @@ export class Repo {
       for (const oid of quarantinedOps) await this.store.deleteObject(oid);
       for (const oid of blobs) await this.store.deleteObject(oid);
     }
+    this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length });
     return { blobs, quarantinedOps };
   }
 
