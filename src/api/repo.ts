@@ -29,6 +29,7 @@ import { Metrics } from "../observe/metrics.ts";
 import type {
   Actor,
   AnyObject,
+  Approval,
   Blob,
   Checkpoint,
   Decision,
@@ -741,6 +742,28 @@ export class Repo {
           return { finalized: false as const, reason: `required check ${k} not pass` };
         }
       }
+      // causal-complete gate (docs/08 C-3): never finalize a partially-synced tree —
+      // every causalDep behind the checkpoint's frontier must be present locally.
+      const missing = await this.#missingCausalDeps(cp.headOps);
+      if (missing.length) {
+        return { finalized: false as const, reason: `incomplete causal history: ${missing.length} object(s) missing — pull before finalizing` };
+      }
+      // required approvals (= PR approvals). A request_changes from any reviewer blocks.
+      if (prot && (prot.requiredApprovals > 0 || prot.requireOwnerApproval)) {
+        const verdict = await this.#approvalVerdicts(args.newCheckpoint);
+        if ([...verdict.values()].includes("request_changes")) {
+          return { finalized: false as const, reason: "changes requested by a reviewer" };
+        }
+        const approvers = [...verdict].filter(([, v]) => v === "approve").map(([id]) => id);
+        if (approvers.length < prot.requiredApprovals) {
+          return { finalized: false as const, reason: `needs ${prot.requiredApprovals} approval(s), have ${approvers.length}` };
+        }
+        if (prot.requireOwnerApproval) {
+          let owner = false;
+          for (const id of approvers) if (await this.hasRole(id, "maintainer")) { owner = true; break; }
+          if (!owner) return { finalized: false as const, reason: "requires an owner (maintainer+) approval" };
+        }
+      }
       await this.store.setRef(`head:${args.view}`, args.newCheckpoint);
       return { finalized: true as const, head: args.newCheckpoint };
     });
@@ -812,6 +835,50 @@ export class Repo {
    */
   async rollbackTo(view: string, checkpointOid: string, by: string): Promise<{ finalized: true; head: string } | { finalized: false; reason: string }> {
     return this.finalize({ view, newCheckpoint: checkpointOid, parentHead: await this.protectedHead(view), by });
+  }
+
+  /** A reviewer approves (or requests changes on) a checkpoint. = PR approve. */
+  async approve(
+    checkpointOid: string,
+    by: string,
+    verdict: "approve" | "request_changes" = "approve",
+    opts: { reason?: string; signWith?: { keyId: string; privateKey: string } } = {},
+  ): Promise<string> {
+    if (!(await this.hasRole(by, "reviewer"))) {
+      throw new Error(`approve requires role >= reviewer; ${by} is ${await this.roleOf(by)}`);
+    }
+    const a: Approval = { type: "approval", checkpointOid, by, verdict, reason: opts.reason, createdAt: new Date().toISOString() };
+    a.sig = this.#sign("approval", a as unknown as Record<string, unknown>, opts.signWith);
+    return this.store.put(a);
+  }
+
+  /** Latest verdict per reviewer for a checkpoint (later canonical approval wins). */
+  async #approvalVerdicts(checkpointOid: string): Promise<Map<string, "approve" | "request_changes">> {
+    const all = (await this.store.collect<Approval>("approval"))
+      .filter((a) => a.checkpointOid === checkpointOid)
+      .sort((x, y) => (x.createdAt < y.createdAt ? -1 : x.createdAt > y.createdAt ? 1 : 0));
+    const out = new Map<string, "approve" | "request_changes">();
+    for (const a of all) if (await this.hasRole(a.by, "reviewer")) out.set(a.by, a.verdict);
+    return out;
+  }
+
+  /** Objects missing from the causal closure of a frontier (incomplete sync). */
+  async #missingCausalDeps(headOps: string[]): Promise<string[]> {
+    const seen = new Set<string>();
+    const missing: string[] = [];
+    const stack = [...headOps];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (!(await this.store.has(id))) {
+        missing.push(id);
+        continue;
+      }
+      const op = await this.store.get<Operation>(id);
+      for (const d of op.causalDeps) if (!seen.has(d)) stack.push(d);
+    }
+    return missing;
   }
 
   // ── sync: object gossip between two stores (Phase 7) ───────────────────────
