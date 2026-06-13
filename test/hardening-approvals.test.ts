@@ -68,7 +68,8 @@ test("causal-complete gate: finalize refuses a checkpoint with missing ancestors
   const cp = await repo.createCheckpoint("main", "cp");
 
   // Hand-craft a checkpoint whose frontier references a non-existent op (partial sync).
-  const badCp = await repo.store.put({ ...(await repo.store.get(cp)), headOps: ["operation_doesnotexist0000000000000000"], summary: "bad" } as never);
+  const orig = (await repo.store.get(cp)) as unknown as Record<string, unknown>;
+  const badCp = await repo.store.put({ ...orig, headOps: ["operation_doesnotexist0000000000000000"], summary: "bad" } as never);
   const f = await repo.finalize({ view: "main", newCheckpoint: badCp, parentHead: null, by: "human:lead" });
   assert.equal(f.finalized, false);
   if (!f.finalized) assert.match(f.reason, /incomplete causal history/);

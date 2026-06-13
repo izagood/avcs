@@ -45,6 +45,8 @@ PR #24–31로 각 마일스톤의 핵심 슬라이스를 구현했다(나머지
 
 **마일스톤 A**: incremental(+동치 harness) → 캐시 → sparse.
 
+**측정 (`npm run bench`, docs/10 검증전략).** N=3000 ops/1000 files 기준: cold materialize ≈ 859ms, warm(M1 캐시 hit) ≈ 327ms(약 2.6x), **+1op(캐시 미스) ≈ cold** — 즉 op 하나만 추가돼도 전체 재reduce. cold/+1op이 N에 선형(500/1500/3000 → 250/407/859ms)으로, 매 materialize가 **전체 op IO + reduce**라는 O(N) 바닥을 확인. M1 캐시는 *무변경* 반복(MCP 서버)�에 2.6x를 주지만 *변경 시*엔 무효. 진짜 O(Δ)는 (a) persistent op-log로 전체 재로딩 회피 + (b) checkpoint base에서 dirty-key 부분 재reduce + (c) 증분 tree 업데이트, 셋 다 필요(설계됨, 대형). 벤치가 회귀 측정과 최적화 우선순위의 근거가 된다.
+
 ## 워크스트림 B — 호스팅: 실제 avcshub 서비스
 
 **문제.** `pull`이 로컬 디렉터리 간 복사. 진짜 협업엔 네트워크 hub 필요.
