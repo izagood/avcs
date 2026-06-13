@@ -791,15 +791,9 @@ export class Repo {
       createdAt: new Date().toISOString(),
     };
     const redactionOid = await this.store.put(redaction);
-    // Evict the bytes: overwrite the blob object in place with a stub (oid preserved).
-    const stub: Blob = {
-      type: "blob",
-      data: Buffer.from(`[REDACTED: ${reason}]`).toString("base64"),
-      encoding: "base64",
-      redacted: true,
-      redactionOid,
-    };
-    await this.store.overwriteAt(blobOid, stub);
+    // Evict the bytes: overwrite the blob in place with the (deterministic) stub.
+    const { redactedStub } = await import("../store/applyRedactions.ts");
+    await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
     return redactionOid;
   }
 
@@ -909,7 +903,16 @@ export class Repo {
       if (obj.type === "operation") for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
       copied++;
     }
+    // Propagate redactions: evict plaintext for any blob we already had before a peer
+    // redacted it (pull skips already-present oids, so the redaction must be applied).
+    await this.applyRedactions();
     return { copied, rejected };
+  }
+
+  /** Apply all known redaction tombstones locally (evict bytes; oids preserved). */
+  async applyRedactions(): Promise<number> {
+    const { applyRedactions } = await import("../store/applyRedactions.ts");
+    return applyRedactions(this.store);
   }
 
   /** Push objects this repo holds that a network hub lacks (M2 / docs/10 WS-B). */

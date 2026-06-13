@@ -85,5 +85,8 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
       if (await store.has(refOid)) await store.setRef(name, refOid);
     }
   }
+  // Propagate redactions: evict plaintext for blobs redacted after we pulled them.
+  const { applyRedactions } = await import("./../store/applyRedactions.ts");
+  await applyRedactions(store);
   return { pulled };
 }
