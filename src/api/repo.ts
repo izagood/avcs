@@ -1246,6 +1246,60 @@ export class Repo {
   }
 
   /**
+   * Garbage-collect (docs/10 WS-C). Reclaims only objects UNREACHABLE from the
+   * authoritative graph — never the append-only audit history of accepted ops:
+   *  - orphan blobs: stored blobs no remaining op references (incl. chunk blobs whose
+   *    manifest is gone);
+   *  - expired quarantine: outsider ops still quarantined (non-member, never promoted),
+   *    past `quarantineTtlMs`, that nothing else builds on — the one place append-only
+   *    yields (abandoned/spam contributions, docs/09 G5).
+   * `dryRun` reports without deleting.
+   */
+  async gc(opts: { quarantineTtlMs?: number; dryRun?: boolean } = {}): Promise<{ blobs: string[]; quarantinedOps: string[] }> {
+    const ops = await this.store.collect<Operation>("operation");
+    const ttl = opts.quarantineTtlMs ?? 7 * 24 * 3600_000;
+    const now = Date.now();
+    const memberships = await this.store.collect<Membership>("membership");
+    const governanceActive = memberships.length > 0;
+    const members = new Set(memberships.filter((m) => !m.revokedAt).map((m) => m.actorId));
+    const promoted = new Set((await this.store.collect<Promotion>("promotion")).flatMap((p) => p.ops));
+    const dependedOn = new Set(ops.flatMap((o) => o.causalDeps));
+
+    const quarantinedOps: string[] = [];
+    const removed = new Set<string>();
+    if (governanceActive) {
+      for (const o of ops) {
+        const oid = o.oid as string;
+        const quarantined = !members.has(o.actor.id) && !promoted.has(oid);
+        if (!quarantined || dependedOn.has(oid)) continue;
+        if (now - Date.parse(o.createdAt) < ttl) continue;
+        quarantinedOps.push(oid);
+        removed.add(oid);
+      }
+    }
+
+    // Blobs referenced by REMAINING ops (+ chunks of referenced chunked manifests).
+    const referenced = new Set<string>();
+    for (const o of ops) {
+      if (removed.has(o.oid as string)) continue;
+      const b = o.body.blobOid;
+      if (!b) continue;
+      referenced.add(b);
+      const blob = await this.store.get<Blob>(b).catch(() => null);
+      if (blob?.chunked && blob.chunks) for (const c of blob.chunks) referenced.add(c);
+    }
+    const blobs = (await this.store.collect<Blob>("blob"))
+      .map((b) => b.oid as string)
+      .filter((oid) => !referenced.has(oid));
+
+    if (!opts.dryRun) {
+      for (const oid of quarantinedOps) await this.store.deleteObject(oid);
+      for (const oid of blobs) await this.store.deleteObject(oid);
+    }
+    return { blobs, quarantinedOps };
+  }
+
+  /**
    * Materialize the state AT a given frontier: reduce only the causal closure of
    * `headOps`. The basis for time-travel — history, bisect, and diff-at-point all
    * reduce over a prefix instead of the whole graph. (Phase 9 / Phase 10)
@@ -1271,7 +1325,8 @@ export class Repo {
    */
   async historyOf(entityKey: string): Promise<Operation[]> {
     const oids = await this.store.readEntityIndex(entityKey);
-    const ops = await Promise.all(oids.map((o) => this.store.get<Operation>(o)));
+    const ops: Operation[] = [];
+    for (const o of oids) if (await this.store.has(o)) ops.push(await this.store.get<Operation>(o)); // skip GC'd
     return ops.sort((a, b) => a.lamport - b.lamport || ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1));
   }
 
