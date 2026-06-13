@@ -775,7 +775,7 @@ export class Repo {
    * preserved so all references and the treeHash stay valid; the plaintext is evicted
    * from this store (and, once a real sync ships, propagated to every replica).
    */
-  async redact(blobOid: string, reason: string, by: string): Promise<string> {
+  async redact(blobOid: string, reason: string, by: string, signWith?: { keyId: string; privateKey: string }): Promise<string> {
     if (!(await this.hasRole(by, "admin"))) {
       throw new Error(`redact requires role admin; ${by} is ${await this.roleOf(by)}`);
     }
@@ -790,6 +790,9 @@ export class Repo {
       by,
       createdAt: new Date().toISOString(),
     };
+    // Sign so other replicas can verify it's a genuine admin redaction (not a forged
+    // DoS). Required when governance is active (see applyRedactions).
+    redaction.sig = this.#sign("redaction", redaction as unknown as Record<string, unknown>, signWith);
     const redactionOid = await this.store.put(redaction);
     // Evict the bytes: overwrite the blob in place with the (deterministic) stub.
     const { redactedStub } = await import("../store/applyRedactions.ts");
