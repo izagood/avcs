@@ -273,6 +273,15 @@ export interface PerKeyDecision {
   autoDecisions: AutoDecision[];
 }
 
+/** Observability for an incremental re-reduce: how much work the dirty-set skipped.
+ *  Does not affect the result; purely for benchmarks/metrics (docs/11 A1). */
+export interface IncrementalStats {
+  groupsTotal: number;
+  groupsRecomputed: number;
+  groupsReused: number;
+  dirtyKeys: number;
+}
+
 /**
  * A full reduce plus the per-group bookkeeping an incremental re-reduce needs to reuse
  * clean groups (see incremental.ts / docs/11). The `result` is exactly `reduce(input)`.
@@ -283,6 +292,8 @@ export interface ReduceSnapshot {
   perKey: Map<string, PerKeyDecision>;
   groupOrder: string[]; // group-map insertion order (= conflict emission order)
   groupMembers: Map<string, string[]>; // key → member op oids
+  /** Set by `reduceIncremental` (a full `snapshotReduce` recomputes every group). */
+  stats: IncrementalStats;
 }
 
 export function reduce(input: ReduceInput): ReductionResult {
@@ -408,7 +419,8 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
-  return { input, result, perKey, groupOrder, groupMembers };
+  const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: groups.size, groupsReused: 0, dirtyKeys: groups.size };
+  return { input, result, perKey, groupOrder, groupMembers, stats };
 }
 
 /** Thrown when an incremental re-reduce's preconditions don't hold; the caller must
@@ -546,6 +558,8 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
   const perKey = new Map<string, PerKeyDecision>();
   const groupOrder: string[] = [];
   const groupMembers = new Map<string, string[]>();
+  let recomputed = 0;
+  let reused = 0;
   for (const [key, groupOps] of groups) {
     groupOrder.push(key);
     groupMembers.set(key, groupOps.map((o) => o.oid as string));
@@ -555,8 +569,10 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
       const ka: AutoDecision[] = [];
       const local = decideGroup(key, groupOps, anc, verdicts, evalOf, next.policy, kc, ka);
       dec = { local, conflicts: kc, autoDecisions: ka };
+      recomputed++;
     } else {
       dec = snap.perKey.get(key)!; // clean group: inputs unchanged ⇒ decision unchanged
+      reused++;
     }
     perKey.set(key, dec);
     for (const [oid, st] of dec.local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
@@ -581,7 +597,8 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
-  return { input: next, result, perKey, groupOrder, groupMembers };
+  const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: recomputed, groupsReused: reused, dirtyKeys: dirty.size };
+  return { input: next, result, perKey, groupOrder, groupMembers, stats };
 }
 
 function decideGroup(

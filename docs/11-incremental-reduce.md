@@ -58,9 +58,16 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   (시드 PRNG 무작위 op-DAG: rename·concurrent·decision·evidence·cross-granularity·다중 액터, 임의 위치
   delta, reliability 섭동). `reduce`를 `reduceCore`로 무손실 추출(동작 불변, 기존 테스트로 게이트).
   전제 미충족 시 `NonIncrementalError`로 throw(호출자 fallback 신호). tree는 전체 재구성(A3에서 증분화).
-- **A1 — dirty-set 정밀화 & 측정.** 위 규칙 구현 확정 + `reduce.ms` 벤치로 클린-키 스킵 이득 측정.
-- **A2 — 클린 그룹 conflicts/autoDecisions 캐시 재방출.** (A0에 포함; 별도 강화 시 분리.)
-- **A3 — 증분 tree.** accepted Δ가 작으면 tree 부분 갱신, 아니면 재구성.
+- **A1 — 측정 & 병목 식별.** ✅ `bench/incremental-bench.ts`(+`npm run bench:incremental`) + `reduceIncremental`
+  재사용 통계(`IncrementalStats`). **측정 결과(중요):** +1op delta에서 clean-group **재사용률 99.9%**(2000/2001
+  그룹 스킵)인데도 **speedup ≈ 1.0x**. 즉 `decideGroup`은 병목이 아니다. O(N) 바닥은 **(a) `ancestry` 전체
+  재계산 + (b) tree materialization(`kahnOrder`+`applyOp`) + (c) treeHash 전체 재해시** — A0가 무조건 수행하는
+  세 가지다. ⇒ A3 범위를 "tree 증분"에서 **"ancestry·tree·treeHash 3종 증분"**으로 재정의(아래).
+- **A2 — 클린 그룹 conflicts/autoDecisions 캐시 재방출.** (A0에 포함.)
+- **A3 — 증분 ancestry + tree + treeHash (A1이 식별한 진짜 병목).**
+  - *ancestry*: 새 op의 조상 = deps의 조상 합집합으로 base 맵 확장; 기존 op는 ancestry-extension 대상만 갱신.
+  - *tree*: accepted 집합·순서가 안 바뀐 경로는 base tree 재사용, 영향 경로만 재적용.
+  - *treeHash*: 경로별 Merkle/누적 해시로 전체 재직렬화 회피(O(Δ) 해시). 동치는 A0 하니스가 강제.
 - **A5 — Repo IO 계층: persistent op-log + tail read.** 모든 op-ingress(`proposeOperation`·pull/
   hubClient·importBundle)에 append-only op-log 유지, 마지막 `ReductionResult`를 (line,filter,op-log
   merkle)로 캐시해 append분만 읽음. ⚠️ ingress 누락 = 조용한 분기 → rebuild-동치 테스트로 완화.
