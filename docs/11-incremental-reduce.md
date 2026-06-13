@@ -74,11 +74,15 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
     ancestry-extension 경로. `synthBlobs`는 최종 tree 참조분만 유지(`pruneSynth`)해 base 재사용을 정확히.
   - *잔여*: frontier 수정 후 full reduce가 이미 빨라 증분 추가 이득은 1.2–1.6x. ancestry/treeHash 증분(Merkle)은
     절대 시간이 작아 후순위. 진짜 end-to-end 이득은 A5(disk re-read 제거)+A6(배선)에서. 동치는 A0 하니스가 강제.
-- **A5 — Repo IO 계층: persistent op-log + tail read.** 모든 op-ingress(`proposeOperation`·pull/
-  hubClient·importBundle)에 append-only op-log 유지, 마지막 `ReductionResult`를 (line,filter,op-log
-  merkle)로 캐시해 append분만 읽음. ⚠️ ingress 누락 = 조용한 분기 → rebuild-동치 테스트로 완화.
-- **A6 — 자가검증 가드.** `AVCS_VERIFY_INCREMENTAL=1`(CI/테스트 ON)일 때 fast 경로가 full도 돌려
-  treeHash+statuses 동일성 assert·불일치 throw. prod OFF. 기존 테스트가 구체 해시를 단언하므로 분기 즉시 검출.
+- **A5 — persistent op-log (foundation).** ✅ `ObjectStore.put`의 **단일 write choke point**에서 새 operation
+  oid를 append-only `oplog`에 기록 — 저작·pull·importBundle·hub push 등 ingress 경로와 무관하게 자동 일관
+  (ingress 누락으로 인한 조용한 분기 원천 차단). `readOpLog()`(first-write 순서·dedup)·`rebuildOpLog()`(구
+  스토어/손상 backfill). 불변식 `oplog ⊇ 현재 operations`를 테스트로 강제(저작·pull·import·rebuild). GC로
+  지워진 op oid는 로그에 남을 수 있어 reader가 missing object를 tolerate(스토어가 진실의 원천).
+- **A6 — repo.materialize 배선 + 자가검증 가드.** `oplog` tail-read로 캐시된 `ReduceSnapshot` 이후 append분만
+  읽어 `reduceIncremental` 호출(전제 미충족·2-pass held·filter 변경 시 full fallback). `AVCS_VERIFY_INCREMENTAL=1`
+  (CI/테스트 ON)일 때 fast 경로가 full도 돌려 treeHash+statuses 동일성 assert·불일치 throw. prod OFF. 기존
+  테스트가 구체 해시를 단언하므로 분기 즉시 검출. ⬜ *다음.*
 
 **Fallback(언제나 정답):** policy/authority/materializeStatuses 변경, line/filter 변경, next ⊉ prev,
 캐시 부재, reliability 광역 무효화 임계 초과 → full `reduce`.

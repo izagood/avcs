@@ -102,8 +102,42 @@ export class ObjectStore {
       // Atomic: concurrent writers of the same oid write distinct temp files and the
       // rename is a no-op overwrite with identical content; never a torn object.
       await this.#writeAtomic(p, canonicalize({ ...payload, oid }));
+      // Op-log (docs/11 A5): append the oid of every NEWLY-written operation to a single
+      // append-only log, AFTER the object is durable. This is the choke point through
+      // which every op enters the store — authoring, pull, importBundle, hub push — so
+      // the log is automatically consistent with the op set regardless of ingress path.
+      // It lets a reader tail only the ops added since its last read (incremental reduce)
+      // instead of scanning every shard. O_APPEND keeps small records atomic across
+      // processes (same pattern as the entity index).
+      if (obj.type === "operation") await appendFile(join(this.root, "oplog"), `${oid}\n`, "utf8");
     }
     return oid;
+  }
+
+  /**
+   * Op-log in authoring/arrival order (docs/11 A5). Returns oids of every operation ever
+   * written, deduped, FIRST-WRITE order preserved. May include oids of operations later
+   * removed by GC (the store is the source of truth — callers tolerate a missing object).
+   * Empty for a store created before the op-log existed; `rebuildOpLog` backfills it.
+   */
+  async readOpLog(): Promise<string[]> {
+    const p = join(this.root, "oplog");
+    if (!existsSync(p)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const line of (await readFile(p, "utf8")).split("\n"))
+      if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    return out;
+  }
+
+  /** Backfill the op-log from a full scan (for stores predating it, or after corruption).
+   *  Rewrites it atomically to the current operation set in canonical oid order. */
+  async rebuildOpLog(): Promise<number> {
+    const oids: string[] = [];
+    for await (const o of this.list("operation")) oids.push(o.oid as string);
+    oids.sort();
+    await this.#writeAtomic(join(this.root, "oplog"), oids.map((o) => `${o}\n`).join(""));
+    return oids.length;
   }
 
   /**
