@@ -328,6 +328,52 @@ function makeEvalOf(
 }
 
 /** Project decided statuses into a tree (+ treeHash, frontier headOps, synth blobs). */
+/** The tree paths an op reads or writes — the unit of incremental-tree dirtying. */
+function pathsOf(op: Operation): string[] {
+  const b = op.body;
+  switch (b.kind) {
+    case "put_file":
+    case "delete_file":
+    case "set_symbol":
+    case "rename_symbol":
+      return [b.path ?? op.target.entityId];
+    case "rename_file":
+      return [b.fromPath ?? op.target.entityId, b.path ?? op.target.entityId];
+    case "move_symbol":
+      return [b.fromPath ?? op.target.entityId, b.path ?? op.target.entityId];
+    case "note":
+      return [];
+  }
+}
+/** rename_file/move_symbol read a SOURCE path's live content, coupling two paths. */
+function isCrossPath(op: Operation): boolean {
+  return op.body.kind === "rename_file" || op.body.kind === "move_symbol";
+}
+
+/** Keep only the synth-blob entries the final tree actually references (drops the
+ *  intermediate splices that get overwritten). Makes synthBlobs a pure function of the
+ *  final tree — which is what lets the incremental path reuse base entries exactly. */
+function pruneSynth(tree: Map<string, string>, synth: Map<string, string>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const oid of tree.values()) {
+    const c = synth.get(oid);
+    if (c !== undefined) out.set(oid, c);
+  }
+  return out;
+}
+
+const treeHashOf = (tree: Map<string, string>): string => sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
+
+/** Frontier: accepted ops not an ancestor of another accepted op. An op is "covered"
+ *  (non-head) iff it is in some accepted op's ancestor set — so collect the covered set
+ *  in O(Σ ancestors) instead of the O(accepted²) all-pairs scan. Identical output. */
+function frontier(ops: Operation[], statuses: Map<string, OperationStatus>, anc: Map<string, Set<string>>): string[] {
+  const acceptedIds = new Set(ops.filter((o) => statuses.get(o.oid as string) === "accepted").map((o) => o.oid as string));
+  const covered = new Set<string>();
+  for (const id of acceptedIds) for (const a of anc.get(id) ?? []) if (acceptedIds.has(a)) covered.add(a);
+  return [...acceptedIds].filter((id) => !covered.has(id));
+}
+
 function materializeProjection(
   ops: Operation[],
   statuses: Map<string, OperationStatus>,
@@ -340,15 +386,43 @@ function materializeProjection(
   const tree = new Map<string, string>();
   const synthBlobs = new Map<string, string>();
   for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
-  const treeHash = sha256hex(canonicalize(Object.fromEntries([...tree].sort())));
+  return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthBlobs) };
+}
 
-  // Frontier: accepted ops not an ancestor of another accepted op.
-  const acceptedIds = new Set(ops.filter((o) => statuses.get(o.oid as string) === "accepted").map((o) => o.oid as string));
-  const headOps = [...acceptedIds].filter((id) => {
-    for (const other of acceptedIds) if (other !== id && anc.get(other)?.has(id)) return false;
-    return true;
-  });
-  return { tree, treeHash, headOps, synthBlobs };
+/**
+ * Incremental tree materialization (docs/11 A3). Reuse the base tree for every path
+ * whose contributing accepted-op subsequence is unchanged, and replay ONLY the ops that
+ * touch a dirty path — skipping the expensive symbol splices on untouched files (A1
+ * showed these dominate). `dirtyPaths` must over-approximate every path whose value can
+ * differ from base: paths of ops whose projected-membership changed (incl. new ops), and
+ * both paths of every projected cross-path op (rename/move read a source's live content).
+ * Replayed ops only ever read/write dirty paths, so a fresh replay tree + clean base
+ * entries reconstructs the full tree exactly. Equivalence is enforced by the A0 harness.
+ */
+function materializeIncremental(
+  ops: Operation[],
+  statuses: Map<string, OperationStatus>,
+  anc: Map<string, Set<string>>,
+  materializeStatuses: Set<OperationStatus>,
+  blobContent: Map<string, string>,
+  base: ReductionResult,
+  dirtyPaths: Set<string>,
+): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, string> } {
+  const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
+  const ordered = kahnOrder(projected, anc);
+  // Replay only dirty-touching ops, in the SAME global order, into a fresh tree.
+  const replayTree = new Map<string, string>();
+  const replaySynth = new Map<string, string>();
+  for (const op of ordered) {
+    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth);
+  }
+  // Final tree = clean base paths (not dirty) + replayed dirty paths.
+  const tree = new Map<string, string>();
+  for (const [p, oid] of base.tree) if (!dirtyPaths.has(p)) tree.set(p, oid);
+  for (const [p, oid] of replayTree) tree.set(p, oid);
+  // synthBlobs: union of base (clean paths' synths) + replay, pruned to the final tree.
+  const synthCandidates = new Map<string, string>([...base.synthBlobs, ...replaySynth]);
+  return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthCandidates) };
 }
 
 export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
@@ -588,12 +662,38 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     if (keysOf(o).length === 0 && statuses.get(o.oid as string) === "proposed")
       statuses.set(o.oid as string, "accepted");
 
-  const { tree, treeHash, headOps, synthBlobs } = materializeProjection(
+  // ── Dirty PATHS for the incremental tree (A3). A path may differ from base if an op
+  // touching it changed projected-membership (incl. new ops), or it is read/written by a
+  // projected cross-path op (rename/move carry a source's live content to a dest). ──
+  const projectedNow = (oid: string): boolean => materializeStatuses.has(statuses.get(oid)!);
+  const projectedBase = (oid: string): boolean => {
+    const s = snap.result.statuses.get(oid);
+    return s !== undefined && materializeStatuses.has(s);
+  };
+  const ancestryExtended = (oid: string): boolean => {
+    const a = anc.get(oid);
+    if (!a) return false;
+    for (const d of deltaOpIds) if (a.has(d)) return true; // a delta op became this op's ancestor
+    return false;
+  };
+  const dirtyPaths = new Set<string>();
+  for (const o of ops) {
+    const oid = o.oid as string;
+    // Membership change (incl. new ops) or ancestry extension can change a path's value
+    // or the order its ops apply in (ancestry extension guards against lamport that is
+    // not consistent with causality — real repo ops always are, but reduce() is pure).
+    if (projectedNow(oid) !== projectedBase(oid) || ancestryExtended(oid)) for (const p of pathsOf(o)) dirtyPaths.add(p);
+    else if (projectedNow(oid) && isCrossPath(o)) for (const p of pathsOf(o)) dirtyPaths.add(p);
+  }
+
+  const { tree, treeHash, headOps, synthBlobs } = materializeIncremental(
     ops,
     statuses,
     anc,
     materializeStatuses,
     next.blobContent ?? new Map<string, string>(),
+    snap.result,
+    dirtyPaths,
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
