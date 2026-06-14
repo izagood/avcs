@@ -239,10 +239,14 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 400, { error: "object must have a string `type`" });
       return;
     }
-    // Gated hub (E2): authorize EVERY mutating governance object by signature + role,
-    // not just operations. A pushed decision/approval/redaction changes governance or
-    // reduce on every replica, so "non-operation objects are harmless" was false.
-    if (gated) {
+    // Authorize the push (E2). On a gated hub EVERY mutating governance object is
+    // checked. A `redaction` is checked ALWAYS — even on an ungated hub (E3): it
+    // overwrites blob bytes irrecoverably, so an unauthenticated redaction is a
+    // data-destruction DoS. authorizePush requires an admin-signed redaction; an open
+    // hub with no admin membership therefore rejects all redactions (no DoS) rather
+    // than the old trust-all behavior.
+    const isRedaction = (obj as AnyObject).type === "redaction";
+    if (gated || isRedaction) {
       const auth = await authorizePush(store, obj as AnyObject);
       if (!auth.ok) {
         sendJson(res, 403, { error: auth.reason });
@@ -252,11 +256,15 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
     // poison the store — it lands at its true content address (or is a no-op if present).
     const oid = await store.put(obj as AnyObject);
-    // A pushed redaction evicts the hub's own copy of the blob too (so no replica can
-    // re-fetch the plaintext from the hub).
-    if ((obj as AnyObject).type === "redaction") {
-      const { applyRedactions } = await import("../store/applyRedactions.ts");
-      await applyRedactions(store);
+    // A pushed (now admin-authorized) redaction evicts the hub's own copy of the blob.
+    // Serialize the read-modify-write under a cross-process lock (E3): the scan +
+    // overwriteAt over shared blob files must not interleave with a concurrent push or
+    // a puller's applyRedactions, or two redactions could race on the same blob.
+    if (isRedaction) {
+      await store.withLock("redactions", async () => {
+        const { applyRedactions } = await import("../store/applyRedactions.ts");
+        await applyRedactions(store);
+      });
     }
     sendJson(res, 200, { oid });
     return;
