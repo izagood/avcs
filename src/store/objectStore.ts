@@ -27,6 +27,9 @@ function decodeObject<T>(raw: Buffer): T {
 
 interface PackLoc { file: string; offset: number; length: number; }
 
+/** Opt-out of fsync for throughput-bound bulk loads (D1). Durability traded for speed. */
+const NO_FSYNC = process.env.AVCS_NO_FSYNC === "1";
+
 export class ObjectStore {
   readonly root: string; // the .avcs directory
   #wc = 0; // temp-file counter for atomic writes
@@ -49,17 +52,62 @@ export class ObjectStore {
    * Crash- and concurrency-safe write: write a unique temp file in the same dir,
    * fsync it, then atomically rename over the target. A reader therefore sees either
    * the old file or the complete new one — never a torn/partial read. (H-5)
+   *
+   * After the rename we fsync the *containing directory* (D1): a fsync of the file
+   * persists its bytes but not necessarily the directory entry created by the rename,
+   * so a power loss could otherwise lose a just-written object/ref/HEAD even after
+   * this call returned. Set AVCS_NO_FSYNC=1 to skip all fsyncs for throughput-bound
+   * bulk loads (durability traded for speed).
    */
   async #writeAtomic(path: string, data: string | Buffer): Promise<void> {
     const tmp = `${path}.tmp-${process.pid}-${++this.#wc}`;
     const fh = await open(tmp, "w");
     try {
       await fh.writeFile(data);
-      await fh.sync();
+      if (!NO_FSYNC) await fh.sync();
     } finally {
       await fh.close();
     }
     await rename(tmp, path); // atomic on the same filesystem
+    await this.#fsyncDir(dirname(path)); // persist the new directory entry
+  }
+
+  /**
+   * fsync a directory so a just-created/renamed/appended entry survives power loss.
+   * Best-effort: some platforms reject opening a directory for fsync (EISDIR/EPERM/
+   * EINVAL) — there the rename's own ordering is the durability guarantee, so we
+   * swallow those rather than fail the write. No-op under AVCS_NO_FSYNC.
+   */
+  async #fsyncDir(dir: string): Promise<void> {
+    if (NO_FSYNC) return;
+    let dh: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      dh = await open(dir, "r");
+      await dh.sync();
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code && !["EISDIR", "EPERM", "EINVAL", "ENOENT", "EACCES"].includes(code)) throw e;
+    } finally {
+      await dh?.close();
+    }
+  }
+
+  /**
+   * Durable append: append `line` to a file, fsync the file's data, and fsync its
+   * directory (the first append also creates the directory entry). This is what keeps
+   * the op-log and entity index from losing their last record(s) on a hard crash. (D1)
+   */
+  async #appendDurable(path: string, line: string): Promise<void> {
+    await appendFile(path, line, "utf8");
+    if (NO_FSYNC) return;
+    let fh: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      fh = await open(path, "r+");
+      await fh.sync();
+    } finally {
+      await fh?.close();
+    }
+    await this.#fsyncDir(dirname(path));
   }
 
   /** Run a critical section under a named cross-process lock (see lock.ts). */
@@ -78,7 +126,7 @@ export class ObjectStore {
   async appendEntityIndex(key: string, oid: string): Promise<void> {
     const p = this.#indexPathFor(key);
     await mkdir(dirname(p), { recursive: true });
-    await appendFile(p, `${oid}\n`, "utf8");
+    await this.#appendDurable(p, `${oid}\n`);
   }
   async readEntityIndex(key: string): Promise<string[]> {
     const p = this.#indexPathFor(key);
@@ -121,7 +169,7 @@ export class ObjectStore {
       // It lets a reader tail only the ops added since its last read (incremental reduce)
       // instead of scanning every shard. O_APPEND keeps small records atomic across
       // processes (same pattern as the entity index).
-      if (obj.type === "operation") await appendFile(join(this.root, "oplog"), `${oid}\n`, "utf8");
+      if (obj.type === "operation") await this.#appendDurable(join(this.root, "oplog"), `${oid}\n`);
     }
     return oid;
   }
