@@ -380,4 +380,107 @@ export class ObjectStore {
   async getHead(): Promise<string> {
     return (await readFile(join(this.root, "HEAD"), "utf8")).trim();
   }
+
+  // ── integrity check (D3 / docs/12) ────────────────────────────────────────
+  /**
+   * Re-derive every stored object's content address and compare it to the address it
+   * lives at — catching bit-rot, truncation, and a torn write that slipped past the
+   * atomic-write guarantee. A redacted blob is exempt: its bytes were deliberately
+   * overwritten by an admin Redaction and no longer hash to their oid (that's the one
+   * sanctioned exception to content-addressing). Also reconciles the op-log against the
+   * actual operation set: operation objects missing from the log are real drift (the
+   * fast-path could skip them); log entries with no object are GC'd/lost (informational).
+   * Read-only unless `rebuild` is set, which rewrites the op-log to match the object set.
+   */
+  async fsck(opts: { rebuild?: boolean } = {}): Promise<FsckReport> {
+    const corrupt: { oid: string; reason: string }[] = [];
+    let objectsChecked = 0;
+    const verify = (oid: string, raw: Buffer): void => {
+      objectsChecked++;
+      let obj: AnyObject & { redacted?: boolean };
+      try {
+        obj = decodeObject<AnyObject & { redacted?: boolean }>(raw);
+      } catch (e) {
+        corrupt.push({ oid, reason: `undecodable: ${(e as Error).message}` });
+        return;
+      }
+      if (obj.type === "blob" && obj.redacted === true) return; // sanctioned overwrite
+      const { oid: _drop, ...payload } = obj as AnyObject & { oid?: string };
+      void _drop;
+      let recomputed: string;
+      try {
+        recomputed = computeOid(obj.type, payload as Record<string, unknown>);
+      } catch (e) {
+        corrupt.push({ oid, reason: `unhashable content: ${(e as Error).message}` });
+        return;
+      }
+      if (recomputed !== oid) corrupt.push({ oid, reason: `content hashes to ${recomputed}` });
+    };
+
+    // loose objects
+    const objectsDir = join(this.root, "objects");
+    if (existsSync(objectsDir)) {
+      for (const shard of await readdir(objectsDir)) {
+        const shardDir = join(objectsDir, shard);
+        if (!(await stat(shardDir)).isDirectory()) continue;
+        for (const file of await readdir(shardDir)) {
+          if (!file.endsWith(".json")) continue;
+          verify(file.slice(0, -".json".length), await readFile(join(shardDir, file)));
+        }
+      }
+    }
+    // packed objects (loose copies, if any, already covered above and shadow these)
+    const looseChecked = new Set<string>(); // avoid double-count of a re-added loose copy
+    for (const [oid, loc] of await this.#packLocations()) {
+      if (looseChecked.has(oid) || existsSync(this.#pathFor(oid))) continue;
+      verify(oid, await this.#readPackSlice(loc));
+    }
+
+    // op-log reconciliation — collect operation oids by ADDRESS (filename / pack index),
+    // never by decoding, so a corrupt object (caught above) doesn't crash the log check.
+    const logged = new Set(await this.readOpLog());
+    const actualOps = new Set<string>();
+    if (existsSync(objectsDir)) {
+      for (const shard of await readdir(objectsDir)) {
+        const shardDir = join(objectsDir, shard);
+        if (!(await stat(shardDir)).isDirectory()) continue;
+        for (const file of await readdir(shardDir))
+          if (file.startsWith("operation_") && file.endsWith(".json")) actualOps.add(file.slice(0, -".json".length));
+      }
+    }
+    for (const oid of (await this.#packLocations()).keys())
+      if (oid.startsWith("operation_")) actualOps.add(oid);
+    const opsMissingFromLog = [...actualOps].filter((o) => !logged.has(o)).sort();
+    const logEntriesMissingObject = [...logged].filter((o) => !actualOps.has(o)).sort();
+
+    let repaired: FsckReport["repaired"];
+    if (opts.rebuild && opsMissingFromLog.length) {
+      const n = await this.rebuildOpLog();
+      repaired = { oplogRebuilt: true, oplogEntries: n };
+    }
+
+    return {
+      objectsChecked,
+      ok: corrupt.length === 0 && opsMissingFromLog.length === 0,
+      corrupt,
+      oplogDrift: { opsMissingFromLog, logEntriesMissingObject },
+      repaired,
+    };
+  }
+}
+
+export interface FsckReport {
+  objectsChecked: number;
+  /** true iff no corrupt object and no operation missing from the op-log. */
+  ok: boolean;
+  /** Objects whose content no longer hashes to the address they live at. */
+  corrupt: { oid: string; reason: string }[];
+  oplogDrift: {
+    /** operation objects absent from the op-log — real drift (fast-path could skip them). */
+    opsMissingFromLog: string[];
+    /** op-log entries with no backing object — GC'd quarantine ops or lost (informational). */
+    logEntriesMissingObject: string[];
+  };
+  /** Present when `fsck({rebuild:true})` repaired op-log drift. */
+  repaired?: { oplogRebuilt: boolean; oplogEntries: number };
 }
