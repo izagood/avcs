@@ -116,12 +116,36 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
  * so an empty repo dir works. Pass `port: 0` (or omit) to get an OS-assigned port,
  * read back from the returned handle.
  */
-export async function startHub(opts: { repoDir: string; port?: number; gated?: boolean; logger?: Logger; metrics?: Metrics }): Promise<HubHandle> {
+export async function startHub(opts: {
+  repoDir: string; port?: number; gated?: boolean; logger?: Logger; metrics?: Metrics;
+  /** App-layer per-actor push quota (E7). Omit to disable. */
+  rateLimit?: { maxPerWindow: number; windowMs?: number };
+}): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
   const gated = opts.gated ?? false;
   const logger = opts.logger ?? silentLogger();
   const metrics = opts.metrics ?? new Metrics();
+
+  // E7 operability: per-actor push quota (a rolling-window counter) + an append-only
+  // audit log of accepted mutations (provenance beyond the signed object itself).
+  const rl = opts.rateLimit;
+  const windowMs = rl?.windowMs ?? 60_000;
+  const hits = new Map<string, number[]>();
+  const allow = (key: string): boolean => {
+    if (!rl) return true;
+    const now = Date.now();
+    const arr = (hits.get(key) ?? []).filter((t) => now - t < windowMs);
+    if (arr.length >= rl.maxPerWindow) { hits.set(key, arr); return false; }
+    arr.push(now);
+    hits.set(key, arr);
+    return true;
+  };
+  const audit = async (rec: Record<string, unknown>): Promise<void> => {
+    try { await store.appendAux("hub-audit.log", `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`); }
+    catch (e) { logger.warn("hub.audit.fail", { error: String((e as Error).message) }); }
+  };
+  const ctx: HubOps = { audit, allow };
 
   const server: Server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
@@ -133,7 +157,7 @@ export async function startHub(opts: { repoDir: string; port?: number; gated?: b
       metrics.inc(`hub.status.${Math.floor(res.statusCode / 100)}xx`);
       logger.info("hub.request", { method: req.method, path, status: res.statusCode, ms: Math.round(ms * 100) / 100 });
     });
-    handle(store, req, res, gated, metrics, opts.repoDir).catch((err) => {
+    handle(store, req, res, gated, metrics, opts.repoDir, ctx).catch((err) => {
       // Last-resort guard: never let a handler rejection crash the server.
       metrics.inc("hub.errors");
       logger.error("hub.error", { method: req.method, path, error: String(err?.message ?? err) });
@@ -176,7 +200,20 @@ async function verifyFinalizeSig(store: ObjectStore, by: string, view: string, n
   return verifyMessage(m.publicKey, `finalize:${view}:${newCheckpoint}:${parentHead ?? ""}`, s.sig);
 }
 
-async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics, repoDir: string): Promise<void> {
+/** E7 operability hooks threaded into the request handler. */
+interface HubOps {
+  audit(rec: Record<string, unknown>): Promise<void>;
+  allow(key: string): boolean;
+}
+
+/** The actor a push is attributed to (for the audit log + quota): the object's signer
+ *  field when there is one, else null (the caller falls back to the remote address). */
+function attributedActor(obj: AnyObject): string | null {
+  const req = authRequirement(obj);
+  return typeof req === "object" ? req.signerId : null;
+}
+
+async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics, repoDir: string, ops: HubOps): Promise<void> {
   // Parse path only (ignore query); the host is irrelevant for routing.
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -267,6 +304,14 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 400, { error: "object must have a string `type`" });
       return;
     }
+    // E7 per-actor push quota: key on the object's signer, else the remote address.
+    const actor = attributedActor(obj as AnyObject);
+    const rlKey = actor ? `actor:${actor}` : `addr:${req.socket.remoteAddress ?? "?"}`;
+    if (!ops.allow(rlKey)) {
+      metrics.inc("hub.ratelimited");
+      sendJson(res, 429, { error: "rate limit exceeded" });
+      return;
+    }
     // Authorize the push (E2). On a gated hub EVERY mutating governance object is
     // checked. A `redaction` is checked ALWAYS — even on an ungated hub (E3): it
     // overwrites blob bytes irrecoverably, so an unauthenticated redaction is a
@@ -294,6 +339,7 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
         await applyRedactions(store);
       });
     }
+    await ops.audit({ action: "put", type: (obj as AnyObject).type, oid, actor }); // E7 provenance
     sendJson(res, 200, { oid });
     return;
   }
@@ -318,9 +364,11 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 403, { error: "finalize not signed by the claimed member" });
       return;
     }
+    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
     const { Repo } = await import("../api/repo.ts");
     const repo = await Repo.open(repoDir);
     const result = await repo.finalize({ view, newCheckpoint, parentHead, by });
+    await ops.audit({ action: "finalize", view, newCheckpoint, by, finalized: result.finalized, reason: result.finalized ? undefined : result.reason }); // E7
     if (result.finalized) { sendJson(res, 200, result); return; }
     // A stale parentHead (lost the CAS race) is a 409 conflict; everything else (role,
     // checks, approvals, incomplete history) is a 422 unprocessable.

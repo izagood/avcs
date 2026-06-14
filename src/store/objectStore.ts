@@ -123,6 +123,14 @@ export class ObjectStore {
     await this.#writeAtomic(p, data);
   }
 
+  /** Durably append a line to an auxiliary log under the repo's `.avcs` root (e.g. the
+   *  hub audit log, E7). Reuses the fsync-file + fsync-dir append path. */
+  async appendAux(relPath: string, line: string): Promise<void> {
+    const p = join(this.root, relPath);
+    await mkdir(dirname(p), { recursive: true });
+    await this.#appendDurable(p, line);
+  }
+
   /** Run a critical section under a named cross-process lock (see lock.ts). */
   async withLock<T>(name: string, fn: () => Promise<T>, opts?: LockOptions): Promise<T> {
     return withLock(join(this.root, "locks"), name, fn, opts);

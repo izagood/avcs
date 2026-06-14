@@ -41,7 +41,7 @@ E4/E5/E6 are independent and can land in parallel. E7 is operability.
 | **E4** | a push is N independent POSTs (non-atomic); an op whose `causalDeps` haven't arrived materializes without its ancestor → transient wrong tree (hubClient.ts:37-53) | accept ops but **hold causally-incomplete ones** (quarantine) until their deps arrive; never project an op missing a dep | Med | — |
 | **E5** | `GET /have` serializes every oid every sync → O(total history) per sync, no cursor (hubServer.ts:153-158) | **since-cursor incremental sync**: a general append-only `objlog` + `GET /sync?since=N` + a persisted per-hub pull cursor (full `/have` fallback). Incremental **pull** done; incremental **push** (idempotent re-POST of the local objlog delta) is a documented follow-up | Med (scale) | — |
 | **E6** | protected-head CAS runs only on the central repo; `setRef` is a plain write with no compare-and-swap (objectStore.ts setRef) | server-side **CAS finalize endpoint** + ref lock so authority never overwrites fresher history | Med | — |
-| **E7** | no provenance/audit of who pushed what; no app-layer rate-limit/quota | push audit log + per-actor quota; extend `fsck` to hub-held objects | Low–Med | E2 |
+| **E7** | no provenance/audit of who pushed what; no app-layer rate-limit/quota | append-only **hub audit log** of accepted mutations + per-actor **push quota** (429). Hub `fsck` needs no new endpoint — the hub IS an ObjectStore, so D3's `avcs fsck` runs directly against the hub's repo dir | Low–Med | E2 |
 
 ## Infra-dependent — documented-only (out of sandbox, Track C kin)
 
