@@ -4,6 +4,9 @@
 // never mutate an existing object. push = send objects the hub lacks; pull = fetch
 // objects we lack. Uses the global fetch available in Node 22.
 
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ObjectStore } from "../store/objectStore.ts";
 import { keysOf } from "../reducer/reducer.ts";
 import type { AnyObject, Operation } from "../objects/types.ts";
@@ -14,6 +17,32 @@ async function hubHave(hubUrl: string): Promise<Set<string>> {
   if (!res.ok) throw new Error(`GET /have failed: ${res.status} ${res.statusText}`);
   const oids = (await res.json()) as string[];
   return new Set(oids);
+}
+
+/** Per-hub sync cursors persisted under .avcs/sync-cursors.json (E5). */
+async function readCursors(root: string): Promise<Record<string, number>> {
+  const p = join(root, "sync-cursors.json");
+  if (!existsSync(p)) return {};
+  try { return JSON.parse(await readFile(p, "utf8")) as Record<string, number>; } catch { return {}; }
+}
+
+/**
+ * Discover the oids to consider pulling. Tries the incremental `GET /sync?since=N`
+ * endpoint (E5): only the oids appended since the client's last cursor, plus the new
+ * cursor. Falls back to the full `GET /have` against an older hub (cursor stays null).
+ * Correctness never depends on the cursor — a wrong/stale one at worst transfers more.
+ */
+async function discover(base: string, since: number): Promise<{ oids: string[]; cursor: number | null }> {
+  try {
+    const res = await fetch(`${base}/sync?since=${since}`);
+    if (res.ok) {
+      const j = (await res.json()) as { oids: string[]; cursor: number };
+      return { oids: j.oids, cursor: j.cursor };
+    }
+  } catch {
+    // fall through to /have
+  }
+  return { oids: [...(await hubHave(base))], cursor: null };
 }
 
 /** Mirror Repo.pull's import side-effect: maintain the entity index for imported ops. */
@@ -61,9 +90,12 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
   await store.init(); // tolerate a fresh local repo dir
-  const have = await hubHave(base);
+  // Incremental discovery (E5): only consider oids the hub added since our last pull.
+  const cursors = await readCursors(store.root);
+  const since = cursors[base] ?? 0;
+  const { oids, cursor } = await discover(base, since);
   let pulled = 0;
-  for (const oid of have) {
+  for (const oid of oids) {
     if (await store.has(oid)) continue;
     const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`);
     if (res.status === 404) continue; // raced eviction; skip
@@ -73,6 +105,9 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
     await indexIfOperation(store, obj, oid);
     pulled++;
   }
+  // Advance the cursor only after the loop completed (a throw aborts before this, so a
+  // failed pull retries from the same cursor next time — never a permanent miss).
+  if (cursor !== null) { cursors[base] = cursor; await store.writeAux("sync-cursors.json", JSON.stringify(cursors)); }
 
   // Governance distribution: adopt the hub's authoritative governance refs (policy,
   // membership, protection, protected heads). The objects they point to were just
