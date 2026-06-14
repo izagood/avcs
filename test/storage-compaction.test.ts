@@ -42,6 +42,10 @@ test("cold materialize from a persisted compaction base equals full reduce, then
     const c = await repo.compact("main");
     assert.ok(c.baseOps >= 9, `base covers all ops, got ${c.baseOps}`);
     assert.ok(existsSync(join(dir, ".avcs", "snapshot", "main.cbor")), "base snapshot persisted");
+    // D2: the snapshot is written atomically (temp→rename) — no torn file, no temp leak.
+    const { readdir } = await import("node:fs/promises");
+    const snapFiles = await readdir(join(dir, ".avcs", "snapshot"));
+    assert.ok(!snapFiles.some((f) => f.includes(".tmp-")), "no leftover temp snapshot file");
 
     // a brand-new (cold) instance loads the base and materializes identically.
     const cold = await Repo.open(dir);
