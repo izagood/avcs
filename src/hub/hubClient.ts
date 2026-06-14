@@ -125,3 +125,25 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
   await applyRedactions(store);
   return { pulled };
 }
+
+/**
+ * Request a finalize (= PR merge) on the hub (E6): POST /finalize with the view, the new
+ * checkpoint, the parent head being compare-and-swapped, and the finalizer. The hub runs
+ * the authoritative CAS+lock+gates. When `signWith` is given the request is signed so a
+ * gated hub can authenticate the finalizer. Returns the HTTP status + the hub's verdict.
+ */
+export async function finalizeOnHub(
+  hubUrl: string,
+  args: { view: string; newCheckpoint: string; parentHead: string | null; by: string; signWith?: { keyId: string; privateKey: string } },
+): Promise<{ status: number; finalized: boolean; head?: string; reason?: string }> {
+  const base = hubUrl.replace(/\/$/, "");
+  const body: Record<string, unknown> = { view: args.view, newCheckpoint: args.newCheckpoint, parentHead: args.parentHead, by: args.by };
+  if (args.signWith) {
+    const { signMessage } = await import("../core/identity.ts");
+    const msg = `finalize:${args.view}:${args.newCheckpoint}:${args.parentHead ?? ""}`;
+    body.sig = { keyId: args.signWith.keyId, alg: "ed25519", sig: signMessage(args.signWith.privateKey, msg) };
+  }
+  const res = await fetch(`${base}/finalize`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const j = (await res.json().catch(() => ({}))) as { finalized?: boolean; head?: string; reason?: string };
+  return { status: res.status, finalized: j.finalized ?? false, head: j.head, reason: j.reason };
+}
