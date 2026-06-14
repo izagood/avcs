@@ -1023,12 +1023,51 @@ export class Repo {
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
       ops.push(op);
     }
+    // E4 (docs/13): hold back causally-incomplete ops. A push is N independent POSTs,
+    // so an op can arrive before its causalDeps (partial/out-of-order sync). Projecting
+    // it without its ancestor yields a transient WRONG tree (the reducer would otherwise
+    // treat the missing dep as an absent edge and apply the op anyway). We exclude any op
+    // a dep of which is absent from the store entirely, transitively. For a complete op
+    // set nothing is held back, so determinism for settled history is unchanged.
+    const present = new Set(allOps.map((o) => o.oid as string));
+    const { complete, pending } = this.#causallyComplete(ops, present);
+    if (pending.length) {
+      this.metrics.inc("materialize.causallyPending", pending.length);
+      this.logger.info("materialize.pending", { view: viewName, pending: pending.length });
+    }
     // Phase 11: in a governed repo, ops authored by non-members (outsiders) are
     // quarantined — excluded from the materialized tree until a reviewer promotes them.
-    const { kept, quarantined } = await this.#partitionQuarantine(ops);
+    const { kept, quarantined } = await this.#partitionQuarantine(complete);
     const res = await this.#reduceOpSet(kept, q.includeStatuses, true); // main path: opt-in incremental
     for (const oid of quarantined) res.statuses.set(oid, "quarantined");
     return res;
+  }
+
+  /**
+   * Partition candidate ops into those whose transitive causalDeps are all PRESENT in
+   * the store vs those still waiting on a missing dep (E4). A dep absent from the store
+   * entirely (`!present.has`) makes its dependents incomplete; incompleteness propagates.
+   * A dep that exists in the store but isn't a candidate here (e.g. another line) counts
+   * as satisfied — only genuinely-unsynced deps hold an op back, so no false holdback.
+   */
+  #causallyComplete(candidates: Operation[], present: Set<string>): { complete: Operation[]; pending: Operation[] } {
+    const byId = new Map(candidates.map((o) => [o.oid as string, o]));
+    const memo = new Map<string, boolean>();
+    const ok = (oid: string): boolean => {
+      const cached = memo.get(oid);
+      if (cached !== undefined) return cached;
+      if (!present.has(oid)) return false; // dep never arrived
+      const op = byId.get(oid);
+      if (!op) return true; // present in the store but not a candidate (other line) — satisfied
+      memo.set(oid, true); // cycle guard (an append-only DAG has none)
+      for (const d of op.causalDeps) if (!ok(d)) { memo.set(oid, false); return false; }
+      memo.set(oid, true);
+      return true;
+    };
+    const complete: Operation[] = [];
+    const pending: Operation[] = [];
+    for (const op of candidates) (ok(op.oid as string) ? complete : pending).push(op);
+    return { complete, pending };
   }
 
   /** Split ops into kept vs quarantined (outsider, not-yet-promoted) for a governed repo. */
