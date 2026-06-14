@@ -189,11 +189,26 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     return;
   }
 
-  // GET /have → all oids the hub holds.
+  // GET /have → all oids the hub holds (full set; initial clone / older clients).
   if (method === "GET" && path === "/have") {
     const oids: string[] = [];
     for await (const obj of store.list()) oids.push(obj.oid as string);
     sendJson(res, 200, oids);
+    return;
+  }
+
+  // GET /sync?since=N → incremental object discovery (E5). Returns the oids appended to
+  // the object-log after index N, plus the new cursor (log length). since=0 / out-of-range
+  // returns the full set (a first sync or a client whose cursor is stale). The object-log
+  // is append-only in normal operation, so the cursor is stable across syncs; the client
+  // always falls back to /have if this endpoint is absent, so correctness never depends
+  // on the cursor — it is a pure transfer optimization.
+  if (method === "GET" && path === "/sync") {
+    const sinceRaw = Number(url.searchParams.get("since") ?? "0");
+    const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+    const all = await store.readObjLog();
+    const oids = since > 0 && since <= all.length ? all.slice(since) : all;
+    sendJson(res, 200, { oids, cursor: all.length });
     return;
   }
 
