@@ -121,9 +121,44 @@ export function symbolNames(content: string, indexer: EntityIndexer = tsIndexer)
   return indexer.parse(content).filter((s) => s.kind === "symbol").map((s) => s.name!);
 }
 
+/** True iff the indexer faithfully partitions `content` — a necessary condition for a
+ *  symbol-granular splice to be byte-safe for the untouched regions of the file. */
+export function parsesCleanly(content: string, indexer: EntityIndexer = tsIndexer): boolean {
+  return indexer.reassemble(indexer.parse(content)) === content;
+}
+
+/** A top-level declaration line starts at column 0 (no leading whitespace). This is the
+ *  fallback used when the brace scanner fails to surface a symbol that nonetheless exists
+ *  in the text — replacing its declaration in place instead of blindly appending a
+ *  duplicate. Returns null if no top-level declaration of `name` is found. */
+function replaceTopLevelDecl(content: string, name: string, newText: string): string | null {
+  const lines = content.split("\n");
+  const topDeclName = (line: string): string | null => {
+    if (!/^\S/.test(line)) return null; // must be column 0
+    const m = DECL.exec(line.trim());
+    return m && m[5] === name ? name : null;
+  };
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) if (topDeclName(lines[i]!) === name) { start = i; break; }
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let j = start + 1; j < lines.length; j++) {
+    const l = lines[j]!;
+    if (/^\S/.test(l) && DECL.test(l.trim())) { end = j; break; } // next top-level decl
+  }
+  return [...lines.slice(0, start), newText, ...lines.slice(end)].join("\n");
+}
+
 /**
- * Replace one symbol's text, returning the new file content. If the symbol does
- * not exist, it is appended. Pure and deterministic.
+ * Replace one symbol's text, returning the new file content. If the symbol does not
+ * exist, it is appended. Pure and deterministic.
+ *
+ * D5 duplicate-guard: when the brace scanner can't find the symbol as a span but a
+ * top-level declaration of that name DOES exist in the text (the scanner mis-parsed —
+ * e.g. a template literal containing `}`), blindly appending would create a SECOND
+ * definition of the symbol: a `set_symbol` meant to UPDATE silently duplicates instead.
+ * We fall back to a column-0 declaration scan and replace the existing decl in place. A
+ * genuinely-new symbol (no existing decl) is still appended.
  */
 export function spliceSymbol(
   content: string,
@@ -133,23 +168,82 @@ export function spliceSymbol(
 ): string {
   const spans = indexer.parse(content);
   const idx = spans.findIndex((s) => s.kind === "symbol" && s.name === symbolName);
-  if (idx === -1) {
-    spans.push({ kind: "symbol", key: symbolName, name: symbolName, text: newText });
-  } else {
+  if (idx !== -1) {
     spans[idx] = { kind: "symbol", key: symbolName, name: symbolName, text: newText };
+    return indexer.reassemble(spans);
   }
+  // Not found as a span. Avoid a duplicate definition if the decl actually exists.
+  const replaced = replaceTopLevelDecl(content, symbolName, newText);
+  if (replaced !== null) return replaced;
+  spans.push({ kind: "symbol", key: symbolName, name: symbolName, text: newText });
   return indexer.reassemble(spans);
 }
 
+const isIdChar = (c: string): boolean => c >= "a" && c <= "z" || c >= "A" && c <= "Z" || c >= "0" && c <= "9" || c === "_" || c === "$";
+
 /**
  * M3 AST op: rename a top-level symbol — its declaration AND its references WITHIN
- * the same file (word-boundary replace). Cross-file references need reference
- * analysis (tree-sitter / typecheck) and are a documented follow-up. Pure.
+ * the same file. Renames only whole-identifier occurrences in CODE, deliberately
+ * skipping strings, template-literal text, and comments (a regex `\bfrom\b` would
+ * also rewrite `from` inside a comment or a "from" string — silent corruption; D5).
+ * Template interpolations `${…}` are treated as code, so identifiers there ARE renamed.
+ * Cross-file references need real reference analysis (tree-sitter) — Track C. Pure.
  */
 export function renameSymbol(content: string, from: string, to: string): string {
   if (!from || !to || from === to) return content;
-  const re = new RegExp(`(?<![A-Za-z0-9_$])${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_$])`, "g");
-  return content.replace(re, to);
+  type Mode =
+    | { k: "code"; interp: boolean; depth: number }
+    | { k: "line" } | { k: "block" } | { k: "sq" } | { k: "dq" } | { k: "tmpl" };
+  const stack: Mode[] = [{ k: "code", interp: false, depth: 0 }];
+  let out = "";
+  let i = 0;
+  const n = content.length;
+  while (i < n) {
+    const m = stack[stack.length - 1]!;
+    const c = content[i]!;
+    const c2 = content[i + 1];
+    if (m.k === "code") {
+      if (c === "/" && c2 === "/") { out += "//"; i += 2; stack.push({ k: "line" }); continue; }
+      if (c === "/" && c2 === "*") { out += "/*"; i += 2; stack.push({ k: "block" }); continue; }
+      if (c === "'") { out += c; i++; stack.push({ k: "sq" }); continue; }
+      if (c === '"') { out += c; i++; stack.push({ k: "dq" }); continue; }
+      if (c === "`") { out += c; i++; stack.push({ k: "tmpl" }); continue; }
+      if (m.interp && c === "{") { m.depth++; out += c; i++; continue; }
+      if (m.interp && c === "}") {
+        if (m.depth === 0) { stack.pop(); out += c; i++; continue; } // closes ${…} → back to tmpl
+        m.depth--; out += c; i++; continue;
+      }
+      if (isIdChar(c) && !(c >= "0" && c <= "9")) {
+        let j = i;
+        while (j < n && isIdChar(content[j]!)) j++;
+        const word = content.slice(i, j);
+        out += word === from ? to : word;
+        i = j;
+        continue;
+      }
+      if (isIdChar(c)) { // a numeric/identifier run starting with a digit — never a rename target
+        let j = i;
+        while (j < n && isIdChar(content[j]!)) j++;
+        out += content.slice(i, j);
+        i = j;
+        continue;
+      }
+      out += c; i++; continue;
+    }
+    if (m.k === "line") { out += c; i++; if (c === "\n") stack.pop(); continue; }
+    if (m.k === "block") { if (c === "*" && c2 === "/") { out += "*/"; i += 2; stack.pop(); continue; } out += c; i++; continue; }
+    if (m.k === "sq" || m.k === "dq") {
+      const q = m.k === "sq" ? "'" : '"';
+      if (c === "\\") { out += content.slice(i, i + 2); i += 2; continue; }
+      out += c; i++; if (c === q) stack.pop(); continue;
+    }
+    // template literal
+    if (c === "\\") { out += content.slice(i, i + 2); i += 2; continue; }
+    if (c === "`") { out += c; i++; stack.pop(); continue; }
+    if (c === "$" && c2 === "{") { out += "${"; i += 2; stack.push({ k: "code", interp: true, depth: 0 }); continue; }
+    out += c; i++;
+  }
+  return out;
 }
 
 /**
