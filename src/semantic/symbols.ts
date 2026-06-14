@@ -121,12 +121,6 @@ export function symbolNames(content: string, indexer: EntityIndexer = tsIndexer)
   return indexer.parse(content).filter((s) => s.kind === "symbol").map((s) => s.name!);
 }
 
-/** True iff the indexer faithfully partitions `content` — a necessary condition for a
- *  symbol-granular splice to be byte-safe for the untouched regions of the file. */
-export function parsesCleanly(content: string, indexer: EntityIndexer = tsIndexer): boolean {
-  return indexer.reassemble(indexer.parse(content)) === content;
-}
-
 /** A top-level declaration line starts at column 0 (no leading whitespace). This is the
  *  fallback used when the brace scanner fails to surface a symbol that nonetheless exists
  *  in the text — replacing its declaration in place instead of blindly appending a
