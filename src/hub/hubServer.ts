@@ -14,6 +14,7 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { ObjectStore } from "../store/objectStore.ts";
 import { verifyMessage } from "../core/identity.ts";
+import { computeOid } from "../core/canonical.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { MATERIALIZER_VERSION } from "../reducer/policy.ts";
@@ -41,7 +42,13 @@ async function isAuthorizedOp(store: ObjectStore, op: Operation): Promise<boolea
   if (m.revokedAt || m.actorId !== op.actor.id) return false;
   if (m.role === "reader") return false; // below proposer
   if (!op.sig) return false;
-  return verifyMessage(m.publicKey, op.oid as string, op.sig.sig);
+  // E1: verify the signature over the RECOMPUTED content oid, not the client-claimed
+  // op.oid. put() stores under computeOid(content); a well-behaved client signs that
+  // same value (#sign → computeOid). Verifying the claimed oid let an op be accepted
+  // here yet rejected by a pulling replica (which recomputes the oid) — silent
+  // divergence. Recomputing here makes hub-accept ⟹ replica-accept.
+  const oid = computeOid(op.type, op as unknown as Record<string, unknown>);
+  return verifyMessage(m.publicKey, oid, op.sig.sig);
 }
 
 const MAX_BODY = 64 * 1024 * 1024; // 64 MiB guard against unbounded request bodies
