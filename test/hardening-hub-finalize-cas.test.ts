@@ -54,7 +54,7 @@ test("E6: hub /finalize enforces signature, role, and the parentHead CAS", async
     assert.match(String(r.reason), /head moved/);
 
     // (5) the head ref reflects the finalize and is distributed via /refs.
-    const refs = (await (await fetch(`${hub.url}/refs`)).json()).refs as Record<string, string>;
+    const refs = ((await (await fetch(`${hub.url}/refs`)).json()) as { refs: Record<string, string> }).refs;
     assert.equal(refs["head:main"], cp, "protected head distributed");
   } finally {
     await hub.close();
