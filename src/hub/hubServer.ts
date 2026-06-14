@@ -18,7 +18,10 @@ import { computeOid } from "../core/canonical.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { MATERIALIZER_VERSION } from "../reducer/policy.ts";
-import type { AnyObject, Membership, Operation } from "../objects/types.ts";
+import type { Signature } from "../core/identity.ts";
+import type {
+  AnyObject, Membership, Operation, Evidence, Decision, Approval, Promotion, Override, Redaction, RoleName,
+} from "../objects/types.ts";
 
 /** Wire-protocol version the hub speaks (have/objects/refs gossip). Bumped on breaking changes. */
 export const HUB_PROTOCOL_VERSION = 1;
@@ -30,25 +33,55 @@ export interface HubHandle {
   close(): Promise<void>;
 }
 
+const ROLE_WEIGHT: Record<RoleName, number> = { reader: 0, proposer: 1, reviewer: 2, maintainer: 3, admin: 4 };
+
 /**
- * Governance gate: an operation pushed to a gated hub must be signed by a key whose
- * membership (resolved via the hub's `member:<actorId>` ref) grants role ≥ proposer
- * and is not revoked. The hub is authoritative for membership — clients pull it.
+ * Per-type push authorization for a gated hub (E2). Each MUTATING governance object
+ * names the actor that must have signed it and the minimum role that actor needs:
+ *  - operation  → its author, ≥ proposer
+ *  - evidence   → its producer, ≥ proposer (it feeds trust scoring)
+ *  - decision   → its decider, ≥ reviewer (it changes verdictMap on every replica)
+ *  - approval / promotion → ≥ reviewer ; override / redaction → admin
+ * `membership`/`protection`/`policy` are CENTRAL-authoritative — distributed via
+ * `GET /refs`, never pushed by a client — so they are rejected outright. Everything
+ * else (blob/intent/session/checkpoint/…) is inert content-addressed data: a forged
+ * copy lands at its own oid and changes no replica's reduction, so it is allowed.
  */
-async function isAuthorizedOp(store: ObjectStore, op: Operation): Promise<boolean> {
-  const memRef = await store.getRef(`member:${op.actor.id}`);
-  if (!memRef || !(await store.has(memRef))) return false;
+type AuthReq = { signerId: string; minRole: RoleName } | "allow" | "reject";
+function authRequirement(obj: AnyObject): AuthReq {
+  switch (obj.type) {
+    case "operation": return { signerId: (obj as Operation).actor.id, minRole: "proposer" };
+    case "evidence": return { signerId: (obj as Evidence).producedBy.id, minRole: "proposer" };
+    case "decision": return { signerId: (obj as Decision).decidedBy.id, minRole: "reviewer" };
+    case "approval": return { signerId: (obj as Approval).by, minRole: "reviewer" };
+    case "promotion": return { signerId: (obj as Promotion).by, minRole: "reviewer" };
+    case "override": return { signerId: (obj as Override).by, minRole: "admin" };
+    case "redaction": return { signerId: (obj as Redaction).by, minRole: "admin" };
+    case "membership": case "protection": case "policy": return "reject";
+    default: return "allow";
+  }
+}
+
+/**
+ * Authorize a pushed object against the hub's membership. Verifies the signer is a
+ * non-revoked member with a sufficient role AND that the signature is valid over the
+ * RECOMPUTED content oid (E1) — never the client-claimed oid — so hub-accept ⟹
+ * replica-accept. Returns a reason string when denied (for the 403 body).
+ */
+async function authorizePush(store: ObjectStore, obj: AnyObject): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const req = authRequirement(obj);
+  if (req === "allow") return { ok: true };
+  if (req === "reject") return { ok: false, reason: `${obj.type} is central-authoritative; pull it via /refs, do not push` };
+  const memRef = await store.getRef(`member:${req.signerId}`);
+  if (!memRef || !(await store.has(memRef))) return { ok: false, reason: `signer ${req.signerId} is not a member` };
   const m = await store.get<Membership>(memRef);
-  if (m.revokedAt || m.actorId !== op.actor.id) return false;
-  if (m.role === "reader") return false; // below proposer
-  if (!op.sig) return false;
-  // E1: verify the signature over the RECOMPUTED content oid, not the client-claimed
-  // op.oid. put() stores under computeOid(content); a well-behaved client signs that
-  // same value (#sign → computeOid). Verifying the claimed oid let an op be accepted
-  // here yet rejected by a pulling replica (which recomputes the oid) — silent
-  // divergence. Recomputing here makes hub-accept ⟹ replica-accept.
-  const oid = computeOid(op.type, op as unknown as Record<string, unknown>);
-  return verifyMessage(m.publicKey, oid, op.sig.sig);
+  if (m.revokedAt || m.actorId !== req.signerId) return { ok: false, reason: "membership revoked or mismatched" };
+  if (ROLE_WEIGHT[m.role] < ROLE_WEIGHT[req.minRole]) return { ok: false, reason: `role ${m.role} below required ${req.minRole}` };
+  const sig = (obj as { sig?: Signature }).sig;
+  if (!sig) return { ok: false, reason: "object is unsigned" };
+  const oid = computeOid(obj.type, obj as unknown as Record<string, unknown>);
+  if (!verifyMessage(m.publicKey, oid, sig.sig)) return { ok: false, reason: "signature does not verify over the content oid" };
+  return { ok: true };
 }
 
 const MAX_BODY = 64 * 1024 * 1024; // 64 MiB guard against unbounded request bodies
@@ -206,11 +239,13 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 400, { error: "object must have a string `type`" });
       return;
     }
-    // Gated hub: reject operations not signed by a member with role ≥ proposer.
-    // Non-operation objects (blobs/evidence/etc.) are content-addressed and harmless.
-    if (gated && (obj as AnyObject).type === "operation") {
-      if (!(await isAuthorizedOp(store, obj as Operation))) {
-        sendJson(res, 403, { error: "operation not signed by an authorized member" });
+    // Gated hub (E2): authorize EVERY mutating governance object by signature + role,
+    // not just operations. A pushed decision/approval/redaction changes governance or
+    // reduce on every replica, so "non-operation objects are harmless" was false.
+    if (gated) {
+      const auth = await authorizePush(store, obj as AnyObject);
+      if (!auth.ok) {
+        sendJson(res, 403, { error: auth.reason });
         return;
       }
     }
