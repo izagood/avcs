@@ -183,6 +183,12 @@ export class ObjectStore {
       // instead of scanning every shard. O_APPEND keeps small records atomic across
       // processes (same pattern as the entity index).
       if (obj.type === "operation") await this.#appendDurable(join(this.root, "oplog"), `${oid}\n`);
+      // Object-log (E5 / docs/13): append EVERY newly-written object's oid (all types)
+      // to a single append-only log in arrival order. A hub serves `GET /sync?since=N`
+      // from it so a client fetches only objects added since its last sync, instead of
+      // diffing the whole oid set each time. Append-only (never reordered in normal
+      // operation), so a numeric cursor is stable. Rebuildable cache; backfilled lazily.
+      await this.#appendDurable(join(this.root, "objlog"), `${oid}\n`);
     }
     return oid;
   }
@@ -201,6 +207,30 @@ export class ObjectStore {
     for (const line of (await readFile(p, "utf8")).split("\n"))
       if (line && !seen.has(line)) { seen.add(line); out.push(line); }
     return out;
+  }
+
+  /**
+   * Object-log in arrival order (E5): oids of EVERY object ever written, deduped,
+   * first-write order preserved. A store predating the log (or one that just upgraded)
+   * is backfilled once from a full scan — that scan order becomes this hub's stable
+   * append base. Append-only afterward, so an index into it is a valid sync cursor.
+   */
+  async readObjLog(): Promise<string[]> {
+    const p = join(this.root, "objlog");
+    if (!existsSync(p)) await this.#backfillObjLog();
+    if (!existsSync(p)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const line of (await readFile(p, "utf8")).split("\n"))
+      if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    return out;
+  }
+
+  /** One-time backfill of the object-log for a store that predates it. */
+  async #backfillObjLog(): Promise<void> {
+    const oids: string[] = [];
+    for await (const o of this.list()) oids.push(o.oid as string);
+    if (oids.length) await this.#writeAtomic(join(this.root, "objlog"), oids.map((o) => `${o}\n`).join(""));
   }
 
   /** Backfill the op-log from a full scan (for stores predating it, or after corruption).
