@@ -110,6 +110,19 @@ export class ObjectStore {
     await this.#fsyncDir(dirname(path));
   }
 
+  /**
+   * Atomically write a derived auxiliary file under the repo's `.avcs` root, reusing the
+   * crash-safe temp→fsync→rename→fsync-dir path (D1/D2). For repo-managed caches the
+   * store doesn't model as objects — e.g. the compaction snapshot. `relPath` is resolved
+   * under root; parent dirs are created. Crash-safe: a reader sees old-or-complete, and
+   * the file survives a hard crash once this returns.
+   */
+  async writeAux(relPath: string, data: string | Buffer): Promise<void> {
+    const p = join(this.root, relPath);
+    await mkdir(dirname(p), { recursive: true });
+    await this.#writeAtomic(p, data);
+  }
+
   /** Run a critical section under a named cross-process lock (see lock.ts). */
   async withLock<T>(name: string, fn: () => Promise<T>, opts?: LockOptions): Promise<T> {
     return withLock(join(this.root, "locks"), name, fn, opts);
