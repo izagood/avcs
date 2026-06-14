@@ -278,6 +278,26 @@ async function main(): Promise<void> {
       console.log(`  evidence : ${JSON.stringify(rel.evidence)}`);
       break;
     }
+    case "fsck": {
+      const store = new ObjectStore(cwd);
+      if (!ObjectStore.isRepo(cwd)) throw new Error("not an AVCS repo (no .avcs here)");
+      const rebuild = args.includes("--rebuild");
+      const r = await store.fsck({ rebuild });
+      console.log(`checked ${r.objectsChecked} object(s)`);
+      if (r.corrupt.length) {
+        console.log(`\n✗ ${r.corrupt.length} corrupt object(s):`);
+        for (const c of r.corrupt) console.log(`   ${c.oid}  — ${c.reason}`);
+      }
+      const d = r.oplogDrift;
+      if (d.opsMissingFromLog.length)
+        console.log(`\n${rebuild ? "↻ repaired" : "✗"} op-log drift: ${d.opsMissingFromLog.length} operation(s) missing from the log${rebuild ? "" : " (run `avcs fsck --rebuild`)"}`);
+      if (d.logEntriesMissingObject.length)
+        console.log(`\nℹ ${d.logEntriesMissingObject.length} op-log entr(y/ies) without an object (GC'd or lost)`);
+      if (r.repaired) console.log(`   op-log rebuilt → ${r.repaired.oplogEntries} entr(y/ies)`);
+      console.log(r.ok ? "\n✓ healthy" : rebuild && r.corrupt.length === 0 ? "\n✓ repaired" : "\n✗ problems found");
+      if (!r.ok && !(rebuild && r.corrupt.length === 0)) process.exitCode = 1;
+      break;
+    }
     case "show": {
       const store = new ObjectStore(cwd);
       const oid = args[1];
@@ -295,6 +315,7 @@ async function main(): Promise<void> {
           "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
           "  compact [view]              persist a base snapshot (cold materialize folds history)\n" +
+          "  fsck [--rebuild]            verify object integrity + op-log; --rebuild repairs the log\n" +
           "  bundle <file>               export the whole repo to a portable file\n" +
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
