@@ -133,7 +133,7 @@ export async function startHub(opts: { repoDir: string; port?: number; gated?: b
       metrics.inc(`hub.status.${Math.floor(res.statusCode / 100)}xx`);
       logger.info("hub.request", { method: req.method, path, status: res.statusCode, ms: Math.round(ms * 100) / 100 });
     });
-    handle(store, req, res, gated, metrics).catch((err) => {
+    handle(store, req, res, gated, metrics, opts.repoDir).catch((err) => {
       // Last-resort guard: never let a handler rejection crash the server.
       metrics.inc("hub.errors");
       logger.error("hub.error", { method: req.method, path, error: String(err?.message ?? err) });
@@ -163,7 +163,20 @@ export async function startHub(opts: { repoDir: string; port?: number; gated?: b
   };
 }
 
-async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics): Promise<void> {
+/** Authenticate a finalize request (E6): the signature must be by `by`'s registered
+ *  membership key over the canonical finalize message. Role authorization is enforced
+ *  separately by repo.finalize (finalizeRole). */
+async function verifyFinalizeSig(store: ObjectStore, by: string, view: string, newCheckpoint: string, parentHead: string | null, sig: unknown): Promise<boolean> {
+  const s = sig as Signature | undefined;
+  if (!s || typeof s.sig !== "string") return false;
+  const memRef = await store.getRef(`member:${by}`);
+  if (!memRef || !(await store.has(memRef))) return false;
+  const m = await store.get<Membership>(memRef);
+  if (m.revokedAt || m.actorId !== by) return false;
+  return verifyMessage(m.publicKey, `finalize:${view}:${newCheckpoint}:${parentHead ?? ""}`, s.sig);
+}
+
+async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics, repoDir: string): Promise<void> {
   // Parse path only (ignore query); the host is irrelevant for routing.
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -282,6 +295,36 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       });
     }
     sendJson(res, 200, { oid });
+    return;
+  }
+
+  // POST /finalize → advance a view's protected head via the authoritative compare-and-
+  // swap (E6). The hub had no finalize endpoint, so a remote client couldn't merge and
+  // setRef had no CAS — two finalizes could clobber. This runs repo.finalize, which does
+  // the CAS on parentHead under a cross-process lock plus the role/checks/approvals/
+  // causal-completeness gates. On a gated hub the request must be signed by `by`.
+  if (method === "POST" && path === "/finalize") {
+    let raw: string;
+    try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    let body: { view?: unknown; newCheckpoint?: unknown; parentHead?: unknown; by?: unknown; sig?: unknown };
+    try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
+    const { view, newCheckpoint, by } = body;
+    if (typeof view !== "string" || typeof newCheckpoint !== "string" || typeof by !== "string") {
+      sendJson(res, 400, { error: "finalize requires string { view, newCheckpoint, by }" });
+      return;
+    }
+    const parentHead = typeof body.parentHead === "string" ? body.parentHead : null;
+    if (gated && !(await verifyFinalizeSig(store, by, view, newCheckpoint, parentHead, body.sig))) {
+      sendJson(res, 403, { error: "finalize not signed by the claimed member" });
+      return;
+    }
+    const { Repo } = await import("../api/repo.ts");
+    const repo = await Repo.open(repoDir);
+    const result = await repo.finalize({ view, newCheckpoint, parentHead, by });
+    if (result.finalized) { sendJson(res, 200, result); return; }
+    // A stale parentHead (lost the CAS race) is a 409 conflict; everything else (role,
+    // checks, approvals, incomplete history) is a 422 unprocessable.
+    sendJson(res, /head moved/.test(result.reason) ? 409 : 422, result);
     return;
   }
 

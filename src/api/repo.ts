@@ -985,6 +985,11 @@ export class Repo {
     const { pushToHub } = await import("../hub/hubClient.ts");
     return pushToHub(this.dir, hubUrl);
   }
+  /** Request a finalize (= PR merge) on a network hub via its CAS endpoint (E6). */
+  async finalizeHub(hubUrl: string, args: { view: string; newCheckpoint: string; parentHead: string | null; by: string; signWith?: { keyId: string; privateKey: string } }): Promise<{ status: number; finalized: boolean; head?: string; reason?: string }> {
+    const { finalizeOnHub } = await import("../hub/hubClient.ts");
+    return finalizeOnHub(hubUrl, args);
+  }
   /** Pull objects a network hub holds that this repo lacks. */
   async pullHub(hubUrl: string): Promise<{ pulled: number }> {
     const { pullFromHub } = await import("../hub/hubClient.ts");
