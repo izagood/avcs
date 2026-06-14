@@ -1402,9 +1402,11 @@ export class Repo {
       this.#forceSnapshot = false;
     }
     if (!this.#incSnap) return { baseOps: 0 };
-    const dir = join(this.dir, ".avcs", "snapshot");
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${view}.cbor`), encodeCbor(serializeSnapshot(this.#incSnap)));
+    // Atomic write (D2): a plain writeFile could leave a torn CBOR snapshot on a crash.
+    // writeAux routes through the store's temp→fsync→rename→fsync-dir path. A torn read
+    // would still fall back to a full reduce (#loadPersistedSnapshot catches decode
+    // errors), but a durable atomic write means the base is never silently corrupt.
+    await this.store.writeAux(join("snapshot", `${view}.cbor`), encodeCbor(serializeSnapshot(this.#incSnap)));
     const baseOps = this.#incSnap.input.ops.length;
     this.logger.info("compact", { view, baseOps });
     return { baseOps };
