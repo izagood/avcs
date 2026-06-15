@@ -90,18 +90,19 @@ Branches become **views**, commits become **checkpoints**, tags become **release
 
 Requires **Node ≥ 22.6** — AVCS runs TypeScript directly via type stripping, so there is **no build step and zero runtime dependencies**.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/izagood/avcs/main/install.sh | bash
-```
-
-That one-liner clones the repo to `~/.local/share/avcs` (override with `--dir`/`AVCS_HOME`) and installs an `avcs` launcher to `~/.local/bin`. Re-running it updates the checkout in place. Already have a clone? Run the installer from inside it instead:
+AVCS is published on npm as [`@izagood/avcs`](https://www.npmjs.com/package/@izagood/avcs). Install it globally to get the `avcs` command on your `PATH`:
 
 ```bash
-git clone https://github.com/izagood/avcs.git && cd avcs
-./install.sh
+npm install -g @izagood/avcs
 ```
 
-Either way, `install.sh` writes a small `avcs` launcher to `~/.local/bin` (override with `--bin-dir <dir>` or `AVCS_BIN_DIR`) that points back at the checkout, so updating is just `git pull` — no reinstall needed. If `~/.local/bin` isn't on your `PATH` yet, the installer prints the line to add.
+Or run it without installing, straight from the registry:
+
+```bash
+npx @izagood/avcs version
+```
+
+Once installed:
 
 ```bash
 avcs version      # confirm it's on your PATH
@@ -113,7 +114,26 @@ avcs conflicts    # decisions a human still owes
 avcs log          # operation history
 ```
 
-Other install options:
+To upgrade later, re-run `npm install -g @izagood/avcs@latest`; to remove it, `npm uninstall -g @izagood/avcs` (your repo data is left intact).
+
+### Install from source
+
+Prefer to track the latest `main`, or hack on AVCS itself? The bundled `install.sh` clones the repo and wires up an `avcs` launcher that points back at the checkout, so updating is just `git pull` — no reinstall needed.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/izagood/avcs/main/install.sh | bash
+```
+
+That one-liner clones the repo to `~/.local/share/avcs` (override with `--dir`/`AVCS_HOME`) and installs an `avcs` launcher to `~/.local/bin`. Re-running it updates the checkout in place. Already have a clone? Run the installer from inside it instead:
+
+```bash
+git clone https://github.com/izagood/avcs.git && cd avcs
+./install.sh
+```
+
+The launcher lands in `~/.local/bin` (override with `--bin-dir <dir>` or `AVCS_BIN_DIR`). If `~/.local/bin` isn't on your `PATH` yet, the installer prints the line to add.
+
+Other install-from-source options:
 
 ```bash
 ./install.sh --bin-dir /usr/local/bin   # system-wide (may need sudo)
@@ -122,7 +142,7 @@ Other install options:
 ./uninstall.sh                          # remove the launcher (data is left intact)
 ```
 
-Prefer npm? `npm link` exposes the same `avcs` binary from `package.json`'s `bin` field. If `node` isn't on your `PATH` at runtime, point the launcher at one with `AVCS_NODE=/path/to/node`.
+If `node` isn't on your `PATH` at runtime, point the launcher at one with `AVCS_NODE=/path/to/node`.
 
 ## Use as a library (`@izagood/avcs`)
 
