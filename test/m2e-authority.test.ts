@@ -26,8 +26,8 @@ async function setup() {
   const sess = await repo.startSession({ intentOid: intent, actor: ai });
   const base = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", content: greet("v0") + "\n", declaredPurpose: "scaffold" });
   // two concurrent edits to the same symbol → a conflict to decide
-  const opA = await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("A"), declaredPurpose: "A", causalDeps: [base] });
-  const opB = await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("B"), declaredPurpose: "B", causalDeps: [base] });
+  const opA = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("A"), declaredPurpose: "A", causalDeps: [base] });
+  const opB = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("B"), declaredPurpose: "B", causalDeps: [base] });
   const conflict = (await repo.materialize()).conflicts[0]!;
   return { dir, repo, conflict, opA, opB };
 }

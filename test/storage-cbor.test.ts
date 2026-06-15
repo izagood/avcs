@@ -103,7 +103,7 @@ test("a full repo round-trips through CBOR storage (author, materialize, cold re
     const intent = await repo.createIntent({ title: "t", owner: "human:h" });
     const sess = await repo.startSession({ intentOid: intent, actor: ai });
     await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", content: "export function a(){ return 1 }\n", declaredPurpose: "a" });
-    await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", symbolName: "a", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
     const warm = (await repo.materialize()).treeHash;
     // cold reopen reads the CBOR objects from scratch and must agree.
     const cold = (await (await Repo.open(dir)).materialize()).treeHash;

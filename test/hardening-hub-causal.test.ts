@@ -26,9 +26,8 @@ test("E4: a dependent op that arrives before its causal ancestor is held back, t
       sessionOid: sess, intentOid: intent, actor: ai, path: "f.ts",
       content: "export function greet() {\n  return 0\n}\n", declaredPurpose: "scaffold",
     });
-    await src.proposeSymbolEdit({
-      sessionOid: sess, intentOid: intent, actor: ai, path: "f.ts", symbolName: "greet",
-      newText: "export function greet() {\n  return 1\n}", declaredPurpose: "edit", causalDeps: [aOid],
+    await src.proposeEdit({
+      sessionOid: sess, intentOid: intent, actor: ai, path: "f.ts", newText: "export function greet() {\n  return 1\n}", declaredPurpose: "edit", causalDeps: [aOid],
     });
     const expected = (await src.materialize()).treeHash; // the fully-synced result
 

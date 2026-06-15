@@ -93,9 +93,9 @@ test("INTEGRATION C1: disjoint multi-agent work converges over the hub (no confl
 
     // Alice runs two agent sessions; edits alpha. Bob edits beta. Different symbols.
     const sA = await alice.repo.startSession({ intentOid: intent, actor: actor("ai:alice") });
-    await alice.repo.proposeSymbolEdit({ sessionOid: sA, intentOid: intent, actor: actor("ai:alice"), path: "mod.ts", symbolName: "alpha", newText: sym("alpha", "A1"), declaredPurpose: "alpha", causalDeps: [org.baseOp], signWith: org.keys.get("ai:alice") });
+    await alice.repo.proposeEdit({ sessionOid: sA, intentOid: intent, actor: actor("ai:alice"), path: "mod.ts", newText: sym("alpha", "A1"), declaredPurpose: "alpha", causalDeps: [org.baseOp], signWith: org.keys.get("ai:alice") });
     const sB = await bob.repo.startSession({ intentOid: intent, actor: actor("ai:bob") });
-    await bob.repo.proposeSymbolEdit({ sessionOid: sB, intentOid: intent, actor: actor("ai:bob"), path: "mod.ts", symbolName: "beta", newText: sym("beta", "B1"), declaredPurpose: "beta", causalDeps: [org.baseOp], signWith: org.keys.get("ai:bob") });
+    await bob.repo.proposeEdit({ sessionOid: sB, intentOid: intent, actor: actor("ai:bob"), path: "mod.ts", newText: sym("beta", "B1"), declaredPurpose: "beta", causalDeps: [org.baseOp], signWith: org.keys.get("ai:bob") });
 
     await alice.repo.pushHub(org.hub.url);
     await bob.repo.pushHub(org.hub.url);
@@ -104,10 +104,13 @@ test("INTEGRATION C1: disjoint multi-agent work converges over the hub (no confl
 
     const ra = await alice.repo.materialize();
     const rb = await bob.repo.materialize();
-    assert.equal(ra.conflicts.length, 0);
+    // MIGRATION: language-neutral edit_file ops on the SAME file with an empty base
+    // overlap, so two concurrent whole-file edits to mod.ts now require a conflict to
+    // decide (the old per-symbol auto-merge is gone). Replicas still converge.
+    assert.equal(ra.conflicts.length, 1, "concurrent same-file edits conflict");
+    assert.equal(rb.conflicts.length, 1);
+    assert.equal(ra.conflicts[0]!.id, rb.conflicts[0]!.id, "identical conflict id on both");
     assert.equal(ra.treeHash, rb.treeHash, "replicas converge");
-    assert.equal(await symVal(alice.repo, "alpha"), "A1");
-    assert.equal(await symVal(alice.repo, "beta"), "B1");
   } finally {
     await org.close();
   }
@@ -121,9 +124,9 @@ test("INTEGRATION C2+C3: same-symbol conflict on all replicas, resolved by autho
     const intent = (await alice.repo.listIntents())[0]!.oid as string;
 
     const sA = await alice.repo.startSession({ intentOid: intent, actor: actor("ai:alice") });
-    const opA = await alice.repo.proposeSymbolEdit({ sessionOid: sA, intentOid: intent, actor: actor("ai:alice"), path: "mod.ts", symbolName: "alpha", newText: sym("alpha", "fromAlice"), declaredPurpose: "alpha A", causalDeps: [org.baseOp], signWith: org.keys.get("ai:alice") });
+    const opA = await alice.repo.proposeEdit({ sessionOid: sA, intentOid: intent, actor: actor("ai:alice"), path: "mod.ts", newText: sym("alpha", "fromAlice"), declaredPurpose: "alpha A", causalDeps: [org.baseOp], signWith: org.keys.get("ai:alice") });
     const sB = await bob.repo.startSession({ intentOid: intent, actor: actor("ai:bob") });
-    const opB = await bob.repo.proposeSymbolEdit({ sessionOid: sB, intentOid: intent, actor: actor("ai:bob"), path: "mod.ts", symbolName: "alpha", newText: sym("alpha", "fromBob"), declaredPurpose: "alpha B", causalDeps: [org.baseOp], signWith: org.keys.get("ai:bob") });
+    const opB = await bob.repo.proposeEdit({ sessionOid: sB, intentOid: intent, actor: actor("ai:bob"), path: "mod.ts", newText: sym("alpha", "fromBob"), declaredPurpose: "alpha B", causalDeps: [org.baseOp], signWith: org.keys.get("ai:bob") });
 
     for (const u of [alice, bob]) await u.repo.pushHub(org.hub.url);
     for (const u of [alice, bob]) await u.repo.pullHub(org.hub.url);
@@ -157,7 +160,7 @@ test("INTEGRATION C4: a gated hub rejects an outsider's (non-member) push", asyn
     const carol = await joinUser(org); // ext:carol is NOT a member
     const intent = (await carol.repo.listIntents())[0]!.oid as string;
     const sC = await carol.repo.startSession({ intentOid: intent, actor: actor("ext:carol") });
-    await carol.repo.proposeSymbolEdit({ sessionOid: sC, intentOid: intent, actor: actor("ext:carol"), path: "mod.ts", symbolName: "alpha", newText: sym("alpha", "evil"), declaredPurpose: "drive-by", causalDeps: [org.baseOp] });
+    await carol.repo.proposeEdit({ sessionOid: sC, intentOid: intent, actor: actor("ext:carol"), path: "mod.ts", newText: sym("alpha", "evil"), declaredPurpose: "drive-by", causalDeps: [org.baseOp] });
 
     const push = await carol.repo.pushHub(org.hub.url);
     assert.ok(push.rejected >= 1, "gated hub rejected the unauthorized op");
@@ -176,7 +179,7 @@ test("INTEGRATION C5: outsider work is quarantined, then a reviewer promotes it 
     const carol = await joinUser(org);
     const intent = (await carol.repo.listIntents())[0]!.oid as string;
     const sC = await carol.repo.startSession({ intentOid: intent, actor: actor("ext:carol") });
-    const contrib = await carol.repo.proposeSymbolEdit({ sessionOid: sC, intentOid: intent, actor: actor("ext:carol"), path: "mod.ts", symbolName: "beta", newText: sym("beta", "contributed"), declaredPurpose: "fix beta", causalDeps: [org.baseOp] });
+    const contrib = await carol.repo.proposeEdit({ sessionOid: sC, intentOid: intent, actor: actor("ext:carol"), path: "mod.ts", newText: sym("beta", "contributed"), declaredPurpose: "fix beta", causalDeps: [org.baseOp] });
     await carol.repo.pushHub(org.hub.url);
 
     const rev = await joinUser(org); // reviewer pulls; governance active → carol quarantined

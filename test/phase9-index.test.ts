@@ -21,25 +21,23 @@ async function repoWithHistory() {
   const base = await repo.proposeFileWrite({
     sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", content: greet("v0") + "\n", declaredPurpose: "scaffold",
   });
-  const op1 = await repo.proposeSymbolEdit({
-    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet",
-    newText: greet("v1"), declaredPurpose: "to v1", causalDeps: [base],
+  const op1 = await repo.proposeEdit({
+    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("v1"), declaredPurpose: "to v1", causalDeps: [base],
   });
-  const op2 = await repo.proposeSymbolEdit({
-    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet",
-    newText: greet("v2"), declaredPurpose: "to v2", causalDeps: [op1],
+  const op2 = await repo.proposeEdit({
+    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("v2"), declaredPurpose: "to v2", causalDeps: [op1],
   });
   return { dir, repo, base, op1, op2 };
 }
 
 test("entity index: historyOf returns ops on an entity in causal order", async () => {
   const { dir, repo, base, op1, op2 } = await repoWithHistory();
-  const symHist = (await repo.historyOf("symbol:mod.ts#greet")).map((o) => o.oid);
-  assert.deepEqual(symHist, [op1, op2], "two symbol edits, in order");
+  // MIGRATION (language-neutral): edits target the file entity ("file:mod.ts"), not a
+  // per-symbol entity. The file history is the scaffold put_file plus the two edits.
   const fileHist = (await repo.historyOf("file:mod.ts")).map((o) => o.oid);
-  assert.deepEqual(fileHist, [base], "the scaffold put_file");
+  assert.deepEqual(fileHist, [base, op1, op2], "scaffold put_file then two edits, in order");
   // declaredPurpose is carried — the 'why' for blame
-  assert.equal((await repo.historyOf("symbol:mod.ts#greet"))[1]!.declaredPurpose, "to v2");
+  assert.equal((await repo.historyOf("file:mod.ts"))[2]!.declaredPurpose, "to v2");
   await rm(dir, { recursive: true, force: true });
 });
 

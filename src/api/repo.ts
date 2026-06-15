@@ -12,10 +12,9 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex, canonicalize } from "../core/canonical.ts";
-import { reduce, conflictIdFor, keysOf, detectCrossGranularity, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, keysOf, detectFileConflicts, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
 import { reduceIncremental, snapshotReduce, NonIncrementalError, serializeSnapshot, deserializeSnapshot, type ReduceSnapshot } from "../reducer/incremental.ts";
 import { encodeCbor, decodeCbor } from "../core/cbor.ts";
-import { detectSemanticConflicts } from "../semantic/contract.ts";
 import { computeReliability } from "../policy/reliability.ts";
 import type { OwnerRule } from "../objects/types.ts";
 import { defaultPolicy, MATERIALIZER_VERSION } from "../reducer/policy.ts";
@@ -413,17 +412,22 @@ export class Repo {
   }
 
   /**
-   * Phase 2: replace one named top-level symbol within a file. Two such edits to
-   * different symbols of the same file auto-merge. Should causally depend on the op
-   * that established the file (`causalDeps`) so reconstruction starts from it.
+   * Language-neutral edit (docs/15): submit the FULL new content of a file together with
+   * the base content it was derived from. Concurrent edit_file ops on the same file are
+   * 3-way line-merged at materialization — disjoint hunks auto-merge, overlapping hunks
+   * surface as a Conflict. No code-structure awareness: works for any text/language.
+   *
+   * `baseBlobOid`/`baseText` is the 3-way merge base (what the agent read before editing);
+   * normally the content established by the causally-prior op. Omit ⇒ base is empty.
    */
-  async proposeSymbolEdit(args: {
+  async proposeEdit(args: {
     sessionOid: string;
     intentOid: string;
     actor: Actor;
     path: string;
-    symbolName: string;
     newText: string;
+    baseText?: string;
+    baseBlobOid?: string;
     declaredPurpose: string;
     causalDeps?: string[];
     effects?: Operation["effects"];
@@ -431,72 +435,17 @@ export class Repo {
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
+    const baseBlobOid =
+      args.baseBlobOid ?? (args.baseText !== undefined ? await this.putBlob(args.baseText) : undefined);
     return this.proposeOperation({
       sessionOid: args.sessionOid,
       intentOid: args.intentOid,
       actor: args.actor,
-      target: { entityKind: "symbol", entityId: `${args.path}#${args.symbolName}` },
-      body: { kind: "set_symbol", path: args.path, symbolName: args.symbolName, blobOid },
+      target: { entityKind: "file", entityId: args.path },
+      body: { kind: "edit_file", path: args.path, blobOid, baseBlobOid },
       declaredPurpose: args.declaredPurpose,
       causalDeps: args.causalDeps,
       effects: args.effects,
-      line: args.line,
-      signWith: args.signWith,
-    });
-  }
-
-  /**
-   * M3 AST op: rename a top-level symbol (declaration + same-file references). Contends
-   * on both the old and new symbol keys. Should causally depend on the op that
-   * established the file. Cross-file references are a follow-up (needs reference analysis).
-   */
-  async proposeRenameSymbol(args: {
-    sessionOid: string;
-    intentOid: string;
-    actor: Actor;
-    path: string;
-    from: string;
-    to: string;
-    declaredPurpose: string;
-    causalDeps?: string[];
-    line?: string;
-  }): Promise<string> {
-    return this.proposeOperation({
-      sessionOid: args.sessionOid,
-      intentOid: args.intentOid,
-      actor: args.actor,
-      target: { entityKind: "symbol", entityId: `${args.path}#${args.from}` },
-      body: { kind: "rename_symbol", path: args.path, symbolName: args.from, newName: args.to },
-      declaredPurpose: args.declaredPurpose,
-      causalDeps: args.causalDeps,
-      line: args.line,
-    });
-  }
-
-  /**
-   * M3 AST op: move a top-level symbol from one file to another. Contends on the
-   * symbol at both source and destination. Cross-file references are a follow-up.
-   */
-  async proposeMoveSymbol(args: {
-    sessionOid: string;
-    intentOid: string;
-    actor: Actor;
-    fromPath: string;
-    toPath: string;
-    symbolName: string;
-    declaredPurpose: string;
-    causalDeps?: string[];
-    line?: string;
-    signWith?: { keyId: string; privateKey: string };
-  }): Promise<string> {
-    return this.proposeOperation({
-      sessionOid: args.sessionOid,
-      intentOid: args.intentOid,
-      actor: args.actor,
-      target: { entityKind: "symbol", entityId: `${args.fromPath}#${args.symbolName}` },
-      body: { kind: "move_symbol", fromPath: args.fromPath, path: args.toPath, symbolName: args.symbolName },
-      declaredPurpose: args.declaredPurpose,
-      causalDeps: args.causalDeps,
       line: args.line,
       signWith: args.signWith,
     });
@@ -695,8 +644,8 @@ export class Repo {
   /**
    * Port (cherry-pick / backport) an operation onto another line: mint a NEW op on
    * the target line carrying the source's body, based on the target line's current
-   * frontier, with `derivedFrom` provenance. set_symbol re-splices against the target
-   * line's content automatically at materialize; put_file replaces on the target line.
+   * frontier, with `derivedFrom` provenance. edit_file 3-way merges (against the target
+   * line's content) at materialize; put_file replaces on the target line.
    */
   async portOp(sourceOpOid: string, targetLine: string, actor?: Actor): Promise<string> {
     const src = await this.store.get<Operation>(sourceOpOid);
@@ -1209,7 +1158,7 @@ export class Repo {
       statuses: new Map(r.statuses),
       conflicts: r.conflicts.map((c) => ({ ...c })),
       autoDecisions: r.autoDecisions.map((a) => ({ ...a })),
-      semanticConflicts: r.semanticConflicts.map((s) => ({ ...s })),
+      fileConflicts: r.fileConflicts.map((s) => ({ ...s })),
       headOps: [...r.headOps],
       synthBlobs: new Map(r.synthBlobs),
     };
@@ -1314,11 +1263,12 @@ export class Repo {
     const intents = new Map<string, Intent>();
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
 
-    // Preload blob content needed by content-aware ops (set_symbol reconstructs text).
+    // Preload blob content needed by edit_file's 3-way merge (base + new content).
     const blobContent = new Map<string, string>();
     for (const op of ops) {
-      const oid = op.body.blobOid;
-      if (oid && !blobContent.has(oid)) blobContent.set(oid, (await this.readBlob(oid)).toString("utf8"));
+      for (const oid of [op.body.blobOid, op.body.baseBlobOid]) {
+        if (oid && !blobContent.has(oid)) blobContent.set(oid, (await this.readBlob(oid)).toString("utf8"));
+      }
     }
 
     const policy = await this.policy();
@@ -1327,47 +1277,31 @@ export class Repo {
     const base: ReduceInput = { ops, evidence, decisions, intents, policy, materializeStatuses: includeStatuses, blobContent, reliability, authority };
     const pass1 = this.#pass1Reduce(base, useInc);
 
-    // Second-pass conflicts that the text-clean grouping accepted but that must be
-    // held back (re-reduce excluding them so the tree stays safe — base content falls
-    // back in automatically): (a) Phase-4 semantic contract breaks, and (b) the
-    // cross-granularity determinism hole — a whole-file op concurrent with a symbol
-    // edit on the same file (found by the determinism harness).
-    const semantic = detectSemanticConflicts(ops, pass1, evidence, blobContent);
-    const cross = detectCrossGranularity(ops, pass1);
-    if (semantic.length === 0 && cross.length === 0) return pass1;
+    // Post-reduce text-merge pass (docs/15 §5): the grouping accepts all concurrent
+    // edit_file ops because their disjoint line hunks compose. This authoritative N-way
+    // merge3 over the file's concurrent frontier finds the ones whose hunks OVERLAP.
+    // Disjoint changes stay merged in the tree (the design goal); the contested region
+    // defaults to the deterministic incumbent (applyOp onConflict:"first") and is
+    // surfaced as a Conflict so the release gate blocks until policy/human resolves it.
+    const fileConflicts = detectFileConflicts(ops, pass1, blobContent);
+    if (fileConflicts.length === 0) return pass1;
 
-    const held = new Set<string>([...semantic.map((s) => s.breakingOp), ...cross.flatMap((c) => c.ops)]);
-    const pass2 = reduce({ ...base, ops: ops.filter((o) => !held.has(o.oid as string)) });
-    for (const s of semantic) {
-      pass2.statuses.set(s.breakingOp, "needs_decision");
-      for (const d of s.dependentOps) pass2.statuses.set(d, pass2.statuses.get(d) ?? "needs_decision");
-    }
-    for (const oid of cross.flatMap((c) => c.ops)) pass2.statuses.set(oid, "needs_decision");
-    pass2.semanticConflicts = semantic;
-    for (const s of semantic) {
-      pass2.conflicts.push({
-        id: `conflict_sem_${(s.symbol.split("#")[1] ?? s.symbol).slice(0, 16)}`,
-        key: `contract:${s.symbol}`,
+    // Clone before annotating — pass1 may be a cached snapshot result.
+    const result: ReductionResult = { ...pass1, conflicts: [...pass1.conflicts], fileConflicts };
+    for (const fc of fileConflicts) {
+      result.conflicts.push({
+        id: conflictIdFor(`file:${fc.file}`),
+        key: `file:${fc.file}`,
         kind: "needs_human",
-        reason: s.reason,
+        reason: `concurrent edits to ${fc.file} overlap on ${fc.regions.length} line range(s) — a human/policy must choose`,
         recommendedOp: null,
-        options: [s.breakingOp, ...s.dependentOps].map((oid) => ({
-          opOid: oid, actor: "", purpose: oid === s.breakingOp ? "contract change" : "depends on old contract",
+        options: fc.ops.map((oid) => ({
+          opOid: oid, actor: "", purpose: "overlapping concurrent edit",
           evidence: [], score: 0, blocked: false, requiresHuman: true,
         })),
       });
     }
-    for (const c of cross) {
-      pass2.conflicts.push({
-        id: conflictIdFor(`file:${c.file}`),
-        key: `file:${c.file}`,
-        kind: "concurrent_write",
-        reason: `whole-file write and symbol edit on ${c.file} are concurrent — can't both apply deterministically`,
-        recommendedOp: null,
-        options: c.ops.map((oid) => ({ opOid: oid, actor: "", purpose: "concurrent whole-file/symbol edit", evidence: [], score: 0, blocked: false, requiresHuman: false })),
-      });
-    }
-    return pass2;
+    return result;
   }
 
   // ── git-like working tree (checkout / commit) ─────────────────────────────
@@ -1950,10 +1884,10 @@ export class Repo {
     } = {},
   ): Promise<{ released: true; releaseOid: string } | { released: false; reason: string }> {
     const result = await this.materialize(viewName);
-    if (result.conflicts.length || result.semanticConflicts.length) {
+    if (result.conflicts.length || result.fileConflicts.length) {
       return {
         released: false,
-        reason: `view has ${result.conflicts.length} open conflict(s) and ${result.semanticConflicts.length} contract break(s); resolve them before releasing`,
+        reason: `view has ${result.conflicts.length} open conflict(s) and ${result.fileConflicts.length} text merge conflict(s); resolve them before releasing`,
       };
     }
     const checkpointOid = await this.createCheckpoint(viewName, opts.summary ?? `release of ${viewName}`);

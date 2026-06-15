@@ -181,9 +181,9 @@ async function multiMachineScene(): Promise<void> {
   console.log(`R files: ${[...rb.tree.keys()].sort().join(", ")}`);
   console.log(`treeHash L == R ? ${ra.treeHash === rb.treeHash ? "✅ 수렴 (충돌 단계 없음)" : "❌"}`);
 
-  hr("Scene B — 같은 symbol 동시 수정 → 양쪽에 동일한 Decision(충돌은 데이터)");
-  await L.proposeSymbolEdit({ sessionOid: sL, intentOid: intent, actor: agentA, path: "src/mod.ts", symbolName: "greet", newText: greet("L-version"), declaredPurpose: "L: greet 변경", causalDeps: [base] });
-  await R.proposeSymbolEdit({ sessionOid: sR, intentOid: intent, actor: agentB, path: "src/mod.ts", symbolName: "greet", newText: greet("R-version"), declaredPurpose: "R: greet 변경", causalDeps: [base] });
+  hr("Scene B — 같은 라인 동시 수정 → 양쪽에 동일한 Conflict(충돌은 데이터)");
+  await L.proposeEdit({ sessionOid: sL, intentOid: intent, actor: agentA, path: "src/mod.ts", baseText: greet("v0") + "\n", newText: greet("L-version") + "\n", declaredPurpose: "L: greet 변경", causalDeps: [base] });
+  await R.proposeEdit({ sessionOid: sR, intentOid: intent, actor: agentB, path: "src/mod.ts", baseText: greet("v0") + "\n", newText: greet("R-version") + "\n", declaredPurpose: "R: greet 변경", causalDeps: [base] });
   await L.pull(dirR);
   await R.pull(dirL);
   const ca = await L.materialize();

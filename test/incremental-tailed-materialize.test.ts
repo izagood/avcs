@@ -32,7 +32,7 @@ test("warm (cached) materialize agrees with cold across authoring", async () => 
     assert.equal(warm1, await coldTreeHash(dir), "warm == cold after first author");
 
     // author more on the SAME warm instance — the op-log tail must pick up the new op.
-    await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", symbolName: "a", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
     await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "b.ts", content: "export const b = 1\n", declaredPurpose: "b" });
     const warm2 = (await repo.materialize()).treeHash;
     assert.notEqual(warm2, warm1, "tree changed after edits");

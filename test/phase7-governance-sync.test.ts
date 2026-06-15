@@ -79,9 +79,9 @@ test("cross-replica conflict on the same symbol surfaces identically on both", a
   // B starts as a clone of A (pull), then both edit greet differently.
   const B = await Repo.init(dirB);
   await B.pull(dirA);
-  await A.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("A"), declaredPurpose: "A edit", causalDeps: [base] });
+  await A.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("A"), declaredPurpose: "A edit", causalDeps: [base] });
   const sB = await B.startSession({ intentOid: intent, actor: { kind: "ai_agent", id: "ai:b" } });
-  await B.proposeSymbolEdit({ sessionOid: sB, intentOid: intent, actor: { kind: "ai_agent", id: "ai:b" }, path: "mod.ts", symbolName: "greet", newText: greet("B"), declaredPurpose: "B edit", causalDeps: [base] });
+  await B.proposeEdit({ sessionOid: sB, intentOid: intent, actor: { kind: "ai_agent", id: "ai:b" }, path: "mod.ts", newText: greet("B"), declaredPurpose: "B edit", causalDeps: [base] });
 
   await A.pull(dirB);
   await B.pull(dirA);

@@ -38,7 +38,7 @@ test("incremental materialize matches full across an authoring sequence with con
     assert.equal((await repo.materialize()).treeHash, await cold(dir), "step1 inc==full");
 
     // step 2: symbol edit (splice) on a warm snapshot
-    await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", symbolName: "a", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.ts", newText: "export function a(){ return 2 }", declaredPurpose: "edit" });
     assert.equal((await repo.materialize()).treeHash, await cold(dir), "step2 inc==full");
 
     // step 3: a concurrent conflict on the same file (policy: human wins, no prompt)
