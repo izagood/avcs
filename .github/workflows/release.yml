@@ -1,26 +1,35 @@
 name: release
 
-# Publish @izagood/avcs to npm + cut a GitHub Release when a version tag is pushed.
+# Automated release of @izagood/avcs to public npm, driven by the main branch.
 #
-#   1. bump "version" in package.json (e.g. 0.1.0 -> 0.1.1)
-#   2. commit, then: git tag v0.1.1 && git push origin v0.1.1
+#   - On a PR targeting main: run a publish DRY RUN. This builds the package,
+#     packs the tarball without publishing, and reports whether the version in
+#     package.json would actually be released on merge (it only releases if the
+#     version is not already on npm). Bump "version" in your PR to ship.
+#   - On push to main (i.e. when the PR merges): if package.json#version is NOT
+#     yet on the npm registry, publish it, push the matching v<version> tag, and
+#     cut a GitHub Release. If the version already exists, the job is a no-op.
 #
-# The tag must match package.json#version (guarded below). Publishing requires an
-# `NPM_TOKEN` repository secret (an npm automation token with publish rights to the
-# @izagood scope). `npm publish` runs the `prepublishOnly` gate (typecheck + test +
-# build), so a release can only ship green, freshly-built artifacts.
+# Publishing requires an `NPM_TOKEN` repository secret (an npm automation token
+# with publish rights to the @izagood scope). `npm publish` runs the
+# `prepublishOnly` gate (typecheck + test + build), so a release can only ship
+# green, freshly-built artifacts.
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
-  contents: write # create the GitHub Release
+  contents: write # push the version tag + create the GitHub Release
   id-token: write # npm provenance attestation
 
 jobs:
-  publish:
+  # PR: prove the package builds and packs, and preview whether merging would
+  # actually release (version not yet on npm) or be a no-op (version exists).
+  dry-run:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,20 +42,76 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify tag matches package.json version
+      - name: Build
+        run: npm run build
+
+      - name: "Publish dry run (packs tarball, no publish)"
+        run: npm publish --dry-run --provenance --access public
+
+      - name: Report whether merge would release
         run: |
-          PKG_VERSION="v$(node -p "require('./package.json').version")"
-          if [ "$PKG_VERSION" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
-            exit 1
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          PUBLISHED="$(npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || true)"
+          if [ -n "${PUBLISHED}" ]; then
+            echo "::warning::${PKG_NAME}@${PKG_VERSION} is already on npm — merging will NOT release. Bump \"version\" in package.json to ship a new release."
+          else
+            echo "::notice::${PKG_NAME}@${PKG_VERSION} is not on npm — merging this PR will publish it and push tag v${PKG_VERSION}."
           fi
 
+  # main: publish only if the version is new, then tag + GitHub Release.
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history + write token so we can push the tag back.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check whether this version is already on npm
+        id: gate
+        run: |
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          PUBLISHED="$(npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || true)"
+          if [ -n "${PUBLISHED}" ]; then
+            echo "::notice::${PKG_NAME}@${PKG_VERSION} already published — nothing to release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${PKG_NAME}@${PKG_VERSION} is new — releasing."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: "Publish to npm (runs prepublishOnly: typecheck, test, build)"
+        if: steps.gate.outputs.should_release == 'true'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Push version tag
+        if: steps.gate.outputs.should_release == 'true'
+        run: |
+          TAG="v${{ steps.gate.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+
       - name: Create GitHub Release
+        if: steps.gate.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
+        run: |
+          TAG="v${{ steps.gate.outputs.version }}"
+          gh release create "${TAG}" --generate-notes --title "${TAG}"
