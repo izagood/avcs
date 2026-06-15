@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { Repo } from "./api/repo.ts";
+import { Repo, type GitMode } from "./api/repo.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import type { Operation } from "./objects/types.ts";
 
@@ -45,6 +45,44 @@ function pkgVersion(): string {
   }
 }
 
+// The exact command that re-invokes this CLI (node + strip-types + this script path), so
+// installed hooks call the same AVCS the user is running now — no global install assumed.
+function avcsInvocation(): string {
+  return `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
+}
+
+const HOOK_PHASES = ["pre-commit", "prepare-commit-msg", "post-commit", "post-merge"] as const;
+const HOOK_MARKER = "# avcs-git-bridge-hook";
+
+function hookScript(phase: string, avcsCmd: string): string {
+  return `#!/bin/sh
+${HOOK_MARKER} ${phase}
+# Managed by \`avcs install-hooks\` (docs/14). Delete this file to disable.
+exec ${avcsCmd} git-hook ${phase} "$@"
+`;
+}
+
+/** Install the git-bridge hook scripts into `hooksDir`, preserving any non-AVCS hooks. */
+async function installHooks(hooksDir: string, avcsCmd: string, force: boolean): Promise<{ installed: string[]; skipped: string[] }> {
+  const { writeFile, mkdir, readFile, chmod } = await import("node:fs/promises");
+  const { existsSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  await mkdir(hooksDir, { recursive: true });
+  const installed: string[] = [];
+  const skipped: string[] = [];
+  for (const phase of HOOK_PHASES) {
+    const p = join(hooksDir, phase);
+    if (existsSync(p)) {
+      const existing = await readFile(p, "utf8");
+      if (!existing.includes(HOOK_MARKER) && !force) { skipped.push(phase); continue; } // a foreign hook — don't clobber
+    }
+    await writeFile(p, hookScript(phase, avcsCmd), "utf8");
+    await chmod(p, 0o755);
+    installed.push(phase);
+  }
+  return { installed, skipped };
+}
+
 async function main(): Promise<void> {
   switch (cmd) {
     case "version": {
@@ -52,9 +90,25 @@ async function main(): Promise<void> {
       break;
     }
     case "init": {
-      const dir = args[1] ?? cwd;
-      await Repo.init(dir);
-      console.log(`initialized AVCS repo at ${dir}/.avcs`);
+      const dir = args[1] && !args[1].startsWith("--") ? args[1] : cwd;
+      const repo = await Repo.init(dir);
+      const want = flag("--mode");
+      const mode: GitMode = want === "committed" ? "committed" : "sidecar";
+      await repo.setGitMode(mode);
+      console.log(`initialized AVCS repo at ${dir}/.avcs  [git mode: ${mode}]`);
+      if (mode === "sidecar") console.log(`  .avcs/ is git-ignored — git tracks only the projection (run \`avcs git-mode committed\` to share history via git)`);
+      // If this is a git repo, offer to install the bridge hooks so `git commit` just works.
+      if (!args.includes("--no-hooks")) {
+        const { execFileSync } = await import("node:child_process");
+        try {
+          const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: dir }).toString().trim();
+          const { isAbsolute, join } = await import("node:path");
+          const hooksDir = isAbsolute(gp) ? gp : join(dir, gp);
+          const cmd = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
+          const { installed } = await installHooks(hooksDir, cmd, false);
+          if (installed.length) console.log(`  installed git hooks (${installed.join(", ")}) — \`git commit\` now auto-syncs AVCS (--no-hooks to skip)`);
+        } catch { /* not a git repo — fine; user can `git init` then `avcs install-hooks` */ }
+      }
       break;
     }
     case "status": {
@@ -245,6 +299,182 @@ async function main(): Promise<void> {
       console.log(`committed ${r.ops.length} change(s) as "${message}"`);
       break;
     }
+    case "git-sync": {
+      const repo = await Repo.open(cwd);
+      const message = flag("-m") ?? flag("--message");
+      if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--no-add]");
+      const author = flag("--author") ?? "human:cli";
+      const line = flag("--line");
+      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, ...(line ? { line } : {}) });
+      for (const p of r.captured.added) console.log(`  A ${p}`);
+      for (const p of r.captured.modified) console.log(`  M ${p}`);
+      for (const p of r.captured.removed) console.log(`  D ${p}`);
+      if (r.conflicts.length) {
+        console.error(`\n✗ ${r.conflicts.length} open conflict(s) need a human — refusing to stage a conflicted tree.`);
+        console.error(`  run \`avcs conflicts ${line ?? "main"}\` to review; resolve, then re-run git-sync.`);
+        process.exitCode = 1;
+        break;
+      }
+      console.log(`captured ${r.captured.ops.length} op(s) · checkpoint ${r.checkpoint!.slice(0, 16)}… · treeHash ${r.treeHash!.slice(0, 12)}…`);
+      console.log(`reprojected ${r.reprojected} file(s)  [git mode: ${r.mode}]`);
+      const wantCommit = args.includes("--commit");
+      if (!args.includes("--no-add") || wantCommit) {
+        const { execFileSync } = await import("node:child_process");
+        try {
+          execFileSync("git", ["add", "-A"], { cwd, stdio: "inherit" });
+          if (wantCommit) {
+            // Inject the provenance trailer (git→avcs) then record the SHA back-link (avcs→git).
+            const trailerOn = await repo.gitTrailerEnabled();
+            const body = trailerOn
+              ? `${message}\n\n${repo.gitTrailer({ checkpoint: r.checkpoint!, treeHash: r.treeHash!, ...(r.captured.intent ? { intent: r.captured.intent } : {}) })}`
+              : message;
+            execFileSync("git", ["commit", "-m", body], { cwd, stdio: "inherit" });
+            const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
+            await repo.recordGitCommit(sha, r.checkpoint!);
+            console.log(`committed ${sha.slice(0, 12)} ↔ checkpoint ${r.checkpoint!.slice(0, 16)}…  (\`avcs verify-git\` to check)`);
+          } else {
+            console.log(`staged working tree (git add -A) — now run \`git commit\` (or re-run with --commit)`);
+          }
+        } catch {
+          console.error(`(git step failed — not a git repo? stage/commit manually, or pass --no-add)`);
+          process.exitCode = 1;
+        }
+      }
+      break;
+    }
+    case "verify-git": {
+      const repo = await Repo.open(cwd);
+      const { execFileSync } = await import("node:child_process");
+      const git = (a: string[]): string => execFileSync("git", a, { cwd }).toString();
+      let sha: string;
+      try {
+        sha = args[1] && !args[1].startsWith("--") ? git(["rev-parse", args[1]]).trim() : git(["rev-parse", "HEAD"]).trim();
+      } catch {
+        console.error(`not a git repo (or bad ref) — verify-git needs a git commit`);
+        process.exitCode = 1;
+        break;
+      }
+      // Find the checkpoint: prefer the local back-link ref, fall back to the commit trailer.
+      let cp = await repo.gitCheckpoint(sha);
+      if (!cp) {
+        const m = git(["log", "-1", "--format=%B", sha]).match(/^AVCS-Checkpoint:\s*(\S+)/m);
+        cp = m?.[1] ?? null;
+      }
+      if (!cp) {
+        console.error(`✗ no AVCS checkpoint linked to ${sha.slice(0, 12)} (no back-link ref, no trailer)`);
+        process.exitCode = 1;
+        break;
+      }
+      const { treeHashOk, files } = await repo.checkpointFiles(cp);
+      const avcs = new Map(files.map((f) => [f.path, f.content]));
+      // Compare against git's committed tree, excluding the .avcs/ history itself (committed mode).
+      const gitPaths = git(["ls-tree", "-r", "--name-only", sha]).split("\n").filter((p) => p && !p.startsWith(".avcs/"));
+      const gitSet = new Set(gitPaths);
+      const diffs: string[] = [];
+      for (const p of gitSet) if (!avcs.has(p)) diffs.push(`  +git only: ${p}`);
+      for (const p of avcs.keys()) if (!gitSet.has(p)) diffs.push(`  -avcs only: ${p}`);
+      for (const p of gitSet) if (avcs.has(p) && git(["show", `${sha}:${p}`]) !== avcs.get(p)) diffs.push(`  ≠ content: ${p}`);
+      if (!treeHashOk) diffs.push(`  ! checkpoint treeHash no longer reproduces from its frontier`);
+      if (diffs.length) {
+        console.error(`✗ ${sha.slice(0, 12)} does NOT match checkpoint ${cp.slice(0, 16)}… (${diffs.length} difference(s)):`);
+        for (const d of diffs.slice(0, 20)) console.error(d);
+        process.exitCode = 1;
+      } else {
+        console.log(`✓ ${sha.slice(0, 12)} is a faithful projection of checkpoint ${cp.slice(0, 16)}… (${avcs.size} file(s) match)`);
+      }
+      break;
+    }
+    case "git-mode": {
+      const repo = await Repo.open(cwd);
+      const want = args[1];
+      if (!want) { console.log(`git mode: ${await repo.getGitMode()}`); break; }
+      if (want !== "sidecar" && want !== "committed") throw new Error("usage: avcs git-mode [sidecar|committed]");
+      await repo.setGitMode(want);
+      console.log(`git mode set to: ${want} (rewrote .avcs/.gitignore)`);
+      if (want === "committed") console.log(`  next: \`git add .avcs\` to start tracking AVCS history, then commit`);
+      else console.log(`  .avcs/ is now git-ignored; \`git rm -r --cached .avcs\` to stop tracking already-committed history`);
+      break;
+    }
+    case "reindex": {
+      const repo = await Repo.open(cwd);
+      const r = await repo.reindex();
+      console.log(`reindexed ${r.ops} operation(s) into the entity index`);
+      break;
+    }
+    case "install-hooks": {
+      await Repo.open(cwd); // validate this is an AVCS repo
+      const { execFileSync } = await import("node:child_process");
+      let hooksDir: string;
+      try {
+        const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd }).toString().trim();
+        const { isAbsolute, join } = await import("node:path");
+        hooksDir = isAbsolute(gp) ? gp : join(cwd, gp);
+      } catch {
+        console.error(`not a git repo — run \`git init\` first`);
+        process.exitCode = 1;
+        break;
+      }
+      const { installed, skipped } = await installHooks(hooksDir, avcsInvocation(), args.includes("--force"));
+      if (installed.length) console.log(`installed git hooks: ${installed.join(", ")}`);
+      if (skipped.length) console.log(`skipped (foreign hook present, use --force): ${skipped.join(", ")}`);
+      console.log(`now \`git commit\` auto-runs avcs sync; \`git pull\`/\`merge\` auto-reprojects`);
+      break;
+    }
+    case "git-hook": {
+      // Internal dispatch target for the installed hook scripts (docs/14). Each phase is
+      // designed to be safe to run by hand, and a no-op when there is nothing to do.
+      const phase = args[1];
+      const repo = await Repo.open(cwd);
+      const { execFileSync } = await import("node:child_process");
+      const author = process.env.AVCS_AUTHOR ?? "human:cli";
+      switch (phase) {
+        case "pre-commit": {
+          // Capture working-tree edits as ops, gate on conflicts, checkpoint, reproject,
+          // re-stage the canonical projection, and stash the provenance for the next hooks.
+          const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
+          const r = await repo.gitSync({ message, actor: { kind: "human", id: author } });
+          if (r.conflicts.length) {
+            console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
+            process.exit(1); // abort the commit
+          }
+          execFileSync("git", ["add", "-A"], { cwd, stdio: "inherit" });
+          await repo.writeGitPending({ checkpoint: r.checkpoint!, treeHash: r.treeHash!, ...(r.captured.intent ? { intent: r.captured.intent } : {}) });
+          break;
+        }
+        case "prepare-commit-msg": {
+          // args: [2]=msgFile [3]=source [4]=sha. Append the trailer if enabled & absent.
+          const msgFile = args[2];
+          if (!msgFile) break;
+          const pending = await repo.readGitPending();
+          if (!pending || !(await repo.gitTrailerEnabled())) break;
+          const { readFile, writeFile } = await import("node:fs/promises");
+          const cur = await readFile(msgFile, "utf8");
+          if (cur.includes("AVCS-Checkpoint:")) break;
+          const trailer = repo.gitTrailer({ checkpoint: pending.checkpoint, treeHash: pending.treeHash, ...(pending.intent ? { intent: pending.intent } : {}) });
+          await writeFile(msgFile, `${cur.replace(/\n*$/, "")}\n\n${trailer}\n`, "utf8");
+          break;
+        }
+        case "post-commit": {
+          const pending = await repo.readGitPending();
+          if (!pending) break;
+          const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
+          await repo.recordGitCommit(sha, pending.checkpoint);
+          await repo.clearGitPending();
+          break;
+        }
+        case "post-merge": {
+          // A git pull/merge unioned new objects (committed mode) straight onto disk:
+          // rebuild the index and re-project deterministically from the merged op graph.
+          await repo.reindex();
+          await repo.checkoutInto(cwd, "main");
+          break;
+        }
+        default:
+          console.error(`unknown git-hook phase: ${phase}`);
+          process.exitCode = 1;
+      }
+      break;
+    }
     case "lines": {
       const repo = await Repo.open(cwd);
       const lines = await repo.listLines();
@@ -332,7 +562,7 @@ async function main(): Promise<void> {
     default:
       console.log(
         "avcs <command>\n\n" +
-          "  init [dir]                  create a repo\n" +
+          "  init [dir] [--mode m]       create a repo (--mode sidecar|committed, default sidecar)\n" +
           "  status [view]               operation/conflict summary\n" +
           "  conflicts [view]            list decisions a human owes\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
@@ -344,6 +574,11 @@ async function main(): Promise<void> {
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
+          "  git-sync -m <msg> [--commit]   capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
+          "  git-mode [sidecar|committed]   show/set how AVCS history relates to git\n" +
+          "  verify-git [<commit>]       check a git commit is a faithful projection of its AVCS checkpoint\n" +
+          "  install-hooks [--force]     install git hooks so `git commit`/`pull` auto-sync AVCS\n" +
+          "  reindex                     rebuild the entity index (after a git pull of .avcs objects)\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
           "  clone <hub-url> [dir]       create a repo from a hub\n" +
           "  push <hub-url>              push objects to a hub\n" +
