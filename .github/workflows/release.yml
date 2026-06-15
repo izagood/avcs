@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to npm (runs prepublishOnly: typecheck + test + build)
+      - name: "Publish to npm (runs prepublishOnly: typecheck, test, build)"
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
