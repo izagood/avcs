@@ -163,7 +163,7 @@ const hub = await startHub({ repoDir: "./data", port: 8080, gated: true });
 
 Entry points: `.` (root barrel) · `./hub` · `./hub/client` · `./store` · `./identity` · `./types`.
 
-Releasing: bump `package.json`'s `version`, then push a `vX.Y.Z` tag — `.github/workflows/release.yml` runs `npm publish` (with provenance) and cuts a GitHub Release. Requires an `NPM_TOKEN` repository secret with publish rights to the `@izagood` scope.
+Releasing: bump `package.json`'s `version` in a PR and merge it to `main` — `.github/workflows/release.yml` detects the new version, runs `npm publish` (with provenance), tags the commit `vX.Y.Z`, and cuts a GitHub Release. The publish steps are guarded by a registry check, so package.json edits that don't change the version are no-ops. Every PR also runs a release dry run (`npm run build` + `npm pack --dry-run`) in CI to catch packaging regressions before merge. Requires an `NPM_TOKEN` repository secret with publish rights to the `@izagood` scope.
 
 ## Quick start
 
