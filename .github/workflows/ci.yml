@@ -41,3 +41,33 @@ jobs:
 
       - name: Test
         run: npm test
+
+  release-dry-run:
+    name: release dry run (build + pack)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Mirror the release build so packaging regressions surface at PR time.
+      # (typecheck + test are covered by the `test` job above.) We use
+      # `npm pack --dry-run` rather than `npm publish --dry-run`: pack reports the
+      # exact tarball contents a real release would ship — exercising the same
+      # `files`/`exports`/ignore rules — without contacting the registry. A
+      # publish dry run would additionally fail with "cannot publish over previously
+      # published versions" on every PR that doesn't bump the version, which is not
+      # a packaging error and must not block PRs.
+      - name: Build
+        run: npm run build
+
+      - name: Pack (verify the release tarball contents)
+        run: npm pack --dry-run
