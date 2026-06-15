@@ -124,6 +124,27 @@ Other install options:
 
 Prefer npm? `npm link` exposes the same `avcs` binary from `package.json`'s `bin` field. If `node` isn't on your `PATH` at runtime, point the launcher at one with `AVCS_NODE=/path/to/node`.
 
+## Use as a library (`@izagood/avcs`)
+
+A hosting server (e.g. avcshub) can depend on the AVCS core as a versioned package. Development and tests run the raw `.ts` via type stripping, but `npm publish` ships a `tsc`-compiled `dist/` (JS + type declarations via `tsconfig.build.json`), so consumers import it with no build tooling of their own.
+
+```bash
+npm install @izagood/avcs
+```
+
+```ts
+import { startHub, type HubHandle } from "@izagood/avcs/hub";   // the hub server
+import { ObjectStore, CorruptObjectError } from "@izagood/avcs/store";
+import { verifyMessage, generateKeypair } from "@izagood/avcs/identity";
+import { Repo } from "@izagood/avcs";                            // root: primary public API
+
+const hub = await startHub({ repoDir: "./data", port: 8080, gated: true });
+```
+
+Entry points: `.` (root barrel) · `./hub` · `./hub/client` · `./store` · `./identity` · `./types`.
+
+Releasing: bump `package.json`'s `version`, then push a `vX.Y.Z` tag — `.github/workflows/release.yml` runs `npm publish` (with provenance) and cuts a GitHub Release. Requires an `NPM_TOKEN` repository secret with publish rights to the `@izagood` scope.
+
 ## Quick start
 
 If you'd rather not install, every command runs straight from the checkout with `node`:
