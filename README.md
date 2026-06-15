@@ -187,6 +187,7 @@ AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 - [11 — Incremental reduce](docs/11-incremental-reduce.md)
 - [12 — Local production](docs/12-local-production.md)
 - [13 — Hub production](docs/13-hub-production.md)
+- [14 — Git bridge (real-world compatibility)](docs/14-git-bridge.md)
 
 ## Contributing
 
