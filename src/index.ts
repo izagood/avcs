@@ -8,6 +8,22 @@
 // Repository / materialization
 export { Repo } from "./api/repo.ts";
 
+// Content-addressing — the sacrosanct interop invariant. A consumer (e.g. avcshub)
+// that stores objects MUST address them with THESE functions, not a re-implementation:
+// any byte-level divergence in canonicalize/computeOid splits oids and treeHashes and
+// silently breaks interop with avcs clients. Exposed so the canonical implementation is
+// importable instead of copied. Also available as `@izagood/avcs/canonical`.
+export { canonicalize, computeOid, sha256hex } from "./core/canonical.ts";
+
+// Deterministic reduce/materialize core (also `@izagood/avcs/reducer`)
+export { reduce, snapshotReduce, reduceIncremental, keysOf, conflictIdFor, detectFileConflicts } from "./reducer/reducer.ts";
+export type { ReduceInput, ReductionResult, ReduceSnapshot, Conflict, AutoDecision } from "./reducer/reducer.ts";
+
+// Policy engine + materializer algorithm identity (also `@izagood/avcs/policy`).
+// MATERIALIZER_VERSION changes iff the merge algorithm changes — consumers can pin /
+// detect determinism boundaries off it. See RELEASES.md.
+export { defaultPolicy, evaluateOp, MATERIALIZER_VERSION } from "./reducer/policy.ts";
+
 // Object storage + integrity
 export { ObjectStore, CorruptObjectError } from "./store/objectStore.ts";
 export type { FsckReport } from "./store/objectStore.ts";
