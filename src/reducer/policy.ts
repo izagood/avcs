@@ -27,8 +27,18 @@ import type {
   Policy,
   PolicyRule,
 } from "../objects/types.ts";
+import { MERGE3_VERSION } from "../merge/merge3.ts";
 
-export const MATERIALIZER_VERSION = "avcs-text-mvp/0.0.1";
+// The materialize result is content-addressed: same ops ⇒ same treeHash, but only if
+// every replica runs the same merge algorithm. This version string is the algorithm's
+// identity, stamped into every materialize result (`materializerVersion`) and surfaced
+// by the hub. It is COMPOSED from MERGE3_VERSION so that any change to the merge
+// substrate flows through automatically — the symbol-aware → text-3way rewrite (0.1.1)
+// failed to bump it, so symbol-era and text-era results shared one string and a
+// consumer could not tell they were produced by incompatible algorithms. Composing it
+// makes the merge3.ts promise ("the algorithm version is pinned into MATERIALIZER_VERSION")
+// self-maintaining. Bumped to a distinct value for the 0.2.0 text-merge core.
+export const MATERIALIZER_VERSION = `avcs-${MERGE3_VERSION}`;
 
 /** A sane built-in policy used when a repo has not authored its own. */
 export function defaultPolicy(): Policy {
