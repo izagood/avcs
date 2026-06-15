@@ -13,21 +13,44 @@
 //   avcs checkpoint <view> [-m <summary>]
 //   avcs show <oid>
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
 import { Repo } from "./api/repo.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import type { Operation } from "./objects/types.ts";
 
 const args = process.argv.slice(2);
-const cmd = args[0];
+let cmd = args[0];
 const cwd = process.cwd();
+
+// Normalize the version/help flags so `avcs --version` / `avcs -h` work like
+// every other CLI, instead of falling through to the usage exit-1 path.
+if (cmd === "--version" || cmd === "-v") cmd = "version";
+if (cmd === "--help" || cmd === "-h") cmd = "help";
 
 function flag(name: string): string | undefined {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+function pkgVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 async function main(): Promise<void> {
   switch (cmd) {
+    case "version": {
+      console.log(`avcs ${pkgVersion()}`);
+      break;
+    }
     case "init": {
       const dir = args[1] ?? cwd;
       await Repo.init(dir);
@@ -305,6 +328,7 @@ async function main(): Promise<void> {
       console.log(JSON.stringify(await store.get(oid), null, 2));
       break;
     }
+    case "help":
     default:
       console.log(
         "avcs <command>\n\n" +
@@ -332,9 +356,11 @@ async function main(): Promise<void> {
           "  materialize [view] [--out d]  project the code tree\n" +
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +
           "  release [view] [-m msg]     cut a verified release + SBOM\n" +
-          "  show <oid>                  dump an object\n",
+          "  show <oid>                  dump an object\n" +
+          "  version | --version | -v    print the avcs version\n" +
+          "  help | --help | -h          show this help\n",
       );
-      if (cmd) process.exitCode = 1;
+      if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }
 
