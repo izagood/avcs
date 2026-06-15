@@ -14,19 +14,20 @@
 //   • A behavior change cannot be accepted without passing-test evidence.
 //   • On a conflict, produce options for a human; do not silently overwrite.
 
+import { pathToFileURL } from "node:url";
 import { Repo } from "../api/repo.ts";
 import type { Actor } from "../objects/types.ts";
 
 const REPO_DIR = process.env.AVCS_REPO ?? process.cwd();
 
-interface ToolDef {
+export interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   handler: (repo: Repo, input: Record<string, unknown>) => Promise<unknown>;
 }
 
-function actorOf(input: Record<string, unknown>): Actor {
+export function actorOf(input: Record<string, unknown>): Actor {
   const a = (input.actor ?? {}) as Partial<Actor>;
   return { kind: a.kind ?? "ai_agent", id: a.id ?? "ai:unknown", ...(a.model ? { model: a.model } : {}) };
 }
@@ -41,7 +42,7 @@ const actorSchema = {
   required: ["id"],
 };
 
-const TOOLS: ToolDef[] = [
+export const TOOLS: ToolDef[] = [
   {
     name: "avcs.intent.create",
     description: "Open an intent: the goal + constraints + allowed scopes for a unit of work. Agents must work within an intent.",
@@ -398,7 +399,11 @@ async function main(): Promise<void> {
   console.error(`[avcs-mcp] serving repo ${REPO_DIR} over stdio (${TOOLS.length} tools)`);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Only start the stdio server when run as the entry point — importing this module
+// (e.g. from tests, to exercise the tool handlers) must not boot the server.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

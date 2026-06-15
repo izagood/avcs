@@ -2,6 +2,7 @@
 
 *An AI-native version control system for humans and AI agents working concurrently.*
 
+[![CI](https://github.com/izagood/avcs/actions/workflows/ci.yml/badge.svg)](https://github.com/izagood/avcs/actions/workflows/ci.yml)
 ![status](https://img.shields.io/badge/status-experimental-orange)
 ![node](https://img.shields.io/badge/node-%E2%89%A522.6-brightgreen)
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue)
@@ -190,6 +191,8 @@ AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 ## Contributing
 
 This is an early-stage research prototype and the design is still moving. Issues and discussion are welcome — if you're proposing a change, the design docs above are the best starting point for the rationale behind the current model. Please run `npm test` and `npm run typecheck` before opening a pull request.
+
+Every push and pull request to `main` runs CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `npm ci` → `npm run typecheck` → `npm test` on Node 22.x and 24.x. PRs are merged only when CI is green.
 
 ## License
 
