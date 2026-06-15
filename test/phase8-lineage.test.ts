@@ -41,13 +41,11 @@ test("two lines hold different content on the SAME symbol with no conflict", asy
   await repo.createLine("v2", "main");
 
   // main edits greet → "main"; v2 edits greet → "v2". Same symbol, different lines.
-  await repo.proposeSymbolEdit({
-    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet",
-    newText: greet("main"), declaredPurpose: "main edit", causalDeps: [base], line: "main",
+  await repo.proposeEdit({
+    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("main"), declaredPurpose: "main edit", causalDeps: [base], line: "main",
   });
-  await repo.proposeSymbolEdit({
-    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet",
-    newText: greet("v2"), declaredPurpose: "v2 edit", causalDeps: await repo.lineFrontier("v2"), line: "v2",
+  await repo.proposeEdit({
+    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("v2"), declaredPurpose: "v2 edit", causalDeps: await repo.lineFrontier("v2"), line: "v2",
   });
 
   const mainRes = await repo.materialize("main");
@@ -82,9 +80,8 @@ test("backport: portOp lands a main fix on v2 without touching main", async () =
   await repo.createLine("v2", "main");
 
   // A fix authored on main.
-  const fix = await repo.proposeSymbolEdit({
-    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet",
-    newText: greet("fixed"), declaredPurpose: "fix greet", causalDeps: [base], line: "main",
+  const fix = await repo.proposeEdit({
+    sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("fixed"), declaredPurpose: "fix greet", causalDeps: [base], line: "main",
   });
   // v2 still on the old content until we backport.
   assert.match(await symbolText(repo, "v2"), /"v0"/);

@@ -86,16 +86,18 @@ function generate(rng: Rng, n: number): Generated {
     // deps drawn only from already-emitted ops (a DAG; any topo order valid).
     const deps: string[] = [];
     for (const prev of ops) if (rng.chance(0.25)) deps.push(prev.oid as string);
-    const kind = rng.pick(["put_file", "set_symbol", "set_symbol", "rename_file", "delete_file", "note"] as const);
+    const kind = rng.pick(["put_file", "edit_file", "edit_file", "rename_file", "delete_file", "note"] as const);
     let body: OperationBody;
     let target: Operation["target"];
     if (kind === "put_file") {
       const path = rng.pick(PATHS); const content = `put_${i}`; const blobOid = blobOf(content);
       blobContent.set(blobOid, content); body = { kind, path, blobOid }; target = { entityKind: "file", entityId: path };
-    } else if (kind === "set_symbol") {
-      const path = rng.pick(PATHS); const symbolName = rng.pick(SYMBOLS); const text = symbolSrc(symbolName, `v${i}`);
+    } else if (kind === "edit_file") {
+      // MIGRATION: language-neutral whole-file edit (was set_symbol). Distinct content
+      // per op keeps the op DAG varied; empty base (baseBlobOid: undefined).
+      const path = rng.pick(PATHS); const text = symbolSrc(rng.pick(SYMBOLS), `v${i}`);
       const blobOid = blobOf(text); blobContent.set(blobOid, text);
-      body = { kind, path, symbolName, blobOid }; target = { entityKind: "symbol", entityId: `${path}#${symbolName}` };
+      body = { kind, path, blobOid, baseBlobOid: undefined }; target = { entityKind: "file", entityId: path };
     } else if (kind === "rename_file") {
       const fromPath: string = rng.pick(PATHS); let path: string = rng.pick(PATHS); if (path === fromPath) path = `${fromPath}.r`;
       body = { kind, fromPath, path }; target = { entityKind: "file", entityId: fromPath };

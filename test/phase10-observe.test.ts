@@ -20,14 +20,15 @@ async function lineared() {
   const intent = await repo.createIntent({ title: "cache work", owner: human.id });
   const sess = await repo.startSession({ intentOid: intent, actor: ai });
   const base = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", content: greet("v0") + "\n", declaredPurpose: "scaffold" });
-  const op1 = await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("v1"), declaredPurpose: "to v1", causalDeps: [base] });
-  const op2 = await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("BAD"), declaredPurpose: "regress", causalDeps: [op1] });
+  const op1 = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("v1"), declaredPurpose: "to v1", causalDeps: [base] });
+  const op2 = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("BAD"), declaredPurpose: "regress", causalDeps: [op1] });
   return { dir, repo, intent, sess, base, op1, op2 };
 }
 
 test("blame: who currently owns a symbol and why", async () => {
   const { dir, repo, op2 } = await lineared();
-  const b = await repo.blame("symbol:mod.ts#greet");
+  // MIGRATION (language-neutral): blame keys on the file entity, not a per-symbol entity.
+  const b = await repo.blame("file:mod.ts");
   assert.equal(b?.op, op2, "current owner is the latest accepted edit");
   assert.equal(b?.purpose, "regress");
   assert.equal(b?.actor.id, "ai:a");
@@ -37,8 +38,11 @@ test("blame: who currently owns a symbol and why", async () => {
 
 test("log -p: each edit with reconstructed before/after", async () => {
   const { dir, repo, op1, op2 } = await lineared();
-  const log = await repo.logP("symbol:mod.ts#greet", "mod.ts");
-  assert.equal(log.length, 2);
+  // MIGRATION (language-neutral): log -p keys on the file entity. The file history now
+  // includes the scaffold put_file plus the two edits (3 entries); we still assert the
+  // before/after reconstruction of the two edits (the test's intent).
+  const log = await repo.logP("file:mod.ts", "mod.ts");
+  assert.equal(log.length, 3);
   const e1 = log.find((e) => e.op === op1)!;
   assert.match(e1.before, /"v0"/);
   assert.match(e1.after, /"v1"/);
@@ -62,7 +66,7 @@ test("bisect: pinpoint the op that introduced a regression", async () => {
 test("diff: two lines differ on the edited file", async () => {
   const { dir, repo, intent, sess, base } = await lineared();
   await repo.createLine("v2", "main");
-  await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", symbolName: "greet", newText: greet("v2-only"), declaredPurpose: "v2 edit", causalDeps: await repo.lineFrontier("v2"), line: "v2" });
+  await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("v2-only"), declaredPurpose: "v2 edit", causalDeps: await repo.lineFrontier("v2"), line: "v2" });
   const d = await repo.diff("main", "v2");
   assert.deepEqual(d.modified, ["mod.ts"]);
   assert.deepEqual(d.added, []);
