@@ -1,31 +1,83 @@
 {
-  "name": "avcs",
-  "version": "0.0.1",
+  "name": "@izagood/avcs",
+  "version": "0.1.0",
   "type": "module",
   "description": "Agentic Version Control System — an AI-native VCS where intent, session, operation, evidence and decision are first-class objects and code is a materialized projection of an operation graph.",
   "license": "Apache-2.0",
   "author": "jaebin lee",
-  "bin": {
-    "avcs": "src/cli.ts"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/izagood/avcs.git"
   },
+  "homepage": "https://github.com/izagood/avcs#readme",
+  "bugs": {
+    "url": "https://github.com/izagood/avcs/issues"
+  },
+  "keywords": [
+    "version-control",
+    "vcs",
+    "content-addressed",
+    "operation-graph",
+    "ai-native",
+    "deterministic",
+    "agentic"
+  ],
+  "bin": {
+    "avcs": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./hub": {
+      "types": "./dist/hub/hubServer.d.ts",
+      "default": "./dist/hub/hubServer.js"
+    },
+    "./hub/client": {
+      "types": "./dist/hub/hubClient.d.ts",
+      "default": "./dist/hub/hubClient.js"
+    },
+    "./store": {
+      "types": "./dist/store/objectStore.d.ts",
+      "default": "./dist/store/objectStore.js"
+    },
+    "./identity": {
+      "types": "./dist/core/identity.d.ts",
+      "default": "./dist/core/identity.js"
+    },
+    "./types": {
+      "types": "./dist/objects/types.d.ts",
+      "default": "./dist/objects/types.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "avcs": "node --experimental-strip-types src/cli.ts",
     "demo": "node --experimental-strip-types src/demo.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "mcp": "node --experimental-strip-types src/mcp/server.ts",
     "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "bench": "node --experimental-strip-types bench/materialize-bench.ts",
     "bench:incremental": "node --experimental-strip-types bench/incremental-bench.ts"
   },
   "engines": {
     "node": ">=22.6"
   },
-  "dependencies": {},
-  "optionalDependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+  "publishConfig": {
+    "access": "public"
   },
+  "dependencies": {},
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.7.0"
   }
 }

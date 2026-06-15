@@ -1,4 +1,6 @@
 node_modules/
+# Published build artifact — produced by `npm run build`, emitted fresh in CI on release
+dist/
 *.log
 .DS_Store
 # Local materialized workspace of demo repos

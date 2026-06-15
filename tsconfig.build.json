@@ -1,0 +1,23 @@
+{
+  // Publish-only build: emit JS + .d.ts into dist/ for npm consumers (e.g. avcshub).
+  // Development and tests still run the raw .ts via `node --experimental-strip-types`
+  // (see tsconfig.json / package.json scripts) — this config exists ONLY to produce the
+  // distributable artifact. Source keeps `.ts` import specifiers (which the type-strip
+  // runtime needs); `rewriteRelativeImportExtensions` rewrites them to `.js` on emit so
+  // the compiled output resolves correctly from node_modules.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  // The MCP server is coupled to the optional `@modelcontextprotocol/sdk` dependency and
+  // is a standalone dev entrypoint, not part of the consumable library — keep it out of
+  // the published artifact so the package has zero optional-dep coupling.
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/mcp/**", "src/demo.ts", "test/**", "**/*.test.ts", "bench/**"]
+}

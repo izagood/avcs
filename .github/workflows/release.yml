@@ -1,0 +1,52 @@
+name: release
+
+# Publish @izagood/avcs to npm + cut a GitHub Release when a version tag is pushed.
+#
+#   1. bump "version" in package.json (e.g. 0.1.0 -> 0.1.1)
+#   2. commit, then: git tag v0.1.1 && git push origin v0.1.1
+#
+# The tag must match package.json#version (guarded below). Publishing requires an
+# `NPM_TOKEN` repository secret (an npm automation token with publish rights to the
+# @izagood scope). `npm publish` runs the `prepublishOnly` gate (typecheck + test +
+# build), so a release can only ship green, freshly-built artifacts.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      - name: Publish to npm (runs prepublishOnly: typecheck + test + build)
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
