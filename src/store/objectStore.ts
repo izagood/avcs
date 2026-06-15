@@ -19,10 +19,32 @@ import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
 import { withLock, type LockOptions } from "./lock.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
 
+/**
+ * A stored object's bytes could not be decoded — bit-rot, truncation, or a torn write
+ * that slipped past the atomic-write guarantee (D1). Typed (not an opaque `SyntaxError`)
+ * and carries the offending `oid` so a decode failure deep in `materialize`/`pull` is
+ * actionable: the caller knows exactly which object to `fsck`/repair. F1 (docs/13).
+ */
+export class CorruptObjectError extends Error {
+  readonly oid?: string;
+  constructor(message: string, opts?: { oid?: string; cause?: unknown }) {
+    super(message, opts?.cause !== undefined ? { cause: opts.cause } : undefined);
+    this.name = "CorruptObjectError";
+    this.oid = opts?.oid;
+  }
+}
+
 /** Deserialize a stored object: CBOR (new format) or legacy canonical-JSON, sniffed by
- *  the first byte. oids are JSON-derived so both formats address identically (B1). */
-function decodeObject<T>(raw: Buffer): T {
-  return (looksLikeCbor(raw) ? decodeCbor(raw) : JSON.parse(raw.toString("utf8"))) as T;
+ *  the first byte. oids are JSON-derived so both formats address identically (B1). Any
+ *  malformed input (truncated CBOR, broken JSON, empty file) is normalized to a typed
+ *  {@link CorruptObjectError} carrying `oid` — never an opaque parser throw (F1). */
+function decodeObject<T>(raw: Buffer, oid?: string): T {
+  try {
+    return (looksLikeCbor(raw) ? decodeCbor(raw) : JSON.parse(raw.toString("utf8"))) as T;
+  } catch (e) {
+    const where = oid ? ` ${oid}` : "";
+    throw new CorruptObjectError(`undecodable object${where}: ${(e as Error).message}`, { oid, cause: e });
+  }
 }
 
 interface PackLoc { file: string; offset: number; length: number; }
@@ -277,10 +299,10 @@ export class ObjectStore {
 
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
     const p = this.#pathFor(oid);
-    if (existsSync(p)) return decodeObject<T>(await readFile(p)); // loose shadows packs
+    if (existsSync(p)) return decodeObject<T>(await readFile(p), oid); // loose shadows packs
     const loc = (await this.#packLocations()).get(oid);
-    if (loc) return decodeObject<T>(await this.#readPackSlice(loc));
-    return decodeObject<T>(await readFile(p)); // absent → throws ENOENT (prior behavior)
+    if (loc) return decodeObject<T>(await this.#readPackSlice(loc), oid);
+    return decodeObject<T>(await readFile(p), oid); // absent → throws ENOENT (prior behavior)
   }
 
   async has(oid: string): Promise<boolean> {
@@ -299,14 +321,14 @@ export class ObjectStore {
           if (!file.endsWith(".json")) continue;
           if (type && !file.startsWith(`${type}_`)) continue;
           seen.add(file.slice(0, -".json".length));
-          yield decodeObject<T>(await readFile(join(shardDir, file)));
+          yield decodeObject<T>(await readFile(join(shardDir, file)), file.slice(0, -".json".length));
         }
       }
     }
     for (const [oid, loc] of await this.#packLocations()) {
       if (seen.has(oid)) continue; // a re-added loose copy already yielded
       if (type && !oid.startsWith(`${type}_`)) continue;
-      yield decodeObject<T>(await this.#readPackSlice(loc));
+      yield decodeObject<T>(await this.#readPackSlice(loc), oid);
     }
   }
 
@@ -437,7 +459,7 @@ export class ObjectStore {
       objectsChecked++;
       let obj: AnyObject & { redacted?: boolean };
       try {
-        obj = decodeObject<AnyObject & { redacted?: boolean }>(raw);
+        obj = decodeObject<AnyObject & { redacted?: boolean }>(raw, oid);
       } catch (e) {
         corrupt.push({ oid, reason: `undecodable: ${(e as Error).message}` });
         return;

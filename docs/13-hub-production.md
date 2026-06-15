@@ -52,6 +52,20 @@ These require a deployment environment, not application code:
   object storage / a replicated log.
 - **Edge rate-limiting / WAF**, **HSM / threshold keys**, **OTel collector**.
 
+## Track F — robustness hardening (decode-path fuzzing)
+
+Beyond the hub trust boundary, a production VCS must survive *corrupt* input on the
+read path, not just reject *unauthorized* input. D1 (atomic writes) and D3 (`avcs
+fsck`) keep bytes honest and detect rot, but the decoder itself had to degrade safely.
+
+| Stage | Blocker | Fix | Severity |
+|---|---|---|---|
+| **F1** | a single torn/bit-rotted object (truncated CBOR, broken JSON, empty file) made `get`/`list`/`materialize`/`pull` throw an opaque `SyntaxError`/`CBOR: …` with no indication of *which* object — un-actionable, and a partial path could surface as a crash deep in reduce | normalize every decode failure at the single `decodeObject` chokepoint to a typed **`CorruptObjectError`** that names the offending `oid`; a seeded **fuzz harness** (arbitrary/truncated/bit-flipped/empty bytes, 400 iterations) asserts the decode dichotomy `{value} ∪ {CorruptObjectError}` — never an opaque throw, non-Error throw, or hang | Med |
+
+This closes the docs/10 verification gate "fuzzing: 객체 파서". Remaining docs/10 fuzz
+targets (sync-negotiation, reduce) are already covered by the determinism property
+harness (reduce, split-independence) and the hub's malformed-input 4xx handling.
+
 ## Invariants Track E must not break
 
 - **Determinism**: no stage changes `reduce`'s output for a given op set — all E
