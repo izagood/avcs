@@ -1,111 +1,158 @@
 # AVCS — Agentic Version Control System
 
-> Git은 "이 코드가 **언제** 바뀌었나"를 기록한다.
-> AVCS는 "**누가 / 무슨 의도로 / 어떤 근거로 / 어떤 충돌 결정을 거쳐** 지금 상태가 되었나"를 기록한다.
+*An AI-native version control system for humans and AI agents working concurrently.*
 
-AVCS는 사람과 다수의 AI 에이전트가 **동시에** 코드를 바꾸는 환경을 1차 대상으로 하는, Git 비호환 신규 VCS입니다. commit/branch/merge/conflict-marker 모델을 버리고, **의도(intent)·세션(session)·연산(operation)·증거(evidence)·결정(decision)**을 1급 객체로 저장합니다. 코드 트리는 이 연산 그래프를 결정론적으로 환원(reduce)해 만든 **projection**일 뿐입니다.
+![status](https://img.shields.io/badge/status-experimental-orange)
+![node](https://img.shields.io/badge/node-%E2%89%A522.6-brightgreen)
+![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue)
+![license](https://img.shields.io/badge/license-Apache--2.0-green)
+
+> Git records **when** the code changed.
+> AVCS records **who changed it, with what intent, on what evidence, and through which conflict decisions** the code reached its current state.
+
+AVCS is a new, deliberately Git-incompatible version control system built for a world where humans and **many AI agents edit the same codebase concurrently**. It drops the commit / branch / merge / conflict-marker model and instead stores **intent**, **session**, **operation**, **evidence**, and **decision** as first-class objects. The code tree is not the source of truth — it is a **projection** computed by deterministically *reducing* the operation graph:
 
 ```
 state = reduce(base, operationDAG, decisions, policy, materializer)
 ```
 
-## 핵심 원칙
+The same objects + the same policy + the same materializer produce the same tree on any replica. Merging is not text selection; it is a pure, deterministic reduction.
 
-1. **Commit이 아니라 Operation이 히스토리다.**
-2. **파일 경로가 아니라 Entity ID가 정체성이다.**
-3. **Merge는 텍스트 선택이 아니라 연산의 결정론적 환원이다.**
-4. **Conflict는 깨진 파일이 아니라 1급 Decision 객체다.**
-5. **AI 출력은 신뢰된 코드가 아니라 증거가 붙은 제안된 연산이다.**
-6. **코드에 last-write-wins를 기본값으로 쓰지 않는다.** 우선순위는 정책이 정한다.
+> **Status:** research prototype. The implementation is real and test-covered, but every phase is built to a *working-MVP depth* (file/symbol-level merge, ed25519 signing, heuristic contract analysis). Production-grade tree-sitter integration, multi-signature trust, and hardened distributed sync are tracked on the [roadmap](docs/07-roadmap.md).
 
-## 지금 동작하는 것 (Phase 1–12 MVP 구현 완료 · 테스트 66/66)
+## Core principles
 
-추가로 구현된 상위 phase:
-- **Phase 7** 멀티 머신: Membership/역할(서명·키연합) · `pull`(객체 gossip, 두 replica가 같은 treeHash로 수렴) · Protection + `finalize` CAS(non-fast-forward 거부 = 권한이 신선한 히스토리를 덮지 못함)
-- **Phase 8** Lineage: 장기 분기 라인(v1.x∥v2.x, 같은 symbol 다른 내용·충돌 0) · `portOp`(backport=cherry-pick)
-- **Phase 9** Scale: entity index · `materializeAt`(시간여행) · chunked 대용량 blob(dedup)
-- **Phase 10** Observability: `blame`(누가/왜)·`logP`·`bisect`(결정론적)·`diff`
-- **Phase 11** 외부 기여: quarantine 티어 + `promote` + 비신뢰 CI 게이트
-- **Phase 12** 보안: `redact`(유출 비밀 byte-eviction, oid 보존) · break-glass override · forward-only rollback
-- **소소**: `revert` · co-authors · stash(private op) · semver release
+| # | Principle | Contrast with Git |
+|---|-----------|-------------------|
+| 1 | **Operations are history**, not commits | A commit is merely a checkpoint over many operations |
+| 2 | **Identity is the entity ID**, not the file path | Rename + edit can auto-merge |
+| 3 | **Merge is a deterministic reduction**, not text selection | No conflict markers |
+| 4 | **A conflict is a first-class `decision` object**, not a broken file | The rationale stays in history |
+| 5 | **AI output is a proposed operation with attached evidence**, not trusted code | A behavior change with no test cannot be `accepted` |
+| 6 | **Code never defaults to last-write-wins** | Precedence is decided by policy |
 
-### 기반 (Phase 1–6)
+## How it works
 
-- **저장 코어** — append-only, content-addressed 객체 저장소(`.avcs/objects`), 8+2 객체 모델: intent · session · operation · evidence · decision · checkpoint · view · lease · release (+ blob · policy)
-- **결정론적 reducer + 정책 엔진** — 충돌 등급화:
-  - **L0/L1** 서로 다른 entity / 같은 파일 다른 **symbol** → 자동 병합
-  - **L2** 같은 슬롯 동시 변경 → 정책 자동 결정 (human 우선·신뢰도). 자동 결정도 `autoDecisions`로 기록
-  - **L3** 동작 변경인데 신뢰된 증거 없음 → 차단 / **선언 안 한 계약 변경 + 호출부** → 의미 충돌 자동 escalate
-  - **L4** public API 파괴 → 사람 결정 필요, **소유자에게 라우팅**
-- **의미(symbol) 단위 병합** (Phase 2) — tree-sitter 교체 가능한 `EntityIndexer`
-- **암호 신뢰** (Phase 3) — ed25519 서명된 evidence/decision, 위조 시 신뢰 게이트 탈락. 실제 검증 러너 · WorkLease · RepairContext
-- **의미 충돌 탐지 + 결정 메모리** (Phase 4) — 시그니처 drift 탐지, `recallDecisions`/`learnedPolicies`
-- **정책 심화** (Phase 5) — code-owner 라우팅 · 신뢰도 학습(bounded)
-- **Release & provenance** (Phase 6) — 검증된 checkpoint + SBOM(CycloneDX) + 서명된 아티팩트
-- branch 대신 **view**, commit 대신 **checkpoint**, tag 대신 **release**
-- 에이전트 1급 인터페이스 **MCP 서버**(tool 14종) · 사람용 **CLI** · **30개 테스트**(회귀 포함) 통과 · `tsc` clean
+Every meaningful thing is a content-addressed, append-only object. Code is a *projection* over the operation DAG, never stored as commits.
 
-> 깊이 표기: 각 phase는 **동작하는 MVP 깊이**다(파일/심볼 단위 머지, ed25519 서명, 휴리스틱 계약 분석). 실제 tree-sitter/타입체크 연동, 다중 서명, 분산 동기화는 [로드맵](docs/07-roadmap.md)의 후속 항목.
+| Object | Role |
+|--------|------|
+| `intent` | Why a change is being made (goal + constraints + allowed scope) |
+| `session` | An agent/human work episode against an intent |
+| `operation` | A single semantic change unit — the real history |
+| `evidence` | Machine-checkable proof (test / typecheck / lint / scan) attached to operations |
+| `decision` | A recorded resolution of a conflict or design choice |
+| `checkpoint` | A verified (ops + policy + materializer) state vector — replaces a commit |
+| `view` | A declarative query over the operation graph — replaces a branch |
+| `release` | A signed, provenance-bearing checkpoint — replaces a tag |
+| `policy` | The deterministic merge rules the reducer is parameterized by |
 
-## 빠른 시작
+…plus `blob` for raw content and the governance objects (`lease`, `membership`, `protection`, `promotion`, `redaction`, `override`, `approval`, `line`) used by the multi-machine and security phases.
 
-전제: Node ≥ 22.6 (TypeScript 타입 스트리핑 사용 — 빌드/설치 불필요).
+## Conflict resolution levels
+
+AVCS never falls back to last-write-wins for code. Contending operations are graded and resolved with a recorded rationale:
+
+- **L0 / L1** — different entities, or the same file but different **symbols** → **auto-merge**
+- **L2** — concurrent edits to the same slot → **policy auto-decision** (human-preferred, trust-weighted); the auto-decision is itself recorded in `autoDecisions`
+- **L3** — a behavior change with no *trusted* evidence → **blocked**; an undeclared contract change with live callers → **semantic conflict, auto-escalated**
+- **L4** — a public-API break → **requires a human decision**, routed to the scope's owners
+
+Evidence trust matters: an operation's own author cannot vouch for it. Evidence-gating and the passing-test bonus only count evidence produced by a *non-authoring, trusted* actor (CI bot / human).
+
+## What works today
+
+The reducer and policy engine are the foundation; the higher phases build distributed collaboration, security, and observability on top.
+
+**Foundation (Phases 1–6)**
+
+- **Storage core** — append-only, content-addressed object store (`.avcs/objects`)
+- **Deterministic reducer + policy engine** — the L0–L4 conflict grading above, with a priority ladder, bounded reliability nudges, and auditable auto-decisions
+- **Symbol-level merge** (Phase 2) — a pluggable `EntityIndexer` (MVP: a TS/JS brace scanner; Tree-sitter backend can drop in) so two edits to different functions in one file auto-merge
+- **Cryptographic trust** (Phase 3) — ed25519-signed evidence/decision; forged signatures fail the trust gate. Real validation runner, `WorkLease`, `RepairContext`
+- **Semantic conflict detection + decision memory** (Phase 4) — signature-drift detection, recallable decisions and learned policies
+- **Policy depth** (Phase 5) — code-owner routing and bounded reliability learning
+- **Release & provenance** (Phase 6) — verified checkpoints + CycloneDX SBOM + signed artifacts
+
+**Collaboration, scale & security (Phases 7–12)**
+
+- **Phase 7 — multi-machine:** membership/roles (signed key federation), `pull` (object gossip; two replicas converge to the same `treeHash`), protection + `finalize` CAS (non-fast-forward rejected, so a stale push can't overwrite fresh history)
+- **Phase 8 — lineage:** long-lived divergent lines (e.g. v1.x ∥ v2.x, same symbol, different content, zero conflict), `portOp` (backport = cherry-pick)
+- **Phase 9 — scale:** entity index, `materializeAt` (time travel), chunked large-blob storage with dedup
+- **Phase 10 — observability:** `blame` (who/why), `logP`, deterministic `bisect`, `diff`
+- **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
+- **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
+
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (21 tools); humans use the **CLI**. The behavior is pinned by a 148-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+
+## Quick start
+
+Requires **Node ≥ 22.6** — AVCS runs TypeScript directly via type stripping, so there is **no build step and zero runtime dependencies**.
 
 ```bash
-# 4가지 병합 시나리오를 한 번에 보여주는 데모
+# Walk all four merge scenarios end to end
 node --experimental-strip-types src/demo.ts
 
-# 동작 계약 테스트 (회귀 포함 30개)
-node --experimental-strip-types --test test/*.test.ts   # 또는: npm test
+# Run the behavior-contract test suite
+node --experimental-strip-types --test test/*.test.ts      # or: npm test
 
-# 사람용 CLI
+# Human-facing CLI
 node --experimental-strip-types src/cli.ts init .
 node --experimental-strip-types src/cli.ts status
 node --experimental-strip-types src/cli.ts conflicts
 node --experimental-strip-types src/cli.ts log
 
-# 에이전트용 MCP 서버 (optionalDependency 설치 필요)
+# Agent-facing MCP server (requires the optional dependency)
 npm install
 AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 ```
 
-> 타입 체크(`tsc --noEmit`)는 `npm install` 후 사용. 런타임은 의존성 0으로 동작합니다.
+> Type checking (`tsc --noEmit`) needs `npm install`; the runtime itself has no dependencies.
 
-## 코드 지도
+## Code map
 
-| 경로 | 역할 |
+| Path | Role |
 |------|------|
-| `src/objects/types.ts` | 객체 모델 정의 (단일 진실 공급원) |
-| `src/store/objectStore.ts` | append-only content-addressed 저장소 |
-| `src/core/canonical.ts` | 정규 직렬화 + content addressing(oid) |
-| `src/core/identity.ts` | ed25519 서명/검증 + Keyring (Phase 3) |
-| `src/reducer/reducer.ts` | 연산 그래프 → 코드 트리 환원 + 충돌 분류 |
-| `src/reducer/policy.ts` | 정책 엔진(우선순위 사다리, 신뢰도 nudge) |
-| `src/semantic/symbols.ts` | symbol 파서(EntityIndexer) — symbol 단위 머지 (Phase 2) |
-| `src/semantic/contract.ts` | 시그니처 분석 + 의미 충돌 탐지 (Phase 4) |
-| `src/policy/owners.ts` · `reliability.ts` | code-owner 라우팅 · 신뢰도 학습 (Phase 5) |
-| `src/validation/runner.ts` · `repair.ts` | 검증 러너 · RepairContext (Phase 3) |
+| `src/objects/types.ts` | Object model definitions (single source of truth) |
+| `src/store/objectStore.ts` | Append-only, content-addressed store |
+| `src/core/canonical.ts` | Canonical serialization + content addressing (oid) |
+| `src/core/identity.ts` | ed25519 sign/verify + Keyring (Phase 3) |
+| `src/reducer/reducer.ts` | Operation graph → code tree reduction + conflict grading |
+| `src/reducer/policy.ts` | Policy engine (priority ladder, reliability nudge) |
+| `src/reducer/incremental.ts` | Incremental re-reduce (reuse clean groups) |
+| `src/semantic/symbols.ts` | Symbol parser (`EntityIndexer`) — symbol-level merge (Phase 2) |
+| `src/semantic/contract.ts` | Signature analysis + semantic conflict detection (Phase 4) |
+| `src/policy/owners.ts`, `reliability.ts` | Code-owner routing · reliability learning (Phase 5) |
+| `src/validation/runner.ts`, `repair.ts` | Validation runner · RepairContext (Phase 3) |
 | `src/concurrency/lease.ts` | WorkLease (Phase 3) |
-| `src/release/sbom.ts` | SBOM 생성 (Phase 6) |
-| `src/api/repo.ts` | 고수준 파사드 (CLI·demo·MCP 공용) |
-| `src/mcp/server.ts` | 에이전트용 MCP 인터페이스 (tool 14종) |
-| `src/cli.ts` | 사람용 inspection/release CLI |
-| `src/demo.ts` | end-to-end 시나리오 |
+| `src/release/sbom.ts` | SBOM generation (Phase 6) |
+| `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
+| `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
+| `src/mcp/server.ts` | Agent-facing MCP interface (21 tools) |
+| `src/cli.ts` | Human-facing inspection/release CLI |
+| `src/demo.ts` | End-to-end scenario |
 
-## 설계 문서
+## Design docs
 
-- [00 — 개요와 원칙](docs/00-overview.md)
-- [01 — 아키텍처](docs/01-architecture.md)
-- [02 — 객체 모델](docs/02-object-model.md)
-- [03 — Reducer와 충돌 등급](docs/03-reducer.md)
-- [04 — 정책 엔진](docs/04-policy.md)
-- [05 — View · Checkpoint · Release](docs/05-views-checkpoints.md)
-- [06 — MCP / Skill 인터페이스](docs/06-mcp-interface.md)
-- [07 — 로드맵](docs/07-roadmap.md)
-- [08 — 거버넌스 & 합의 (avcshub)](docs/08-governance.md)
-- [09 — Git/GitHub 사용 사례 커버리지 & 설계 진화](docs/09-usecase-coverage.md)
-- [10 — Production 설계 계획](docs/10-production-plan.md)
+- [00 — Overview & principles](docs/00-overview.md)
+- [01 — Architecture](docs/01-architecture.md)
+- [02 — Object model](docs/02-object-model.md)
+- [03 — Reducer & conflict levels](docs/03-reducer.md)
+- [04 — Policy engine](docs/04-policy.md)
+- [05 — Views · Checkpoints · Releases](docs/05-views-checkpoints.md)
+- [06 — MCP / Skill interface](docs/06-mcp-interface.md)
+- [07 — Roadmap](docs/07-roadmap.md)
+- [08 — Governance & consensus (avcshub)](docs/08-governance.md)
+- [09 — Git/GitHub use-case coverage & design evolution](docs/09-usecase-coverage.md)
+- [10 — Production design plan](docs/10-production-plan.md)
+- [11 — Incremental reduce](docs/11-incremental-reduce.md)
+- [12 — Local production](docs/12-local-production.md)
+- [13 — Hub production](docs/13-hub-production.md)
 
-## 상태
+## Contributing
 
-연구/프로토타입. MVP는 **파일 단위** 연산입니다. 의미(AST/symbol) 단위 병합은 Phase 2 — reducer의 `conflictKey` 유도와 트리 변형만 교체하면 되도록 설계돼 있습니다.
+This is an early-stage research prototype and the design is still moving. Issues and discussion are welcome — if you're proposing a change, the design docs above are the best starting point for the rationale behind the current model. Please run `npm test` and `npm run typecheck` before opening a pull request.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). Copyright © 2026 jaebin lee. See [NOTICE](NOTICE) for attribution.
