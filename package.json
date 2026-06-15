@@ -1,6 +1,6 @@
 {
   "name": "@izagood/avcs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "description": "Agentic Version Control System — an AI-native VCS where intent, session, operation, evidence and decision are first-class objects and code is a materialized projection of an operation graph.",
   "license": "Apache-2.0",
@@ -45,6 +45,18 @@
     "./identity": {
       "types": "./dist/core/identity.d.ts",
       "default": "./dist/core/identity.js"
+    },
+    "./canonical": {
+      "types": "./dist/core/canonical.d.ts",
+      "default": "./dist/core/canonical.js"
+    },
+    "./reducer": {
+      "types": "./dist/reducer/reducer.d.ts",
+      "default": "./dist/reducer/reducer.js"
+    },
+    "./policy": {
+      "types": "./dist/reducer/policy.d.ts",
+      "default": "./dist/reducer/policy.js"
     },
     "./types": {
       "types": "./dist/objects/types.d.ts",
