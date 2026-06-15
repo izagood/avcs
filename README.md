@@ -85,9 +85,47 @@ The reducer and policy engine are the foundation; the higher phases build distri
 
 Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (21 tools); humans use the **CLI**. The behavior is pinned by a 148-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
-## Quick start
+## Install
 
 Requires **Node ≥ 22.6** — AVCS runs TypeScript directly via type stripping, so there is **no build step and zero runtime dependencies**.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/izagood/avcs/main/install.sh | bash
+```
+
+That one-liner clones the repo to `~/.local/share/avcs` (override with `--dir`/`AVCS_HOME`) and installs an `avcs` launcher to `~/.local/bin`. Re-running it updates the checkout in place. Already have a clone? Run the installer from inside it instead:
+
+```bash
+git clone https://github.com/izagood/avcs.git && cd avcs
+./install.sh
+```
+
+Either way, `install.sh` writes a small `avcs` launcher to `~/.local/bin` (override with `--bin-dir <dir>` or `AVCS_BIN_DIR`) that points back at the checkout, so updating is just `git pull` — no reinstall needed. If `~/.local/bin` isn't on your `PATH` yet, the installer prints the line to add.
+
+```bash
+avcs version      # confirm it's on your PATH
+avcs help         # list every command
+
+avcs init .       # create a repo in the current directory
+avcs status       # operation / conflict summary
+avcs conflicts    # decisions a human still owes
+avcs log          # operation history
+```
+
+Other install options:
+
+```bash
+./install.sh --bin-dir /usr/local/bin   # system-wide (may need sudo)
+./install.sh --name avcs-dev            # install under a different command name
+./install.sh --dir ~/src/avcs --ref v1  # one-liner mode: clone dir + ref to install
+./uninstall.sh                          # remove the launcher (data is left intact)
+```
+
+Prefer npm? `npm link` exposes the same `avcs` binary from `package.json`'s `bin` field. If `node` isn't on your `PATH` at runtime, point the launcher at one with `AVCS_NODE=/path/to/node`.
+
+## Quick start
+
+If you'd rather not install, every command runs straight from the checkout with `node`:
 
 ```bash
 # Walk all four merge scenarios end to end
@@ -96,7 +134,7 @@ node --experimental-strip-types src/demo.ts
 # Run the behavior-contract test suite
 node --experimental-strip-types --test test/*.test.ts      # or: npm test
 
-# Human-facing CLI
+# Human-facing CLI (or just `avcs <command>` once installed)
 node --experimental-strip-types src/cli.ts init .
 node --experimental-strip-types src/cli.ts status
 node --experimental-strip-types src/cli.ts conflicts
