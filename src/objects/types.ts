@@ -79,8 +79,8 @@ export interface Blob extends BaseObject {
 
 // ── intent ──────────────────────────────────────────────────────────────────
 export type IntentKind = "feature" | "bugfix" | "refactor" | "formatting" | "generated";
-/** A symbol/file/glob scope the intent is allowed to touch. */
-export type ScopeRef = string; // e.g. "file:src/cache/*", "symbol:UserService.findById"
+/** A file/glob scope the intent is allowed to touch. */
+export type ScopeRef = string; // e.g. "file:src/cache/a.ts", "file:src/cache/*"
 /** Machine-checkable invariants. `constraints` (NL) is human prose; these are enforced. */
 export type ConstraintKind =
   | "forbid_public_api_break"
@@ -115,37 +115,37 @@ export interface Session extends BaseObject {
 }
 
 // ── operation ───────────────────────────────────────────────────────────────
-// Operations carry the full semantic envelope. `put_file` is whole-file (Phase 1);
-// `set_symbol` (Phase 2) edits one named top-level symbol so disjoint-symbol edits to
-// the same file auto-merge. The reducer keys contention on `keysOf(op)`.
+// Operations carry the full semantic envelope. The merge substrate is LANGUAGE-NEUTRAL
+// (docs/15): a file is text, merged by line-level 3-way merge. `put_file` writes whole
+// content; `edit_file` carries the content an agent produced together with the base it
+// was derived from, so concurrent disjoint edits to the same file auto-merge (merge3)
+// and only overlapping line ranges conflict. NO code-structure (symbol/AST) awareness.
+// The reducer keys contention on `keysOf(op)` — every file op keys on `file:<path>`.
 export type OperationKind =
-  | "put_file" // create or replace whole file content
+  | "put_file" // create or replace whole file content (no base → not 3-way mergeable)
+  | "edit_file" // new full content derived from a known base → line-level 3-way merge
   | "delete_file"
   | "rename_file" // identity-preserving move
-  | "set_symbol" // replace one named top-level symbol's text within a file
-  | "rename_symbol" // rename a top-level symbol (decl + same-file references)
-  | "move_symbol" // move a top-level symbol from one file to another
   | "note"; // metadata-only op (e.g. record an effect), never mutates the tree
 
 export interface OperationTarget {
   /** What conceptual entity this op changes. */
-  entityKind: "file" | "symbol" | "contract" | "config" | "test";
-  /** Stable entity id. file: the path. symbol: `<path>#<symbolName>`. */
+  entityKind: "file" | "contract" | "config" | "test";
+  /** Stable entity id — for files, the path. */
   entityId: string;
 }
 
 export interface OperationBody {
   kind: OperationKind;
-  /** put_file / rename_file / set_symbol destination path. */
+  /** put_file / edit_file / rename_file destination path. */
   path?: string;
   /** rename_file source path. */
   fromPath?: string;
-  /** put_file content, or set_symbol's new symbol text. */
+  /** put_file / edit_file new full file content (blob oid). */
   blobOid?: string;
-  /** set_symbol / rename_symbol: the top-level symbol name (the OLD name for rename). */
-  symbolName?: string;
-  /** rename_symbol: the new symbol name. */
-  newName?: string;
+  /** edit_file: the blob this edit was derived from — the 3-way merge base.
+   *  Empty/absent ⇒ base is the empty file. */
+  baseBlobOid?: string;
 }
 
 export interface Operation extends BaseObject {

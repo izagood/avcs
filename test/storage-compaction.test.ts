@@ -35,7 +35,7 @@ test("cold materialize from a persisted compaction base equals full reduce, then
     for (let i = 0; i < 8; i++) {
       await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: `f${i}.ts`, content: `export function g${i}(){ return 0 }\n`, declaredPurpose: `f${i}` });
     }
-    await repo.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "f0.ts", symbolName: "g0", newText: "export function g0(){ return 1 }", declaredPurpose: "edit" });
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "f0.ts", newText: "export function g0(){ return 1 }", declaredPurpose: "edit" });
     const expected = (await repo.materialize()).treeHash;
 
     // compact: persist the base snapshot.
@@ -54,7 +54,7 @@ test("cold materialize from a persisted compaction base equals full reduce, then
     assert.equal(fromBase, await fullTreeHash(dir), "and == an independent full reduce");
 
     // author MORE ops after compaction; the persisted base + delta must still equal full.
-    await cold.proposeSymbolEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "f0.ts", symbolName: "g0", newText: "export function g0(){ return 2 }", declaredPurpose: "edit2" });
+    await cold.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "f0.ts", newText: "export function g0(){ return 2 }", declaredPurpose: "edit2" });
     await cold.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "f9.ts", content: "export const z = 1\n", declaredPurpose: "f9" });
     const after = (await cold.materialize()).treeHash;
     assert.equal(after, await fullTreeHash(dir), "base + post-compaction delta == full");

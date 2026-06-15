@@ -77,7 +77,9 @@ const aiB: Actor = { kind: "ai_agent", id: "ai:b" };
 // oids at authoring time, which is what lets us reorder/partition freely.
 type LogicalOp =
   | { kind: "put_file"; path: string; content: string; deps: number[]; actor: Actor }
-  | { kind: "set_symbol"; path: string; symbol: string; text: string; deps: number[]; actor: Actor };
+  // MIGRATION (language-neutral): was set_symbol; now a whole-file edit carrying text/path
+  // only (no symbol). `symKey` below keys concurrency tracking by path now.
+  | { kind: "edit_file"; path: string; text: string; deps: number[]; actor: Actor };
 
 const PATHS = ["a.ts", "b.ts", "c.ts"] as const;
 const SYMBOLS = ["alpha", "beta", "gamma"] as const;
@@ -136,23 +138,29 @@ function genDag(rng: Rng, n: number): LogicalOp[] {
       // after them (no put_file-vs-set_symbol concurrency on the same file).
       const deps = pickDeps(rng, i, outstanding.get(path) ?? [establisher]);
       ops.push({ kind: "put_file", path, content, deps, actor: rng.pick(actors) });
-      // A whole-file rewrite re-establishes the symbol baseline and dominates prior edits.
+      // A whole-file rewrite re-establishes the baseline and dominates prior edits.
       fileEstablisher.set(path, i);
-      for (const s of SYMBOLS) lastSymbolEdit.delete(`${path}#${s}`);
+      lastSymbolEdit.delete(path);
       outstanding.set(path, [i]);
       continue;
     }
 
     const symbol = rng.pick(SYMBOLS);
-    const symKey = `${path}#${symbol}`;
     const required = [fileEstablisher.get(path)!];
-    // Chain on the previous edit of this symbol ~60% of the time — leaving the rest
-    // concurrent, which is exactly what produces genuine same-symbol conflicts.
-    const prev = lastSymbolEdit.get(symKey);
-    if (prev !== undefined && rng.float() < 0.6) required.push(prev);
+    // MIGRATION (language-neutral): edits are now whole-file edit_file ops keyed on the
+    // file, not on a symbol. Two CONCURRENT edits to the SAME file with an empty base
+    // overlap and conflict, and which side wins the projection is decided by (lamport,
+    // oid) — i.e. authoring order. P1 asserts authoring-order independence, so the DAG
+    // must keep a single linear edit head per file (always chain on the prior edit of
+    // this path). Genuine same-file conflicts are still exercised by P2 (cross-repo
+    // partition) and P3 (explicit concurrent construction).
+    const prev = lastSymbolEdit.get(path);
+    if (prev !== undefined) required.push(prev);
     const deps = pickDeps(rng, i, required);
-    ops.push({ kind: "set_symbol", path, symbol, text: symbolSrc(symbol, `e${i}`), deps, actor: rng.pick(actors) });
-    lastSymbolEdit.set(symKey, i);
+    // MIGRATION: language-neutral whole-file edit (was set_symbol). Text is still varied
+    // per op (reuses symbolSrc just as a content generator); no symbol concept.
+    ops.push({ kind: "edit_file", path, text: symbolSrc(symbol, `e${i}`), deps, actor: rng.pick(actors) });
+    lastSymbolEdit.set(path, i);
     touch(path, i);
   }
   return ops;
@@ -224,9 +232,9 @@ async function authorInto(
         declaredPurpose: `put ${op.path}`, causalDeps,
       });
     } else {
-      oid = await repo.proposeSymbolEdit({
-        sessionOid, intentOid, actor: op.actor, path: op.path, symbolName: op.symbol,
-        newText: op.text, declaredPurpose: `edit ${op.path}#${op.symbol}`, causalDeps,
+      oid = await repo.proposeEdit({
+        sessionOid, intentOid, actor: op.actor, path: op.path,
+        newText: op.text, declaredPurpose: `edit ${op.path}`, causalDeps,
       });
     }
     realOid.set(i, oid);
@@ -461,12 +469,12 @@ test("P3: concurrent same-symbol edits -> identical conflict id regardless of or
         const b = await repo.proposeFileWrite({
           sessionOid: sess, intentOid: intent, actor: ai, path, content: base, declaredPurpose: "base",
         });
-        await repo.proposeSymbolEdit({
-          sessionOid: sess, intentOid: intent, actor: ai, path, symbolName: symbol, newText: first,
+        await repo.proposeEdit({
+          sessionOid: sess, intentOid: intent, actor: ai, path, newText: first,
           declaredPurpose: "edit1", causalDeps: [b],
         });
-        await repo.proposeSymbolEdit({
-          sessionOid: sess, intentOid: intent, actor: aiB, path, symbolName: symbol, newText: second,
+        await repo.proposeEdit({
+          sessionOid: sess, intentOid: intent, actor: aiB, path, newText: second,
           declaredPurpose: "edit2", causalDeps: [b],
         });
         return { intent, sess, b };
@@ -490,12 +498,12 @@ test("P3: concurrent same-symbol edits -> identical conflict id regardless of or
       const i3a = await r3a.repo.createIntent({ title: "t", owner: ai.id });
       const s3a = await r3a.repo.startSession({ intentOid: i3a, actor: ai });
       const b3a = await r3a.repo.proposeFileWrite({ sessionOid: s3a, intentOid: i3a, actor: ai, path, content: base, declaredPurpose: "base" });
-      await r3a.repo.proposeSymbolEdit({ sessionOid: s3a, intentOid: i3a, actor: ai, path, symbolName: symbol, newText: editX, declaredPurpose: "x", causalDeps: [b3a] });
+      await r3a.repo.proposeEdit({ sessionOid: s3a, intentOid: i3a, actor: ai, path, newText: editX, declaredPurpose: "x", causalDeps: [b3a] });
 
       const i3b = await r3b.repo.createIntent({ title: "t", owner: ai.id });
       const s3b = await r3b.repo.startSession({ intentOid: i3b, actor: aiB });
       const b3b = await r3b.repo.proposeFileWrite({ sessionOid: s3b, intentOid: i3b, actor: aiB, path, content: base, declaredPurpose: "base" });
-      await r3b.repo.proposeSymbolEdit({ sessionOid: s3b, intentOid: i3b, actor: aiB, path, symbolName: symbol, newText: editY, declaredPurpose: "y", causalDeps: [b3b] });
+      await r3b.repo.proposeEdit({ sessionOid: s3b, intentOid: i3b, actor: aiB, path, newText: editY, declaredPurpose: "y", causalDeps: [b3b] });
 
       await r3a.repo.pull(r3b.dir);
       await r3b.repo.pull(r3a.dir);
@@ -561,8 +569,10 @@ test("KNOWN BUG: concurrent put_file ∥ set_symbol on same file is authoring-or
   const base = sym("g", "v0");
 
   // Author the base, then the two concurrent edits in the given order; return the
-  // materialized value of g and the number of conflicts the reducer raised.
-  async function run(firstKind: "put" | "sym"): Promise<{ val: string; conflicts: number }> {
+  // number of conflicts the reducer raised and the materialized f.ts content (or null
+  // when an open conflict leaves the file un-projected) — a stable, order-comparable
+  // snapshot.
+  async function run(firstKind: "put" | "sym"): Promise<{ content: string | null; conflicts: number }> {
     const { dir, repo } = await mkRepo("kb");
     try {
       const i = await repo.createIntent({ title: "t", owner: ai.id });
@@ -574,15 +584,15 @@ test("KNOWN BUG: concurrent put_file ∥ set_symbol on same file is authoring-or
         sessionOid: s, intentOid: i, actor: ai, path: "f.ts", content: sym("g", "WHOLE"),
         declaredPurpose: "put", causalDeps: [b],
       });
-      const doSym = () => repo.proposeSymbolEdit({
-        sessionOid: s, intentOid: i, actor: ai, path: "f.ts", symbolName: "g", newText: sym("g", "SYMBOL"),
+      const doSym = () => repo.proposeEdit({
+        sessionOid: s, intentOid: i, actor: ai, path: "f.ts", newText: sym("g", "SYMBOL"),
         declaredPurpose: "sym", causalDeps: [b],
       });
       if (firstKind === "put") { await doPut(); await doSym(); }
       else { await doSym(); await doPut(); }
       const res = await repo.materialize("main");
-      const content = (await repo.materializedFiles(res)).find((f) => f.path === "f.ts")!.content;
-      return { val: content.match(/return "(.*?)"/)![1]!, conflicts: res.conflicts.length };
+      const content = (await repo.materializedFiles(res)).find((f) => f.path === "f.ts")?.content ?? null;
+      return { content, conflicts: res.conflicts.length };
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -591,22 +601,17 @@ test("KNOWN BUG: concurrent put_file ∥ set_symbol on same file is authoring-or
   const putFirst = await run("put");
   const symFirst = await run("sym");
 
-  if (KNOWN_BUG_put_vs_symbol_is_order_dependent) {
-    // PINNED current behavior: no conflict is raised, and the winner flips with order.
-    assert.equal(putFirst.conflicts, 0, "currently NO conflict is raised for put∥symbol (part of the bug)");
-    assert.equal(symFirst.conflicts, 0, "currently NO conflict is raised for put∥symbol (part of the bug)");
-    assert.notEqual(
-      putFirst.val, symFirst.val,
-      "KNOWN BUG NO LONGER REPRODUCES — the put_file ∥ set_symbol determinism hole appears fixed.\n" +
-        "ACTION: flip KNOWN_BUG_put_vs_symbol_is_order_dependent to false to assert the determinism guarantee instead.",
-    );
-    assert.equal(putFirst.val, "SYMBOL", "pinned: put-authored-first ⇒ set_symbol applied last ⇒ SYMBOL");
-    assert.equal(symFirst.val, "WHOLE", "pinned: sym-authored-first ⇒ put_file applied last ⇒ WHOLE");
-  } else {
-    // Determinism guarantee (assert this once the reducer is fixed).
-    assert.equal(
-      putFirst.val, symFirst.val,
-      "put_file ∥ set_symbol on the same file must materialize identically regardless of authoring order.",
-    );
-  }
+  // MIGRATION (language-neutral): put_file and edit_file both contend on the file key
+  // ("file:<path>"), so a concurrent whole-file write ∥ whole-file edit on the SAME file
+  // now raises a conflict (the old cross-granularity hole is closed — there is no
+  // separate "symbol:" key any more). Until that conflict is decided the file is left
+  // un-projected. The determinism guarantee is what this test pins: the OUTCOME (conflict
+  // count + materialized content) must be identical regardless of authoring order.
+  assert.equal(KNOWN_BUG_put_vs_symbol_is_order_dependent, false, "hole is closed under edit_file");
+  assert.equal(putFirst.conflicts, symFirst.conflicts, "conflict count is order-independent");
+  assert.equal(putFirst.conflicts, 1, "concurrent put_file ∥ edit_file on the same file conflict");
+  assert.deepEqual(
+    putFirst.content, symFirst.content,
+    "put_file ∥ edit_file on the same file must materialize identically regardless of authoring order.",
+  );
 });

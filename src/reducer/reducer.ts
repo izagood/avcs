@@ -20,7 +20,7 @@ import type {
   Policy,
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
-import { spliceSymbol, renameSymbol, extractSymbol } from "../semantic/symbols.ts";
+import { merge3, type ConflictRegion } from "../merge/merge3.ts";
 import { ownersFor } from "../policy/owners.ts";
 
 export interface ConflictOption {
@@ -45,19 +45,6 @@ export interface Conflict {
   requiredOwners?: string[];
 }
 
-/**
- * A merge that is text-clean but meaning-broken: one op changed a public contract
- * while another depends on the old one. Detected (and escalated) by the repo's
- * semantic pass, not the core grouping.
- */
-export interface SemanticConflict {
-  kind: "contract_break";
-  symbol: string; // "<file>#<name>"
-  breakingOp: string;
-  dependentOps: string[];
-  reason: string;
-}
-
 /** A contest the policy resolved by itself — recorded so auto-merges are auditable. */
 export interface AutoDecision {
   key: string;
@@ -75,15 +62,16 @@ export interface ReductionResult {
   statuses: Map<string, OperationStatus>;
   conflicts: Conflict[];
   autoDecisions: AutoDecision[];
-  /** Text-clean but meaning-broken merges, escalated by the repo's semantic pass. */
-  semanticConflicts: SemanticConflict[];
+  /** Line-level text merge conflicts among concurrent edit_file ops, filled by the repo's
+   *  post-reduce pass (detectFileConflicts). reduce() itself leaves this empty. */
+  fileConflicts: FileConflict[];
   /** Frontier op ids: accepted ops that no other accepted op descends from. */
   headOps: string[];
   /**
-   * Content for blob oids synthesized during reduction (symbol-level merges produce
-   * file content that is not any single stored blob). oid → content. The caller
-   * persists or writes these directly. Synthetic oids are content-derived, so the
-   * treeHash that references them stays deterministic.
+   * Content for blob oids synthesized during reduction (a 3-way text merge produces file
+   * content that is not any single stored blob). oid → content. The caller persists or
+   * writes these directly. Synthetic oids are content-derived, so the treeHash that
+   * references them stays deterministic.
    */
   synthBlobs: Map<string, string>;
 }
@@ -96,7 +84,7 @@ export interface ReduceInput {
   policy: Policy;
   /** Which statuses get projected into the tree. Default: accepted only. */
   materializeStatuses?: OperationStatus[];
-  /** blob oid → content, for ops that need file text (set_symbol). */
+  /** blob oid → content, for ops that need file text (edit_file 3-way merge). */
   blobContent?: Map<string, string>;
   /** actorId → bounded reliability nudge (Phase 5 trust learning). */
   reliability?: Map<string, number>;
@@ -128,20 +116,13 @@ export function keysOf(op: Operation): string[] {
   const b = op.body;
   switch (b.kind) {
     case "put_file":
-      return [`file:${b.path ?? op.target.entityId}`];
+    case "edit_file":
     case "delete_file":
+      // Every file op contends on the file. Concurrent edit_file ops on the same file
+      // are 3-way text-merged at materialization; only overlapping line ranges conflict.
       return [`file:${b.path ?? op.target.entityId}`];
     case "rename_file":
       return [`file:${b.fromPath ?? op.target.entityId}`, `file:${b.path ?? op.target.entityId}`];
-    case "set_symbol":
-      // Symbol-granular: two edits to different symbols of the same file auto-merge.
-      return [`symbol:${b.path}#${b.symbolName}`];
-    case "rename_symbol":
-      // Contends on both the old and new symbol names within the file.
-      return [`symbol:${b.path}#${b.symbolName}`, `symbol:${b.path}#${b.newName}`];
-    case "move_symbol":
-      // Contends on the symbol at its source and its destination.
-      return [`symbol:${b.fromPath}#${b.symbolName}`, `symbol:${b.path}#${b.symbolName}`];
     case "note":
       return [];
   }
@@ -215,53 +196,53 @@ export function conflictIdFor(key: string): string {
   return `conflict_${sha256hex(key).slice(0, 24)}`;
 }
 
-export interface CrossConflict {
+/** A file whose concurrent edits overlapped at the line level — a genuine text merge
+ *  conflict. Language-neutral: detected purely by merge3 over the file's content. */
+export interface FileConflict {
   file: string;
-  ops: string[]; // the concurrent whole-file + symbol ops on that file
+  ops: string[]; // the concurrent edit_file ops whose hunks overlapped
+  regions: ConflictRegion[]; // the contested base line ranges + per-op options
 }
 
 /**
- * A whole-file op (put_file/delete/rename) and a set_symbol on the SAME file are keyed
- * differently (file:… vs symbol:…#…), so the reducer's grouping never makes them
- * contend. When they are CONCURRENT (neither a causal ancestor of the other), letting
- * both apply makes the result depend on kahnOrder's lamport (authoring-order) tie-break
- * — non-deterministic. This finds those pairs among ACCEPTED ops so the repo can hold
- * them back (re-reduce) and surface a conflict. Ancestor relations (scaffold→edit) are
- * intentionally not flagged.
+ * Detect line-level merge conflicts among CONCURRENT accepted edit_file ops on the same
+ * file. The reducer's grouping accepts all such ops (their disjoint hunks compose); this
+ * pass runs the authoritative N-way `merge3` over the file's concurrent frontier to find
+ * the ones whose hunks actually OVERLAP, so the repo can surface a Conflict / hold back.
+ *
+ * No language knowledge — merge3 compares lines. Ancestor relations (an edit built on a
+ * prior edit) are not concurrent and never flagged. Deterministic over canonical order.
  */
-export function detectCrossGranularity(ops: Operation[], result: ReductionResult): CrossConflict[] {
+export function detectFileConflicts(
+  ops: Operation[],
+  result: ReductionResult,
+  blobContent: Map<string, string>,
+): FileConflict[] {
   const anc = ancestry(ops);
-  const fileOf = (o: Operation): string | null => {
-    const b = o.body;
-    if (b.kind === "put_file" || b.kind === "delete_file") return b.path ?? o.target.entityId;
-    if (b.kind === "rename_file") return b.fromPath ?? o.target.entityId;
-    if (b.kind === "set_symbol") return b.path ?? null;
-    return null;
-  };
-  const isWhole = (o: Operation) =>
-    o.body.kind === "put_file" || o.body.kind === "delete_file" || o.body.kind === "rename_file";
+  const resolve = (oid: string | undefined): string => (oid ? blobContent.get(oid) ?? "" : "");
   const byFile = new Map<string, Operation[]>();
   for (const o of ops) {
+    if (o.body.kind !== "edit_file") continue;
     if (result.statuses.get(o.oid as string) !== "accepted") continue;
-    const f = fileOf(o);
-    if (f) (byFile.get(f) ?? byFile.set(f, []).get(f)!).push(o);
+    const f = o.body.path ?? o.target.entityId;
+    (byFile.get(f) ?? byFile.set(f, []).get(f)!).push(o);
   }
-  const out: CrossConflict[] = [];
+  const out: FileConflict[] = [];
   for (const [file, fops] of byFile) {
-    const whole = fops.filter(isWhole);
-    const syms = fops.filter((o) => o.body.kind === "set_symbol");
-    if (!whole.length || !syms.length) continue;
-    const involved = new Set<string>();
-    for (const w of whole)
-      for (const s of syms) {
-        const wId = w.oid as string;
-        const sId = s.oid as string;
-        if (!anc.get(wId)?.has(sId) && !anc.get(sId)?.has(wId)) {
-          involved.add(wId);
-          involved.add(sId);
-        }
-      }
-    if (involved.size) out.push({ file, ops: [...involved].sort() });
+    // Concurrent frontier: ops not a causal ancestor of another edit on this file.
+    const frontier = fops.filter(
+      (o) => !fops.some((p) => p !== o && anc.get(p.oid as string)?.has(o.oid as string)),
+    );
+    if (frontier.length < 2) continue; // linear chain ⇒ no concurrency ⇒ no conflict
+    const ordered = [...frontier].sort((a, b) => a.lamport - b.lamport || cmp(a.oid, b.oid));
+    // Common 3-way base: the content all variants were derived from. Use the shared
+    // baseBlobOid when they agree (the normal case); else the lexically-first for a
+    // deterministic, conservative comparison.
+    const baseOid = [...new Set(ordered.map((o) => o.body.baseBlobOid ?? ""))].sort()[0] ?? "";
+    const base = resolve(baseOid);
+    const variants = ordered.map((o) => resolve(o.body.blobOid));
+    const m = merge3(base, variants);
+    if (!m.clean) out.push({ file, ops: ordered.map((o) => o.oid as string), regions: m.conflicts });
   }
   return out;
 }
@@ -333,21 +314,18 @@ function pathsOf(op: Operation): string[] {
   const b = op.body;
   switch (b.kind) {
     case "put_file":
+    case "edit_file":
     case "delete_file":
-    case "set_symbol":
-    case "rename_symbol":
       return [b.path ?? op.target.entityId];
     case "rename_file":
-      return [b.fromPath ?? op.target.entityId, b.path ?? op.target.entityId];
-    case "move_symbol":
       return [b.fromPath ?? op.target.entityId, b.path ?? op.target.entityId];
     case "note":
       return [];
   }
 }
-/** rename_file/move_symbol read a SOURCE path's live content, coupling two paths. */
+/** rename_file reads a SOURCE path's live content, coupling two paths. */
 function isCrossPath(op: Operation): boolean {
-  return op.body.kind === "rename_file" || op.body.kind === "move_symbol";
+  return op.body.kind === "rename_file";
 }
 
 /** Keep only the synth-blob entries the final tree actually references (drops the
@@ -492,7 +470,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
     input.blobContent ?? new Map<string, string>(),
   );
 
-  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs };
   const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: groups.size, groupsReused: 0, dirtyKeys: groups.size };
   return { input, result, perKey, groupOrder, groupMembers, stats };
 }
@@ -696,7 +674,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     dirtyPaths,
   );
 
-  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, semanticConflicts: [], headOps, synthBlobs };
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs };
   const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: recomputed, groupsReused: reused, dirtyKeys: dirty.size };
   return { input: next, result, perKey, groupOrder, groupMembers, stats };
 }
@@ -731,7 +709,7 @@ export function serializeSnapshot(snap: ReduceSnapshot): unknown {
       statuses: mapToEntries(r.statuses),
       conflicts: r.conflicts,
       autoDecisions: r.autoDecisions,
-      semanticConflicts: r.semanticConflicts,
+      fileConflicts: r.fileConflicts,
       headOps: r.headOps,
       synthBlobs: mapToEntries(r.synthBlobs),
     },
@@ -763,7 +741,7 @@ export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
     statuses: entriesToMap(r.statuses as Entries<OperationStatus>),
     conflicts: r.conflicts as Conflict[],
     autoDecisions: r.autoDecisions as AutoDecision[],
-    semanticConflicts: r.semanticConflicts as ReductionResult["semanticConflicts"],
+    fileConflicts: r.fileConflicts as ReductionResult["fileConflicts"],
     headOps: r.headOps as string[],
     synthBlobs: entriesToMap(r.synthBlobs as Entries<string>),
   };
@@ -825,6 +803,17 @@ function decideGroup(
   const viable = remaining.filter((o) => !blocked.includes(o));
 
   const needsHuman = viable.some((o) => evalOf(o, inConflict).requiresHuman);
+
+  // Concurrent TEXT edits (all edit_file) auto-merge: accept all. Their disjoint line
+  // hunks compose deterministically (merge3); an actual line overlap is surfaced by
+  // detectFileConflicts over the full op set, NOT resolved by dropping a sibling here.
+  // (A winner-pick would silently lose the loser's non-overlapping changes.) When a
+  // human is required (e.g. declared API break) we still fall through to escalation.
+  if (viable.length > 1 && !needsHuman && viable.every((o) => o.body.kind === "edit_file")) {
+    for (const o of viable) out.set(o.oid as string, "accepted");
+    return out;
+  }
+
   const ranked = [...viable].sort((a, b) => {
     const d = evalOf(b, inConflict).score - evalOf(a, inConflict).score;
     if (d !== 0) return d;
@@ -944,6 +933,22 @@ function applyOp(
     case "put_file":
       if (b.path && b.blobOid) tree.set(b.path, b.blobOid);
       break;
+    case "edit_file": {
+      if (!b.path || !b.blobOid) break;
+      const opNew = resolve(b.blobOid);
+      const opBase = b.baseBlobOid ? resolve(b.baseBlobOid) : "";
+      const currentOid = tree.get(b.path);
+      const current = currentOid !== undefined ? resolve(currentOid) : opBase;
+      // Apply this op's patch (opBase→opNew) onto the accumulated content. Disjoint
+      // line changes compose (order-independent); an overlap with a prior concurrent op
+      // keeps `current` (deterministic incumbent) — the overlap is reported separately
+      // by detectFileConflicts over the full op set. Language-neutral: pure text.
+      const m = merge3(opBase, [current, opNew], { onConflict: "first" });
+      const synthOid = `blob_${sha256hex(m.merged).slice(0, 32)}`;
+      synthBlobs.set(synthOid, m.merged);
+      tree.set(b.path, synthOid);
+      break;
+    }
     case "delete_file":
       tree.delete(b.path ?? op.target.entityId);
       break;
@@ -956,42 +961,6 @@ function applyOp(
         }
       }
       break;
-    case "set_symbol": {
-      if (!b.path || !b.symbolName || !b.blobOid) break;
-      const currentOid = tree.get(b.path);
-      const current = currentOid !== undefined ? resolve(currentOid) : "";
-      const merged = spliceSymbol(current, b.symbolName, resolve(b.blobOid));
-      const synthOid = `blob_${sha256hex(merged).slice(0, 32)}`;
-      synthBlobs.set(synthOid, merged);
-      tree.set(b.path, synthOid);
-      break;
-    }
-    case "rename_symbol": {
-      if (!b.path || !b.symbolName || !b.newName) break;
-      const currentOid = tree.get(b.path);
-      if (currentOid === undefined) break;
-      const renamed = renameSymbol(resolve(currentOid), b.symbolName, b.newName);
-      const synthOid = `blob_${sha256hex(renamed).slice(0, 32)}`;
-      synthBlobs.set(synthOid, renamed);
-      tree.set(b.path, synthOid);
-      break;
-    }
-    case "move_symbol": {
-      if (!b.fromPath || !b.path || !b.symbolName) break;
-      const fromOid = tree.get(b.fromPath);
-      if (fromOid === undefined) break;
-      const extracted = extractSymbol(resolve(fromOid), b.symbolName);
-      if (!extracted) break;
-      const toContent = tree.get(b.path) !== undefined ? resolve(tree.get(b.path)!) : "";
-      const newTo = spliceSymbol(toContent, b.symbolName, extracted.text);
-      const fromSynth = `blob_${sha256hex(extracted.rest).slice(0, 32)}`;
-      const toSynth = `blob_${sha256hex(newTo).slice(0, 32)}`;
-      synthBlobs.set(fromSynth, extracted.rest);
-      synthBlobs.set(toSynth, newTo);
-      tree.set(b.fromPath, fromSynth);
-      tree.set(b.path, toSynth);
-      break;
-    }
     case "note":
       break;
   }
