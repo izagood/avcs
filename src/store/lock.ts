@@ -6,7 +6,7 @@
 // exactly one caller wins the directory creation. A stale lock (holder crashed) is
 // reclaimed after `staleMs`. Always released in a finally.
 
-import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rm, rename } from "node:fs/promises";
 import { join } from "node:path";
 
 function sleep(ms: number): Promise<void> {
@@ -39,7 +39,14 @@ export async function withLock<T>(
   for (;;) {
     try {
       await mkdir(lockPath); // atomic; EEXIST if already held
-      await writeFile(ownerFile, `${process.pid}:${Date.now()}`, "utf8");
+      // Publish the owner stamp atomically: a waiter must never read a half-written
+      // owner file. A torn read (e.g. "pid:" with the timestamp truncated) parses to
+      // a tiny number that looks ancient, which would wrongly reclaim a *live* lock
+      // and double-grant. writeFile is not atomic, so write-then-rename instead:
+      // a reader sees either no owner file (ENOENT → fresh) or the full stamp.
+      const tmpOwner = join(lockPath, `owner.${process.pid}.tmp`);
+      await writeFile(tmpOwner, `${process.pid}:${Date.now()}`, "utf8");
+      await rename(tmpOwner, ownerFile);
       break;
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
@@ -51,8 +58,11 @@ export async function withLock<T>(
       // Held by someone — reclaim if stale, else back off.
       let stale = false;
       try {
-        const ts = Number((await readFile(ownerFile, "utf8")).split(":")[1] ?? "0");
-        if (Date.now() - ts > staleMs) stale = true;
+        const ts = Number((await readFile(ownerFile, "utf8")).split(":")[1]);
+        // Only a valid, genuinely-old stamp counts as stale. A missing/garbled stamp
+        // (NaN, ≤0, or a future time from a skewed clock) means acquire-in-progress
+        // or just-written → treat as fresh, never reclaim.
+        if (Number.isFinite(ts) && ts > 0 && Date.now() - ts > staleMs) stale = true;
       } catch {
         // owner file not written yet (acquire-in-progress) → treat as fresh
       }
