@@ -19,7 +19,7 @@ state = reduce(base, operationDAG, decisions, policy, materializer)
 
 The same objects + the same policy + the same materializer produce the same tree on any replica. Merging is not text selection; it is a pure, deterministic reduction.
 
-> **Status:** research prototype. The implementation is real and test-covered, but every phase is built to a *working-MVP depth* (file/symbol-level merge, ed25519 signing, heuristic contract analysis). Production-grade tree-sitter integration, multi-signature trust, and hardened distributed sync are tracked on the [roadmap](docs/07-roadmap.md).
+> **Status:** research prototype. The implementation is real and test-covered, but every phase is built to a *working-MVP depth* (language-neutral text 3-way merge, ed25519 signing). Structure-aware merge, semantic-break detection, multi-signature trust, and hardened distributed sync are tracked on the [roadmap](docs/07-roadmap.md).
 
 ## Core principles
 
@@ -54,9 +54,9 @@ Every meaningful thing is a content-addressed, append-only object. Code is a *pr
 
 AVCS never falls back to last-write-wins for code. Contending operations are graded and resolved with a recorded rationale:
 
-- **L0 / L1** — different entities, or the same file but different **symbols** → **auto-merge**
-- **L2** — concurrent edits to the same slot → **policy auto-decision** (human-preferred, trust-weighted); the auto-decision is itself recorded in `autoDecisions`
-- **L3** — a behavior change with no *trusted* evidence → **blocked**; an undeclared contract change with live callers → **semantic conflict, auto-escalated**
+- **L0 / L1** — different entities, or **disjoint line regions** in the same file → **auto-merge**
+- **L2** — concurrent edits that overlap the same line region → **policy auto-decision** (human-preferred, trust-weighted); the auto-decision is itself recorded in `autoDecisions`
+- **L3** — a behavior change with no *trusted* evidence → **blocked**
 - **L4** — a public-API break → **requires a human decision**, routed to the scope's owners
 
 Evidence trust matters: an operation's own author cannot vouch for it. Evidence-gating and the passing-test bonus only count evidence produced by a *non-authoring, trusted* actor (CI bot / human).
@@ -69,22 +69,22 @@ The reducer and policy engine are the foundation; the higher phases build distri
 
 - **Storage core** — append-only, content-addressed object store (`.avcs/objects`)
 - **Deterministic reducer + policy engine** — the L0–L4 conflict grading above, with a priority ladder, bounded reliability nudges, and auditable auto-decisions
-- **Symbol-level merge** (Phase 2) — a pluggable `EntityIndexer` (MVP: a TS/JS brace scanner; Tree-sitter backend can drop in) so two edits to different functions in one file auto-merge
+- **Language-neutral text merge** (Phase 2) — a deterministic N-way line-level 3-way merge (`src/merge/merge3.ts`), so edits to disjoint regions of one file auto-merge regardless of language; overlapping edits become a policy-resolved conflict region. No language parsing in the core
 - **Cryptographic trust** (Phase 3) — ed25519-signed evidence/decision; forged signatures fail the trust gate. Real validation runner, `WorkLease`, `RepairContext`
-- **Semantic conflict detection + decision memory** (Phase 4) — signature-drift detection, recallable decisions and learned policies
+- **Decision memory** (Phase 4) — recallable prior human decisions (`recallDecisions`) and distilled "learned policies" that bias future auto-resolution
 - **Policy depth** (Phase 5) — code-owner routing and bounded reliability learning
 - **Release & provenance** (Phase 6) — verified checkpoints + CycloneDX SBOM + signed artifacts
 
 **Collaboration, scale & security (Phases 7–12)**
 
 - **Phase 7 — multi-machine:** membership/roles (signed key federation), `pull` (object gossip; two replicas converge to the same `treeHash`), protection + `finalize` CAS (non-fast-forward rejected, so a stale push can't overwrite fresh history)
-- **Phase 8 — lineage:** long-lived divergent lines (e.g. v1.x ∥ v2.x, same symbol, different content, zero conflict), `portOp` (backport = cherry-pick)
+- **Phase 8 — lineage:** long-lived divergent lines (e.g. v1.x ∥ v2.x, same path, different content, zero conflict), `portOp` (backport = cherry-pick)
 - **Phase 9 — scale:** entity index, `materializeAt` (time travel), chunked large-blob storage with dedup
 - **Phase 10 — observability:** `blame` (who/why), `logP`, deterministic `bisect`, `diff`
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (21 tools); humans use the **CLI**. The behavior is pinned by a 148-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (21 tools); humans use the **CLI**. The behavior is pinned by a 176-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -200,8 +200,7 @@ AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
 | `src/reducer/reducer.ts` | Operation graph → code tree reduction + conflict grading |
 | `src/reducer/policy.ts` | Policy engine (priority ladder, reliability nudge) |
 | `src/reducer/incremental.ts` | Incremental re-reduce (reuse clean groups) |
-| `src/semantic/symbols.ts` | Symbol parser (`EntityIndexer`) — symbol-level merge (Phase 2) |
-| `src/semantic/contract.ts` | Signature analysis + semantic conflict detection (Phase 4) |
+| `src/merge/merge3.ts` | Language-neutral N-way line-level 3-way text merge (Phase 2) |
 | `src/policy/owners.ts`, `reliability.ts` | Code-owner routing · reliability learning (Phase 5) |
 | `src/validation/runner.ts`, `repair.ts` | Validation runner · RepairContext (Phase 3) |
 | `src/concurrency/lease.ts` | WorkLease (Phase 3) |
