@@ -7,9 +7,14 @@ name: release
 #   1. in a PR, bump "version" in package.json (e.g. 0.1.0 -> 0.1.1)
 #   2. merge the PR into main
 #
-# The workflow only triggers when package.json changes, and the publish steps are
-# guarded so they run *only* when the version is not yet on the registry — so
-# unrelated package.json edits (deps, scripts, metadata) are safe no-ops.
+# The workflow runs on every push to main (post-merge only — PRs never push to
+# main), and the publish steps are guarded so they run *only* when package.json's
+# version is not yet on the registry. So a merge that doesn't change the version
+# is a safe no-op, and — crucially — a *follow-up* code-only fix to a release that
+# failed mid-flight will re-trigger the workflow and finish publishing the still-
+# unpublished version, with no manual re-run needed. (We deliberately do NOT gate
+# this on the CI workflow via `workflow_run`: that fires on PR CI too, which would
+# risk publishing un-merged code.)
 #
 # Publishing requires an `NPM_TOKEN` repository secret (an npm automation token
 # with publish rights to the @izagood scope). `npm publish` runs the
@@ -19,8 +24,6 @@ name: release
 on:
   push:
     branches: [main]
-    paths:
-      - "package.json"
 
 # Never run two publishes at once.
 concurrency:
