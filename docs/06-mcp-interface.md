@@ -17,12 +17,25 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 | `avcs.decision.record` | 사람/owner의 충돌 해결 기록 |
 | `avcs.checkpoint.create` | 검증된 상태 벡터 동결 |
 
-실행:
+실행 — `avcs mcp`가 stdio MCP 서버를 띄운다(이것이 에이전트가 spawn하는 1급 진입점):
 ```bash
-npm install                       # @modelcontextprotocol/sdk (optionalDependency)
-AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
+# 전역 설치본 / 소스 체크아웃 어디서든
+avcs mcp                          # 대상 저장소 = $AVCS_REPO, 없으면 현재 cwd
+AVCS_REPO=/path/to/repo avcs mcp  # 특정 저장소에 고정
+
+# 소스 체크아웃에서 직접 실행할 때
+npm run mcp                       # = node --experimental-strip-types src/mcp/server.ts
 ```
-SDK 미설치 시 서버는 친절한 안내 후 종료한다(tool 표면 정의는 코드에 그대로 존재).
+
+Claude Code에 등록:
+```bash
+avcs mcp install                  # `claude mcp add avcs -- avcs mcp` 를 대신 실행 (scope: user)
+avcs mcp install -s local --repo /path/to/repo   # 스코프/대상 저장소 지정
+claude mcp list                   # "avcs" 가 Connected 인지 확인
+```
+`claude` CLI가 PATH에 없으면 `avcs mcp install`이 그대로 실행할 수 있는 수동 등록 명령을 출력한다.
+
+`@modelcontextprotocol/sdk`는 optionalDependency라 `avcs` 설치 시 기본 동봉된다. 만약 누락됐다면 서버는 재설치 안내 후 종료한다(tool 표면 정의는 코드에 그대로 존재).
 
 ## 에이전트 워크플로우
 
