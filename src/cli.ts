@@ -12,6 +12,7 @@
 //   avcs materialize [view] [--out <dir>]
 //   avcs checkpoint <view> [-m <summary>]
 //   avcs show <oid>
+//   avcs mcp [install]
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -558,6 +559,47 @@ async function main(): Promise<void> {
       console.log(JSON.stringify(await store.get(oid), null, 2));
       break;
     }
+    case "mcp": {
+      // AVCS's primary, agent-facing interface. `avcs mcp` boots the stdio MCP server
+      // (this is what Claude/agents spawn); `avcs mcp install` registers it with the
+      // Claude Code CLI. The server loads `@modelcontextprotocol/sdk` lazily, so all the
+      // commands above keep working even when that optionalDependency is absent.
+      const sub = args[1] && !args[1].startsWith("-") ? args[1] : undefined;
+      if (sub === "install") {
+        // Mirror `install-hooks`: the registered command re-invokes the EXACT binary the
+        // user is running now — node + any --experimental-strip-types flag + this script —
+        // so it works for a global install and a source checkout alike.
+        const scope = flag("-s") ?? flag("--scope") ?? "user";
+        const repoDir = flag("--repo");
+        const serverArgv = [process.execPath, ...process.execArgv, process.argv[1]!, "mcp"];
+        const addArgs = ["mcp", "add", "avcs", "-s", scope];
+        if (repoDir) addArgs.push("-e", `AVCS_REPO=${repoDir}`);
+        addArgs.push("--", ...serverArgv);
+        const pretty = `claude ${addArgs.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`;
+        const { execFileSync } = await import("node:child_process");
+        try {
+          execFileSync("claude", addArgs, { stdio: "inherit" });
+          console.log(`\nregistered avcs MCP server (scope: ${scope}). Verify with \`claude mcp list\`.`);
+        } catch (e) {
+          const enoent = (e as NodeJS.ErrnoException)?.code === "ENOENT";
+          console.error(
+            (enoent
+              ? "Claude Code CLI ('claude') not found on PATH. Register it manually:"
+              : "`claude mcp add` failed. You can register it manually:") + `\n\n  ${pretty}\n`,
+          );
+          process.exitCode = 1;
+        }
+        break;
+      }
+      if (sub) {
+        console.error(`unknown mcp subcommand: ${sub} — use \`avcs mcp\` to serve or \`avcs mcp install\` to register`);
+        process.exitCode = 1;
+        break;
+      }
+      const { startMcpServer } = await import("./mcp/server.ts");
+      await startMcpServer();
+      break;
+    }
     case "help":
     default:
       console.log(
@@ -592,6 +634,8 @@ async function main(): Promise<void> {
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +
           "  release [view] [-m msg]     cut a verified release + SBOM\n" +
           "  show <oid>                  dump an object\n" +
+          "  mcp                         run the agent-facing MCP server over stdio (primary interface)\n" +
+          "  mcp install [-s scope] [--repo d]  register avcs with the Claude Code CLI (`claude mcp add`)\n" +
           "  version | --version | -v    print the avcs version\n" +
           "  help | --help | -h          show this help\n",
       );
