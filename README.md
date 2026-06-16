@@ -114,6 +114,23 @@ avcs conflicts    # decisions a human still owes
 avcs log          # operation history
 ```
 
+### Connect agents (MCP)
+
+Agents drive AVCS through its MCP server. Once `avcs` is installed, register it with the Claude Code CLI:
+
+```bash
+avcs mcp install            # runs `claude mcp add avcs -- avcs mcp` for you (scope: user)
+claude mcp list             # confirm "avcs" is Connected
+```
+
+`avcs mcp` itself is the stdio server agents spawn (target repo = `$AVCS_REPO`, else the cwd). To register by hand — or for any other MCP client — point it at `avcs mcp`:
+
+```bash
+claude mcp add avcs -- avcs mcp
+```
+
+The MCP SDK ships as an optionalDependency, so a normal install includes it; no extra step needed.
+
 To upgrade later, re-run `npm install -g @izagood/avcs@latest`; to remove it, `npm uninstall -g @izagood/avcs` (your repo data is left intact).
 
 ### Install from source
@@ -182,9 +199,9 @@ node --experimental-strip-types src/cli.ts status
 node --experimental-strip-types src/cli.ts conflicts
 node --experimental-strip-types src/cli.ts log
 
-# Agent-facing MCP server (requires the optional dependency)
+# Agent-facing MCP server (`avcs mcp` once installed; ships the SDK as an optionalDependency)
 npm install
-AVCS_REPO=$(pwd) node --experimental-strip-types src/mcp/server.ts
+AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/server.ts
 ```
 
 > Type checking (`tsc --noEmit`) needs `npm install`; the runtime itself has no dependencies.

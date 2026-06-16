@@ -361,7 +361,13 @@ export const TOOLS: ToolDef[] = [
   },
 ];
 
-async function main(): Promise<void> {
+/**
+ * Boot the AVCS MCP server on stdio. This is the function the CLI's `avcs mcp`
+ * subcommand and the direct entrypoint below both call. It loads the optional
+ * `@modelcontextprotocol/sdk` lazily so importing this module (e.g. from tests, to
+ * exercise the tool handlers) — and the rest of the CLI — never depends on the SDK.
+ */
+export async function startMcpServer(): Promise<void> {
   let sdk: typeof import("@modelcontextprotocol/sdk/server/index.js");
   let stdio: typeof import("@modelcontextprotocol/sdk/server/stdio.js");
   let typesMod: typeof import("@modelcontextprotocol/sdk/types.js");
@@ -372,7 +378,8 @@ async function main(): Promise<void> {
   } catch {
     console.error(
       "[avcs-mcp] @modelcontextprotocol/sdk is not installed.\n" +
-        "          Run `npm install` (it is an optionalDependency), then start again.\n" +
+        "          It ships as an optionalDependency; reinstall avcs (e.g. `npm i -g @izagood/avcs`)\n" +
+        "          or run `npm i @modelcontextprotocol/sdk` in this package, then start again.\n" +
         "          Tool surface is defined in src/mcp/server.ts regardless.",
     );
     process.exit(1);
@@ -400,9 +407,9 @@ async function main(): Promise<void> {
 }
 
 // Only start the stdio server when run as the entry point — importing this module
-// (e.g. from tests, to exercise the tool handlers) must not boot the server.
+// (e.g. from tests, or the CLI dispatching `avcs mcp`) must not boot the server.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((e) => {
+  startMcpServer().catch((e) => {
     console.error(e);
     process.exit(1);
   });

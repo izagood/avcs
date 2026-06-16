@@ -15,9 +15,10 @@
     "sourceMap": true,
     "rewriteRelativeImportExtensions": true
   },
-  // The MCP server is coupled to the optional `@modelcontextprotocol/sdk` dependency and
-  // is a standalone dev entrypoint, not part of the consumable library — keep it out of
-  // the published artifact so the package has zero optional-dep coupling.
+  // The MCP server (src/mcp/**) IS part of the shipped artifact: it is avcs's primary,
+  // agent-facing interface, reached via `avcs mcp`. It only loads `@modelcontextprotocol/sdk`
+  // (an optionalDependency) lazily at runtime, so the core library import paths stay dep-free
+  // even though dist/mcp/server.js is present. `demo.ts` and tests are still dev-only.
   "include": ["src/**/*.ts"],
-  "exclude": ["src/mcp/**", "src/demo.ts", "test/**", "**/*.test.ts", "bench/**"]
+  "exclude": ["src/demo.ts", "test/**", "**/*.test.ts", "bench/**"]
 }
