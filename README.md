@@ -250,6 +250,15 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 
 This is an early-stage research prototype and the design is still moving. Issues and discussion are welcome — if you're proposing a change, the design docs above are the best starting point for the rationale behind the current model. Please run `npm test` and `npm run typecheck` before opening a pull request.
 
+### Filing an issue
+
+Hit something you'd like changed while using AVCS? Please open an issue rather than sending free-form feedback — structured reports are far easier to act on. Two templates are provided under [`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE):
+
+- **🔧 Change request** — propose a change to existing behavior, the CLI/MCP interface, defaults, or docs.
+- **🐞 Bug report** — something behaves incorrectly, crashes, or produces a non-deterministic result.
+
+> 🌐 **Any language is welcome.** File your issue in whatever language you're most comfortable with — English, 한국어, 日本語, etc. Maintainers will translate as needed; don't let language be a barrier to reporting.
+
 Every push and pull request to `main` runs CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `npm ci` → `npm run typecheck` → `npm test` on Node 22.x and 24.x. PRs are merged only when CI is green.
 
 ## License

@@ -1,0 +1,79 @@
+name: 🔧 Change request
+description: Propose a change to existing behavior, the CLI/MCP interface, defaults, or docs after using AVCS.
+title: "[change] <short summary>"
+labels: ["change-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to propose a change! 🙏
+
+        > 🌐 **Any language is welcome.** Write this issue in whatever language you're most comfortable with — English, 한국어, 日本語, etc. Maintainers will translate as needed. Don't let language stop you from filing.
+
+        Before filing, please skim the [design docs](https://github.com/izagood/avcs/tree/main/docs) — they explain the rationale behind the current model and often answer "why is it like this?".
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+      description: What does AVCS do today that you'd like changed? Be concrete — command, flag, output, or doc section.
+      placeholder: |
+        e.g. `avcs status` prints conflict counts but not which entity IDs are involved.
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior
+      description: What should it do instead?
+      placeholder: |
+        e.g. `avcs status --verbose` should list the entity IDs for each unresolved conflict.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why / use case
+      description: What problem does this solve? Who benefits, and how often does it come up?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      multiple: true
+      options:
+        - CLI (avcs <command>)
+        - MCP server / agent tools
+        - Reducer / policy / conflict grading
+        - Merge (merge3)
+        - Storage / object model
+        - Hub / multi-machine sync
+        - Library API (@izagood/avcs)
+        - Docs / README
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're using today, or other approaches you weighed?
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: AVCS version
+      description: Output of `avcs version` (or the commit / npm version you're on).
+      placeholder: "e.g. 0.2.0"
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I read (or skimmed) the relevant design doc under /docs.
+          required: false
