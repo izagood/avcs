@@ -15,8 +15,13 @@ async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "avcs-"));
   const repo = await Repo.init(dir);
   const root = generateKeypair();
+  // Retain each member's private key so decisions can be signed: registering a
+  // membership puts the member's public key in the keyring, so (issue #15) a
+  // decision by that member is only trusted when signed by their key.
+  const keys: Record<string, string> = {};
   const mk = async (id: string, role: "reviewer" | "admin" | "proposer") => {
     const k = generateKeypair();
+    keys[id] = k.privateKey;
     await repo.registerMembership({ actorId: id, publicKey: k.publicKey, role, actorKind: "human", root: { keyId: "root", privateKey: root.privateKey } });
   };
   await mk("human:reviewer", "reviewer");
@@ -29,14 +34,14 @@ async function setup() {
   const opA = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("A"), declaredPurpose: "A", causalDeps: [base] });
   const opB = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "mod.ts", newText: greet("B"), declaredPurpose: "B", causalDeps: [base] });
   const conflict = (await repo.materialize()).conflicts[0]!;
-  return { dir, repo, conflict, opA, opB };
+  return { dir, repo, conflict, opA, opB, keys };
 }
 
 test("higher-authority decision wins a contradiction (not wall-clock)", async () => {
-  const { dir, repo, conflict, opA, opB } = await setup();
+  const { dir, repo, conflict, opA, opB, keys } = await setup();
   // reviewer decides A first; admin later decides B. Authority (admin>reviewer) wins → B.
-  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opA], rejectedOps: [opB], reason: "reviewer picks A", decidedBy: { kind: "human", id: "human:reviewer" } });
-  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opB], rejectedOps: [opA], reason: "admin overrides to B", decidedBy: { kind: "human", id: "human:admin" } });
+  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opA], rejectedOps: [opB], reason: "reviewer picks A", decidedBy: { kind: "human", id: "human:reviewer" }, signWith: { keyId: "human:reviewer", privateKey: keys["human:reviewer"]! } });
+  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opB], rejectedOps: [opA], reason: "admin overrides to B", decidedBy: { kind: "human", id: "human:admin" }, signWith: { keyId: "human:admin", privateKey: keys["human:admin"]! } });
   const res = await repo.materialize();
   assert.equal(res.statuses.get(opB), "accepted", "admin (higher authority) wins");
   assert.equal(res.statuses.get(opA), "rejected");
@@ -44,10 +49,10 @@ test("higher-authority decision wins a contradiction (not wall-clock)", async ()
 });
 
 test("authority beats recency even when the lower-authority decision is later", async () => {
-  const { dir, repo, conflict, opA, opB } = await setup();
+  const { dir, repo, conflict, opA, opB, keys } = await setup();
   // admin decides A first; reviewer decides B LATER. Authority should still pick A.
-  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opA], rejectedOps: [opB], reason: "admin picks A", decidedBy: { kind: "human", id: "human:admin" } });
-  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opB], rejectedOps: [opA], reason: "reviewer (later) picks B", decidedBy: { kind: "human", id: "human:reviewer" } });
+  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opA], rejectedOps: [opB], reason: "admin picks A", decidedBy: { kind: "human", id: "human:admin" }, signWith: { keyId: "human:admin", privateKey: keys["human:admin"]! } });
+  await repo.recordDecision({ conflictId: conflict.id, chosenOps: [opB], rejectedOps: [opA], reason: "reviewer (later) picks B", decidedBy: { kind: "human", id: "human:reviewer" }, signWith: { keyId: "human:reviewer", privateKey: keys["human:reviewer"]! } });
   const res = await repo.materialize();
   assert.equal(res.statuses.get(opA), "accepted", "admin wins despite reviewer being later");
   await rm(dir, { recursive: true, force: true });

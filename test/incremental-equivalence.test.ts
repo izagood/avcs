@@ -60,14 +60,14 @@ interface Generated {
   evidence: Evidence[];
   decisions: Decision[];
   intents: Map<string, Intent>;
-  blobContent: Map<string, string>;
+  blobContent: Map<string, Buffer>;
   authority: Map<string, number>;
 }
 
 /** Generate a random valid op DAG + evidence + decisions over a tiny entity space. */
 function generate(rng: Rng, n: number): Generated {
   const ops: Operation[] = [];
-  const blobContent = new Map<string, string>();
+  const blobContent = new Map<string, Buffer>();
   const intents = new Map<string, Intent>();
   for (const k of [0, 1]) {
     const oid = `intent_${k}`;
@@ -91,12 +91,12 @@ function generate(rng: Rng, n: number): Generated {
     let target: Operation["target"];
     if (kind === "put_file") {
       const path = rng.pick(PATHS); const content = `put_${i}`; const blobOid = blobOf(content);
-      blobContent.set(blobOid, content); body = { kind, path, blobOid }; target = { entityKind: "file", entityId: path };
+      blobContent.set(blobOid, Buffer.from(content, "utf8")); body = { kind, path, blobOid }; target = { entityKind: "file", entityId: path };
     } else if (kind === "edit_file") {
       // MIGRATION: language-neutral whole-file edit (was set_symbol). Distinct content
       // per op keeps the op DAG varied; empty base (baseBlobOid: undefined).
       const path = rng.pick(PATHS); const text = symbolSrc(rng.pick(SYMBOLS), `v${i}`);
-      const blobOid = blobOf(text); blobContent.set(blobOid, text);
+      const blobOid = blobOf(text); blobContent.set(blobOid, Buffer.from(text, "utf8"));
       body = { kind, path, blobOid, baseBlobOid: undefined }; target = { entityKind: "file", entityId: path };
     } else if (kind === "rename_file") {
       const fromPath: string = rng.pick(PATHS); let path: string = rng.pick(PATHS); if (path === fromPath) path = `${fromPath}.r`;
@@ -214,7 +214,7 @@ test("ancestry extension: a delta op that is a causal ancestor of a pre-existing
   const Z = mk("operation_Z", "a.ts", [], 0);
   const Y = mk("operation_Y", "a.ts", ["operation_Z"], 1); // same key as Z, depends on Z
   const X = mk("operation_X", "a.ts", ["operation_Y"], 2); // same key, depends on Y
-  const blobContent = new Map([[blobOf("operation_Z"), "z"], [blobOf("operation_Y"), "y"], [blobOf("operation_X"), "x"]]);
+  const blobContent = new Map([[blobOf("operation_Z"), Buffer.from("z", "utf8")], [blobOf("operation_Y"), Buffer.from("y", "utf8")], [blobOf("operation_X"), Buffer.from("x", "utf8")]]);
   const intents = new Map<string, Intent>([["intent_0", { type: "intent", oid: "intent_0", title: "i", owner: "human:h", kind: "feature", constraints: [], createdAt: "2026-01-01T00:00:00.000Z" } as unknown as Intent]]);
   const mkInput = (ops: Operation[]): ReduceInput => ({ ops, evidence: [], decisions: [], intents, policy, blobContent });
 
