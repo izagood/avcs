@@ -1,0 +1,62 @@
+name: 🐞 Bug report
+description: Something behaves incorrectly, crashes, or produces a non-deterministic / unexpected result.
+title: "[bug] <short summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! A small reproducible example is worth a thousand words.
+
+        > 🌐 **Any language is welcome.** Write this issue in whatever language you're most comfortable with — English, 한국어, 日本語, etc. Maintainers will translate as needed. Don't let language stop you from filing.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Describe the bug. For a reducer/merge issue, "non-deterministic across replicas" or "wrong conflict level" is exactly the kind of thing we want to know.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands / API calls. Paste them as a runnable block if you can.
+      render: shell
+      placeholder: |
+        avcs init .
+        avcs ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual
+      description: What did you expect, and what did you get instead? Include error output / stack traces.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AVCS version
+      description: Output of `avcs version` (or the commit / npm version you're on).
+      placeholder: "e.g. 0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version & OS
+      description: AVCS requires Node ≥ 22.6. Output of `node --version`, plus your OS.
+      placeholder: "e.g. Node 22.6.0, Ubuntu 22.04"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I'm on a supported Node version (≥ 22.6).
+          required: true
