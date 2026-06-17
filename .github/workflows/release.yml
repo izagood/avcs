@@ -1,25 +1,33 @@
 name: release
 
-# Auto-publish @izagood/avcs to npm + cut a GitHub Release when a version bump
-# lands on main (i.e. a PR that changes package.json#version is merged).
+# Auto-version + publish @izagood/avcs to npm and cut a GitHub Release on every
+# push to main. The version is chosen FOR you — you only touch package.json for
+# SPECIAL cases (forcing a specific number: a major/1.0.0, a pre-release, etc.).
 #
-# To ship a release:
-#   1. in a PR, bump "version" in package.json (e.g. 0.1.0 -> 0.1.1)
-#   2. merge the PR into main
+# On each push to main the version is decided like this:
 #
-# The workflow runs on every push to main (post-merge only — PRs never push to
-# main), and the publish steps are guarded so they run *only* when package.json's
-# version is not yet on the registry. So a merge that doesn't change the version
-# is a safe no-op, and — crucially — a *follow-up* code-only fix to a release that
-# failed mid-flight will re-trigger the workflow and finish publishing the still-
-# unpublished version, with no manual re-run needed. (We deliberately do NOT gate
-# this on the CI workflow via `workflow_run`: that fires on PR CI too, which would
-# risk publishing un-merged code.)
+#   1. MANUAL OVERRIDE — if package.json#version is strictly GREATER than the
+#      latest vX.Y.Z git tag, that exact version is released as-is. Bump
+#      package.json in a PR whenever you want to control the number yourself.
 #
-# Publishing requires an `NPM_TOKEN` repository secret (an npm automation token
-# with publish rights to the @izagood scope). `npm publish` runs the
-# `prepublishOnly` gate (typecheck + test + build), so a release can only ship
-# green, freshly-built artifacts.
+#   2. AUTO (default) — otherwise the level is derived from the Conventional
+#      Commit subjects since the latest tag, and bumped off that tag:
+#         <type>!: / "BREAKING CHANGE"   -> minor   (pre-1.0: never auto-jumps to 1.0.0)
+#         feat: / feat(scope):           -> minor
+#         fix: / perf:                   -> patch
+#         only docs/ci/chore/test/...    -> NO release (safe no-op)
+#      The bumped package.json + lock are committed back to main as
+#      "release: vX.Y.Z [skip ci]", which does NOT re-trigger this workflow.
+#
+# Every publishing step is independently guarded (publish only if not on npm,
+# tag/commit/release only if missing), so a re-run finishes a release that failed
+# mid-flight with no manual cleanup. main is unprotected, so the bot can push the
+# bump commit + tag directly.
+#
+# Publishing requires an `NPM_TOKEN` repo secret (npm automation token with
+# publish rights to the @izagood scope). `npm publish` runs `prepublishOnly`
+# (typecheck + test + build), so a release can only ship green, freshly-built
+# artifacts.
 
 on:
   push:
@@ -31,7 +39,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # create the git tag + GitHub Release
+  contents: write # create the git tag + GitHub Release + push the bump commit
   id-token: write # npm provenance attestation
 
 jobs:
@@ -40,7 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # need tags to create/push the release tag
+          fetch-depth: 0 # need full history + tags to decide & bump the version
+          token: ${{ secrets.GITHUB_TOKEN }} # push the bump commit/tag back to main
 
       - uses: actions/setup-node@v4
         with:
@@ -50,40 +59,96 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check whether this version needs publishing
-        id: check
+      - name: Decide the release version
+        id: v
         run: |
-          VERSION="$(node -p "require('./package.json').version")"
+          set -eu
           NAME="$(node -p "require('./package.json').name")"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          PKG="$(node -p "require('./package.json').version")"
+          LATEST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+          LATEST="${LATEST_TAG#v}"; LATEST="${LATEST:-0.0.0}"
 
-          # Already on npm? Then this push didn't bump the version — nothing to do.
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "::notice::$NAME@$VERSION is already published — skipping release."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+          # Manual override: package.json bumped strictly above the latest tag.
+          TOP="$(printf '%s\n%s\n' "$LATEST" "$PKG" | sort -V | tail -n1)"
+          if [ "$PKG" != "$LATEST" ] && [ "$TOP" = "$PKG" ]; then
+            TARGET="$PKG"; MODE="manual"
           else
-            echo "::notice::$NAME@$VERSION is new — releasing."
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+            # Auto: derive the bump level from Conventional Commits since the tag.
+            RANGE="HEAD"; [ -n "$LATEST_TAG" ] && RANGE="$LATEST_TAG..HEAD"
+            LOG="$(git log --format='%s%n%b' $RANGE || true)"
+            LEVEL=""
+            if printf '%s\n' "$LOG" | grep -qE '^[a-z]+(\([^)]*\))?!:' || printf '%s\n' "$LOG" | grep -q 'BREAKING CHANGE'; then
+              LEVEL="minor"
+            elif printf '%s\n' "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+              LEVEL="minor"
+            elif printf '%s\n' "$LOG" | grep -qE '^(fix|perf)(\([^)]*\))?:'; then
+              LEVEL="patch"
+            fi
+            if [ -z "$LEVEL" ]; then
+              echo "::notice::no feat/fix/perf/breaking commits since ${LATEST_TAG:-the start} — no release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            TARGET="$(node -e "var v='$LATEST'.split('.').map(Number),l='$LEVEL',r;if(l==='major')r=[v[0]+1,0,0];else if(l==='minor')r=[v[0],v[1]+1,0];else r=[v[0],v[1],v[2]+1];console.log(r.join('.'))")"
+            MODE="auto:$LEVEL"
           fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "tag=v$TARGET" >> "$GITHUB_OUTPUT"
+          echo "::notice::release mode=$MODE -> v$TARGET (latest tag ${LATEST_TAG:-none}, package.json $PKG)"
+
+      - name: Set package.json to the target version
+        if: steps.v.outputs.release == 'true'
+        run: npm version "${{ steps.v.outputs.target }}" --no-git-tag-version --allow-same-version
 
       - name: "Publish to npm (runs prepublishOnly: typecheck, test, build)"
-        if: steps.check.outputs.publish == 'true'
-        run: npm publish --provenance --access public
+        if: steps.v.outputs.release == 'true'
+        run: |
+          set -eu
+          if npm view "${{ steps.v.outputs.name }}@${{ steps.v.outputs.target }}" version >/dev/null 2>&1; then
+            echo "::notice::${{ steps.v.outputs.name }}@${{ steps.v.outputs.target }} already on npm — skipping publish."
+          else
+            npm publish --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Tag the release commit
-        if: steps.check.outputs.publish == 'true'
+      - name: Commit the version bump back to main (if it lags)
+        if: steps.v.outputs.release == 'true'
         run: |
-          TAG="${{ steps.check.outputs.tag }}"
+          set -eu
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
+          if [ -n "$(git status --porcelain package.json package-lock.json)" ]; then
+            git add package.json package-lock.json
+            git commit -m "release: ${{ steps.v.outputs.tag }} [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "::notice::package.json already at ${{ steps.v.outputs.target }} — nothing to commit."
+          fi
 
-      - name: Create GitHub Release
-        if: steps.check.outputs.publish == 'true'
+      - name: Tag the release commit (if absent)
+        if: steps.v.outputs.release == 'true'
+        run: |
+          set -eu
+          TAG="${{ steps.v.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::notice::$TAG already exists — skipping tag."
+          else
+            git tag -a "$TAG" -m "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Create the GitHub Release (if absent)
+        if: steps.v.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ steps.check.outputs.tag }}" --generate-notes --title "${{ steps.check.outputs.tag }}"
+        run: |
+          set -eu
+          TAG="${{ steps.v.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release $TAG already exists — skipping."
+          else
+            gh release create "$TAG" --generate-notes --title "$TAG"
+          fi
