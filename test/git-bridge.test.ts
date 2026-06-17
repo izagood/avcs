@@ -3,13 +3,21 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir, readFile, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Repo } from "../src/api/repo.ts";
 import type { Actor } from "../src/objects/types.ts";
 
 const dev: Actor = { kind: "human", id: "human:dev" };
 const mkrepo = () => mkdtemp(join(tmpdir(), "avcs-git-"));
+
+const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const hasGit = (() => { try { execFileSync("git", ["--version"], { stdio: "ignore" }); return true; } catch { return false; } })();
+const git = (cwd: string, ...a: string[]) => execFileSync("git", a, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+const avcs = (cwd: string, ...a: string[]) =>
+  execFileSync(process.execPath, ["--experimental-strip-types", CLI, ...a], { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
 
 test("init defaults to sidecar mode and ignores all of .avcs/", async () => {
   const dir = await mkrepo();
@@ -174,4 +182,60 @@ test("reindex rebuilds the entity index from scratch and is idempotent", async (
   assert.equal(r2.ops, 2);
   const files = (await repo.materializedFiles(await repo.materialize())).map((f) => f.path).sort();
   assert.deepEqual(files, ["src/a.ts", "src/b.ts"]);
+});
+
+// ── worktree-safety: the store is single; the working tree it projects can differ ──────
+test("gitSync decouples the single store from the projected working tree (workDir)", async () => {
+  const storeDir = await mkrepo();
+  const workDir = await mkrepo(); // a SEPARATE working tree (stands in for a git worktree)
+  const repo = await Repo.init(storeDir);
+  await repo.setGitMode("sidecar");
+
+  await writeFile(join(workDir, "app.ts"), "export const v = 1\n", "utf8");
+  const r = await repo.gitSync({ message: "from worktree", actor: dev, workDir });
+
+  assert.deepEqual(r.captured.added, ["app.ts"], "captured the edit from workDir, not storeDir");
+  assert.ok(existsSync(join(workDir, "app.ts")), "re-projected back into workDir");
+  // The store lives ONLY at storeDir — the working tree never grew its own .avcs.
+  assert.ok(existsSync(join(storeDir, ".avcs", "objects")), "objects stay in the single store");
+  assert.ok(!existsSync(join(workDir, ".avcs")), "workDir is not a second store (no divergence)");
+  // The op is readable from the one store.
+  const files = (await repo.materializedFiles(await repo.materialize())).map((f) => f.path);
+  assert.deepEqual(files, ["app.ts"]);
+});
+
+test("git-sync from a linked git worktree shares one store and maps branch → line", { skip: !hasGit }, async () => {
+  const main = await mkrepo();
+  git(main, "init", "-b", "main");
+  git(main, "config", "user.email", "t@t");
+  git(main, "config", "user.name", "t");
+  const repo = await Repo.init(main);
+  await repo.setGitMode("sidecar");
+
+  // Seed an initial commit on main so a worktree branch can fork from HEAD.
+  await writeFile(join(main, "base.ts"), "export const base = 1\n", "utf8");
+  avcs(main, "git-sync", "-m", "base", "--commit", "--author", "human:dev");
+
+  // A real linked git worktree on its own branch — git's file-based parallel checkout.
+  const wt = join(main, "..", `wt-${Date.now()}`);
+  git(main, "worktree", "add", "-b", "feature", wt);
+
+  // Edit + sync FROM the worktree. This used to break in sidecar (no .avcs in the worktree).
+  await writeFile(join(wt, "feat.ts"), "export const feat = 1\n", "utf8");
+  const out = avcs(wt, "git-sync", "-m", "feat work", "--commit", "--author", "human:dev");
+  assert.match(out, /checkpoint/, "git-sync from the worktree succeeded");
+
+  // Single store: the worktree never grew its own .avcs (sidecar) — it used main's store.
+  assert.ok(!existsSync(join(wt, ".avcs")), "worktree shares the one store, no divergent copy");
+
+  // Branch → line: the work landed on a `feature` line, isolated from main.
+  const reopened = await Repo.open(main);
+  const lines = (await reopened.listLines()).map((l) => l.name);
+  assert.ok(lines.includes("feature"), "the feature branch auto-created a matching avcs line");
+  const featFiles = (await reopened.materializedFiles(await reopened.materialize("feature"))).map((f) => f.path).sort();
+  assert.deepEqual(featFiles, ["base.ts", "feat.ts"], "feature line = main's base + the worktree edit");
+  const mainFiles = (await reopened.materializedFiles(await reopened.materialize("main"))).map((f) => f.path);
+  assert.deepEqual(mainFiles, ["base.ts"], "main line is unaffected by the worktree's edit");
+
+  await rm(wt, { recursive: true, force: true });
 });

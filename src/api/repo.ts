@@ -93,7 +93,7 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /packs/
 /oplog
 /objlog
-/.git-pending
+/pending/
 *.lock
 *.tmp*
 `;
@@ -1444,23 +1444,35 @@ export class Repo {
   }
 
   /**
-   * Persist the provenance handoff for the git-hook trio (pre-commit writes it; the
-   * prepare-commit-msg and post-commit hooks consume it). Local working state, git-ignored.
+   * Relative store path for a working tree's provenance handoff. Keyed by the working
+   * directory so concurrent `git commit`s from different git worktrees (which all share
+   * this single store) don't clobber each other's pending handoff. `workDir` defaults to
+   * the store dir, so a plain (non-worktree) repo keeps a single, stable pending slot.
    */
-  async writeGitPending(info: { checkpoint: string; treeHash: string; intent?: string }): Promise<void> {
-    await this.store.writeAux(".git-pending", JSON.stringify(info) + "\n");
+  #pendingRel(workDir: string): string {
+    return join("pending", `${sha256hex(workDir).slice(0, 16)}.json`);
   }
 
-  /** Read the pending provenance handoff, or null if none is staged. */
-  async readGitPending(): Promise<{ checkpoint: string; treeHash: string; intent?: string } | null> {
-    const p = join(this.dir, ".avcs", ".git-pending");
+  /**
+   * Persist the provenance handoff for the git-hook trio (pre-commit writes it; the
+   * prepare-commit-msg and post-commit hooks consume it). Local working state, git-ignored.
+   * `workDir` is the working tree being committed (the git worktree dir), defaulting to
+   * the store dir for a plain repo.
+   */
+  async writeGitPending(info: { checkpoint: string; treeHash: string; intent?: string }, workDir = this.dir): Promise<void> {
+    await this.store.writeAux(this.#pendingRel(workDir), JSON.stringify(info) + "\n");
+  }
+
+  /** Read the pending provenance handoff for `workDir`, or null if none is staged. */
+  async readGitPending(workDir = this.dir): Promise<{ checkpoint: string; treeHash: string; intent?: string } | null> {
+    const p = join(this.dir, ".avcs", this.#pendingRel(workDir));
     if (!existsSync(p)) return null;
     try { return JSON.parse(await readFile(p, "utf8")); } catch { return null; }
   }
 
-  /** Clear the pending provenance handoff (post-commit, after recording the back-link). */
-  async clearGitPending(): Promise<void> {
-    await rm(join(this.dir, ".avcs", ".git-pending"), { force: true });
+  /** Clear the pending provenance handoff for `workDir` (post-commit, after recording the back-link). */
+  async clearGitPending(workDir = this.dir): Promise<void> {
+    await rm(join(this.dir, ".avcs", this.#pendingRel(workDir)), { force: true });
   }
 
   /**
@@ -1502,7 +1514,7 @@ export class Repo {
    * Git invocation (`git add`) is intentionally left to the caller/CLI so this core stays
    * git-agnostic; `.avcs/.gitignore` (ensured here) makes a plain `git add -A` mode-correct.
    */
-  async gitSync(opts: { message: string; actor: Actor; line?: string }): Promise<{
+  async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string };
     conflicts: ReductionResult["conflicts"];
@@ -1510,10 +1522,13 @@ export class Repo {
     treeHash?: string;
     reprojected?: number;
   }> {
+    // The STORE is single (`this.dir`); the working tree projected/captured may be a
+    // separate git worktree (`workDir`). They coincide for a plain, non-worktree repo.
+    const workDir = opts.workDir ?? this.dir;
     const view = opts.line ?? "main";
     const lineOpt = opts.line ? { line: opts.line } : {};
     // 1. Capture direct working-tree edits as ops before anything else.
-    const cap = await this.commitWorkingTree(this.dir, { message: opts.message, actor: opts.actor, ...lineOpt });
+    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt });
     const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
@@ -1523,7 +1538,7 @@ export class Repo {
     if (res.conflicts.length > 0) return { mode, captured, conflicts: res.conflicts };
     // 3. Checkpoint the verified state. 4. Re-project the working tree.
     const checkpoint = await this.createCheckpoint(view, opts.message);
-    const written = await this.checkoutInto(this.dir, view);
+    const written = await this.checkoutInto(workDir, view);
     this.logger.info("git.sync", { view, mode, capturedOps: captured.ops.length, checkpoint, treeHash: res.treeHash });
     return { mode, captured, conflicts: [], checkpoint, treeHash: res.treeHash, reprojected: written.length };
   }

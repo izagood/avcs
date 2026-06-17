@@ -16,7 +16,8 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, isAbsolute } from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { Repo, type GitMode } from "./api/repo.ts";
 import { ObjectStore } from "./store/objectStore.ts";
@@ -34,6 +35,51 @@ if (cmd === "--help" || cmd === "-h") cmd = "help";
 function flag(name: string): string | undefined {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
+}
+
+// ── git-bridge worktree resolution ──────────────────────────────────────────
+// AVCS keeps a SINGLE store and is git-agnostic at its core. These helpers live
+// in the CLI (the bridge layer, which already shells out to git) so the core
+// never depends on git. They let `git-sync`/`git-hook` work correctly when run
+// from a *linked git worktree*: the working tree is the worktree dir, but the
+// store lives in the main checkout — which we locate via git's own resolution.
+function gitCmd(dir: string, a: string[]): string | null {
+  try {
+    return execFileSync("git", a, { cwd: dir, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Locate the single AVCS store for a (possibly git-worktree) working dir: it's here
+ *  if `.avcs` is present, otherwise it lives in the main git checkout (resolved via
+ *  `git rev-parse --git-common-dir`, whose parent is the main work tree). Falls back to
+ *  `dir` so `Repo.open` surfaces its normal "not an AVCS repo" error when truly absent. */
+function storeDirFor(dir: string): string {
+  if (ObjectStore.isRepo(dir)) return dir; // non-worktree, or committed-mode main checkout
+  const common = gitCmd(dir, ["rev-parse", "--git-common-dir"]);
+  if (common) {
+    const main = dirname(isAbsolute(common) ? common : join(dir, common)); // <main>/.git → <main>
+    if (ObjectStore.isRepo(main)) return main;
+  }
+  return dir;
+}
+
+/** The AVCS line a working dir maps to: an explicit `--line` wins; otherwise the current
+ *  git branch (so each worktree/branch commits to its own line), with main/master → the
+ *  default `main` line. Detached HEAD or non-git → the default line. */
+function lineFor(dir: string, explicit?: string): string | undefined {
+  if (explicit) return explicit;
+  const branch = gitCmd(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (!branch || branch === "HEAD" || branch === "main" || branch === "master") return undefined;
+  return branch;
+}
+
+/** Ensure the line/view exists before sync targets it (auto-forked from main on the first
+ *  commit on a branch). No-op for the default `main` line/view, which always exists. */
+async function ensureLine(repo: Repo, line?: string): Promise<void> {
+  if (!line) return;
+  if (!(await repo.store.getRef(`view:${line}`))) await repo.createLine(line);
 }
 
 function pkgVersion(): string {
@@ -301,12 +347,13 @@ async function main(): Promise<void> {
       break;
     }
     case "git-sync": {
-      const repo = await Repo.open(cwd);
+      const repo = await Repo.open(storeDirFor(cwd));
       const message = flag("-m") ?? flag("--message");
       if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--no-add]");
       const author = flag("--author") ?? "human:cli";
-      const line = flag("--line");
-      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, ...(line ? { line } : {}) });
+      const line = lineFor(cwd, flag("--line"));
+      await ensureLine(repo, line);
+      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}) });
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
@@ -425,28 +472,31 @@ async function main(): Promise<void> {
       // Internal dispatch target for the installed hook scripts (docs/14). Each phase is
       // designed to be safe to run by hand, and a no-op when there is nothing to do.
       const phase = args[1];
-      const repo = await Repo.open(cwd);
-      const { execFileSync } = await import("node:child_process");
+      // cwd is the working tree (possibly a linked git worktree); the store may live in
+      // the main checkout. Resolve the single store, and map this worktree's branch → line.
+      const repo = await Repo.open(storeDirFor(cwd));
+      const line = lineFor(cwd);
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
       switch (phase) {
         case "pre-commit": {
           // Capture working-tree edits as ops, gate on conflicts, checkpoint, reproject,
           // re-stage the canonical projection, and stash the provenance for the next hooks.
           const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
-          const r = await repo.gitSync({ message, actor: { kind: "human", id: author } });
+          await ensureLine(repo, line);
+          const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}) });
           if (r.conflicts.length) {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
             process.exit(1); // abort the commit
           }
           execFileSync("git", ["add", "-A"], { cwd, stdio: "inherit" });
-          await repo.writeGitPending({ checkpoint: r.checkpoint!, treeHash: r.treeHash!, ...(r.captured.intent ? { intent: r.captured.intent } : {}) });
+          await repo.writeGitPending({ checkpoint: r.checkpoint!, treeHash: r.treeHash!, ...(r.captured.intent ? { intent: r.captured.intent } : {}) }, cwd);
           break;
         }
         case "prepare-commit-msg": {
           // args: [2]=msgFile [3]=source [4]=sha. Append the trailer if enabled & absent.
           const msgFile = args[2];
           if (!msgFile) break;
-          const pending = await repo.readGitPending();
+          const pending = await repo.readGitPending(cwd);
           if (!pending || !(await repo.gitTrailerEnabled())) break;
           const { readFile, writeFile } = await import("node:fs/promises");
           const cur = await readFile(msgFile, "utf8");
@@ -456,18 +506,20 @@ async function main(): Promise<void> {
           break;
         }
         case "post-commit": {
-          const pending = await repo.readGitPending();
+          const pending = await repo.readGitPending(cwd);
           if (!pending) break;
           const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
           await repo.recordGitCommit(sha, pending.checkpoint);
-          await repo.clearGitPending();
+          await repo.clearGitPending(cwd);
           break;
         }
         case "post-merge": {
           // A git pull/merge unioned new objects (committed mode) straight onto disk:
-          // rebuild the index and re-project deterministically from the merged op graph.
+          // rebuild the index and re-project deterministically from the merged op graph
+          // into this worktree, for the branch's line.
           await repo.reindex();
-          await repo.checkoutInto(cwd, "main");
+          await ensureLine(repo, line);
+          await repo.checkoutInto(cwd, line ?? "main");
           break;
         }
         default:
