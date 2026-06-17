@@ -1,0 +1,6 @@
+# https://docs.github.com/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & design discussion
+    url: https://github.com/izagood/avcs/discussions
+    about: For open-ended questions or design debate, start a Discussion instead of an issue. The design docs in /docs are the best starting point for rationale.
