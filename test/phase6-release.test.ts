@@ -15,9 +15,9 @@ const ai: Actor = { kind: "ai_agent", id: "ai:a" };
 
 test("generateSbom is deterministic and lists files + package deps", () => {
   const files = [
-    { path: "src/b.ts", content: "b" },
-    { path: "src/a.ts", content: "a" },
-    { path: "package.json", content: JSON.stringify({ dependencies: { left: "1.0.0" }, devDependencies: { dev: "2.0.0" } }) },
+    { path: "src/b.ts", bytes: Buffer.from("b", "utf8") },
+    { path: "src/a.ts", bytes: Buffer.from("a", "utf8") },
+    { path: "package.json", bytes: Buffer.from(JSON.stringify({ dependencies: { left: "1.0.0" }, devDependencies: { dev: "2.0.0" } }), "utf8") },
   ];
   const s1 = generateSbom(files);
   const s2 = generateSbom([...files].reverse());

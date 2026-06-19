@@ -20,11 +20,23 @@ import type { Actor } from "../objects/types.ts";
 
 const REPO_DIR = process.env.AVCS_REPO ?? process.cwd();
 
+/** Result of an MCP elicitation prompt (subset of the SDK's ElicitResult). */
+export interface ElicitOutcome {
+  action: string; // "accept" | "decline" | "cancel"
+  content?: Record<string, unknown>;
+}
+
+/** Per-call context handed to a handler: the channel to ask the human (elicitation). */
+export interface ToolCtx {
+  /** Ask the human to confirm/provide input via MCP elicitation. */
+  elicit?: (message: string, requestedSchema: Record<string, unknown>) => Promise<ElicitOutcome>;
+}
+
 export interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  handler: (repo: Repo, input: Record<string, unknown>) => Promise<unknown>;
+  handler: (repo: Repo, input: Record<string, unknown>, ctx?: ToolCtx) => Promise<unknown>;
 }
 
 export function actorOf(input: Record<string, unknown>): Actor {
@@ -205,7 +217,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.decision.record",
-    description: "Record a HUMAN/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history. Rejected unless actor.kind is 'human' (an agent may not decide its own conflicts; cryptographic enforcement lands in Phase 3).",
+    description: "Record a HUMAN/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history. The agent CANNOT forge this: the owner is asked to confirm via MCP elicitation, and the decision is then signed with the owner's LOCAL private key (which the agent never holds). Unsigned/forged decisions are dropped by the reducer's trust gate (issue #15). Requires actor.kind 'human', an elicitation-capable client, and a provisioned local owner key.",
     inputSchema: {
       type: "object",
       properties: {
@@ -218,10 +230,29 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["conflictId", "reason"],
     },
-    handler: (repo, i) => {
+    handler: async (repo, i, ctx) => {
       const actor = actorOf(i);
       if (actor.kind !== "human") {
         throw new Error("avcs.decision.record requires a human actor; agents may not resolve their own conflicts");
+      }
+      // (issue #15) The decision must be cryptographically signed by the owner to be
+      // trusted by the reducer. The agent never holds the key: (a) the owner's LOCAL
+      // private key signs it, and (b) the owner explicitly confirms via elicitation —
+      // so neither an agent nor a malicious client can fabricate an owner sign-off.
+      const priv = await repo.loadLocalKey(actor.id);
+      if (!priv) {
+        throw new Error(`no local signing key for ${actor.id}; provision one (repo.provisionOwnerKey) so decisions can be signed and trusted (issue #15). Without it the trust gate drops the decision.`);
+      }
+      const elicit = ctx?.elicit;
+      if (!elicit) {
+        throw new Error("owner confirmation is required but this client does not support MCP elicitation; sign decisions via the avcs CLI, or use an elicitation-capable client");
+      }
+      const res = await elicit(
+        `owner 승인 필요: 충돌 ${String(i.conflictId)} 을(를) chosenOps=${JSON.stringify((i.chosenOps as string[]) ?? [])}, rejectedOps=${JSON.stringify((i.rejectedOps as string[]) ?? [])} 로 기록하려 합니다. 본인(${actor.id})이 이 결정을 승인합니까?`,
+        { type: "object", properties: { approve: { type: "boolean", description: "true to record this decision under your key" } }, required: ["approve"] },
+      );
+      if (res.action !== "accept" || res.content?.approve !== true) {
+        throw new Error("owner declined the decision (elicitation not accepted); nothing recorded");
       }
       return repo.recordDecision({
         conflictId: String(i.conflictId),
@@ -230,6 +261,7 @@ export const TOOLS: ToolDef[] = [
         reason: String(i.reason),
         decidedBy: actor,
         futurePolicy: i.futurePolicy as string | undefined,
+        signWith: { keyId: actor.id, privateKey: priv },
       });
     },
   },
@@ -398,7 +430,20 @@ export async function startMcpServer(): Promise<void> {
     const tool = TOOLS.find((t) => t.name === req.params.name);
     if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
     if (!repo) repo = await Repo.open(REPO_DIR);
-    const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>);
+    const ctx: ToolCtx = {
+      // Bridge to MCP elicitation; surface a friendly error if the client lacks support.
+      elicit: async (message, requestedSchema) => {
+        const elicitInput = (server as unknown as {
+          elicitInput: (p: { message: string; requestedSchema: Record<string, unknown> }) => Promise<ElicitOutcome>;
+        }).elicitInput;
+        try {
+          return await elicitInput({ message, requestedSchema });
+        } catch (e) {
+          throw new Error(`owner confirmation via MCP elicitation failed or is unsupported by this client (${(e as Error).message}); sign decisions via the avcs CLI, or use an elicitation-capable client`);
+        }
+      },
+    };
+    const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>, ctx);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   });
 

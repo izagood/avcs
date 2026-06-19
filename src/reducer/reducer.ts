@@ -22,6 +22,8 @@ import type {
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
 import { merge3, type ConflictRegion } from "../merge/merge3.ts";
 import { ownersFor } from "../policy/owners.ts";
+import { isBinary } from "../core/bytes.ts";
+import { Buffer } from "node:buffer";
 
 export interface ConflictOption {
   opOid: string;
@@ -73,7 +75,7 @@ export interface ReductionResult {
    * writes these directly. Synthetic oids are content-derived, so the treeHash that
    * references them stays deterministic.
    */
-  synthBlobs: Map<string, string>;
+  synthBlobs: Map<string, Buffer>;
 }
 
 export interface ReduceInput {
@@ -84,8 +86,8 @@ export interface ReduceInput {
   policy: Policy;
   /** Which statuses get projected into the tree. Default: accepted only. */
   materializeStatuses?: OperationStatus[];
-  /** blob oid → content, for ops that need file text (edit_file 3-way merge). */
-  blobContent?: Map<string, string>;
+  /** blob oid → content bytes, for ops that need file text (edit_file 3-way merge). */
+  blobContent?: Map<string, Buffer>;
   /** actorId → bounded reliability nudge (Phase 5 trust learning). */
   reliability?: Map<string, number>;
   /** deciderId → role weight; resolves contradictory decisions by authority (docs/08 §4). */
@@ -216,10 +218,10 @@ export interface FileConflict {
 export function detectFileConflicts(
   ops: Operation[],
   result: ReductionResult,
-  blobContent: Map<string, string>,
+  blobContent: Map<string, Buffer>,
 ): FileConflict[] {
   const anc = ancestry(ops);
-  const resolve = (oid: string | undefined): string => (oid ? blobContent.get(oid) ?? "" : "");
+  const resolve = (oid: string | undefined): Buffer => (oid ? blobContent.get(oid) ?? Buffer.alloc(0) : Buffer.alloc(0));
   const byFile = new Map<string, Operation[]>();
   for (const o of ops) {
     if (o.body.kind !== "edit_file") continue;
@@ -239,8 +241,29 @@ export function detectFileConflicts(
     // baseBlobOid when they agree (the normal case); else the lexically-first for a
     // deterministic, conservative comparison.
     const baseOid = [...new Set(ordered.map((o) => o.body.baseBlobOid ?? ""))].sort()[0] ?? "";
-    const base = resolve(baseOid);
-    const variants = ordered.map((o) => resolve(o.body.blobOid));
+    const baseBuf = resolve(baseOid);
+    const variantBufs = ordered.map((o) => resolve(o.body.blobOid));
+    // Binary route: any variant/base with a NUL is not line-mergeable. Report the whole
+    // file as one atomic conflict (matches merge3's binary fallback shape) instead of
+    // running a bogus line merge.
+    if (isBinary(baseBuf) || variantBufs.some(isBinary)) {
+      const base = baseBuf.toString("utf8");
+      const distinct = [...new Set(variantBufs.map((v) => v.toString("utf8")).filter((v) => v !== base))];
+      if (distinct.length < 2) continue; // 0 or 1 distinct variant ⇒ atomic, but clean
+      const regions: ConflictRegion[] = [
+        {
+          baseStart: 0,
+          baseEnd: base.split("\n").length,
+          base,
+          mergedStart: 0,
+          options: distinct.map((text, i) => ({ sides: [i], text })),
+        },
+      ];
+      out.push({ file, ops: ordered.map((o) => o.oid as string), regions });
+      continue;
+    }
+    const base = baseBuf.toString("utf8");
+    const variants = variantBufs.map((v) => v.toString("utf8"));
     const m = merge3(base, variants);
     if (!m.clean) out.push({ file, ops: ordered.map((o) => o.oid as string), regions: m.conflicts });
   }
@@ -331,8 +354,8 @@ function isCrossPath(op: Operation): boolean {
 /** Keep only the synth-blob entries the final tree actually references (drops the
  *  intermediate splices that get overwritten). Makes synthBlobs a pure function of the
  *  final tree — which is what lets the incremental path reuse base entries exactly. */
-function pruneSynth(tree: Map<string, string>, synth: Map<string, string>): Map<string, string> {
-  const out = new Map<string, string>();
+function pruneSynth(tree: Map<string, string>, synth: Map<string, Buffer>): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
   for (const oid of tree.values()) {
     const c = synth.get(oid);
     if (c !== undefined) out.set(oid, c);
@@ -357,12 +380,12 @@ function materializeProjection(
   statuses: Map<string, OperationStatus>,
   anc: Map<string, Set<string>>,
   materializeStatuses: Set<OperationStatus>,
-  blobContent: Map<string, string>,
-): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, string> } {
+  blobContent: Map<string, Buffer>,
+): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
   const tree = new Map<string, string>();
-  const synthBlobs = new Map<string, string>();
+  const synthBlobs = new Map<string, Buffer>();
   for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
   return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthBlobs) };
 }
@@ -382,15 +405,15 @@ function materializeIncremental(
   statuses: Map<string, OperationStatus>,
   anc: Map<string, Set<string>>,
   materializeStatuses: Set<OperationStatus>,
-  blobContent: Map<string, string>,
+  blobContent: Map<string, Buffer>,
   base: ReductionResult,
   dirtyPaths: Set<string>,
-): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, string> } {
+): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
   // Replay only dirty-touching ops, in the SAME global order, into a fresh tree.
   const replayTree = new Map<string, string>();
-  const replaySynth = new Map<string, string>();
+  const replaySynth = new Map<string, Buffer>();
   for (const op of ordered) {
     if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth);
   }
@@ -399,7 +422,7 @@ function materializeIncremental(
   for (const [p, oid] of base.tree) if (!dirtyPaths.has(p)) tree.set(p, oid);
   for (const [p, oid] of replayTree) tree.set(p, oid);
   // synthBlobs: union of base (clean paths' synths) + replay, pruned to the final tree.
-  const synthCandidates = new Map<string, string>([...base.synthBlobs, ...replaySynth]);
+  const synthCandidates = new Map<string, Buffer>([...base.synthBlobs, ...replaySynth]);
   return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthCandidates) };
 }
 
@@ -467,7 +490,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
     statuses,
     anc,
     materializeStatuses,
-    input.blobContent ?? new Map<string, string>(),
+    input.blobContent ?? new Map<string, Buffer>(),
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs };
@@ -669,7 +692,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     statuses,
     anc,
     materializeStatuses,
-    next.blobContent ?? new Map<string, string>(),
+    next.blobContent ?? new Map<string, Buffer>(),
     snap.result,
     dirtyPaths,
   );
@@ -743,7 +766,7 @@ export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
     autoDecisions: r.autoDecisions as AutoDecision[],
     fileConflicts: r.fileConflicts as ReductionResult["fileConflicts"],
     headOps: r.headOps as string[],
-    synthBlobs: entriesToMap(r.synthBlobs as Entries<string>),
+    synthBlobs: entriesToMap(r.synthBlobs as Entries<Buffer>),
   };
   const perKey = new Map<string, PerKeyDecision>(
     (s.perKey as [string, any][]).map(([k, d]) => [k, { local: entriesToMap(d.local), conflicts: d.conflicts, autoDecisions: d.autoDecisions }]),
@@ -924,11 +947,11 @@ function kahnOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[]
 function applyOp(
   tree: Map<string, string>,
   op: Operation,
-  blobContent: Map<string, string>,
-  synthBlobs: Map<string, string>,
+  blobContent: Map<string, Buffer>,
+  synthBlobs: Map<string, Buffer>,
 ): void {
   const b = op.body;
-  const resolve = (oid: string): string => synthBlobs.get(oid) ?? blobContent.get(oid) ?? "";
+  const resolve = (oid: string): Buffer => synthBlobs.get(oid) ?? blobContent.get(oid) ?? Buffer.alloc(0);
   switch (b.kind) {
     case "put_file":
       if (b.path && b.blobOid) tree.set(b.path, b.blobOid);
@@ -936,16 +959,27 @@ function applyOp(
     case "edit_file": {
       if (!b.path || !b.blobOid) break;
       const opNew = resolve(b.blobOid);
-      const opBase = b.baseBlobOid ? resolve(b.baseBlobOid) : "";
+      const opBase = b.baseBlobOid ? resolve(b.baseBlobOid) : Buffer.alloc(0);
       const currentOid = tree.get(b.path);
       const current = currentOid !== undefined ? resolve(currentOid) : opBase;
+      // Binary route: a NUL byte means line-merge is meaningless. Skip merge3 and keep a
+      // deterministic incumbent — leave the existing tree entry (currentOid) untouched if
+      // one is present; otherwise register opNew as a new blob so the file still lands.
+      if (isBinary(opNew) || isBinary(opBase) || isBinary(current)) {
+        if (currentOid !== undefined) break; // incumbent stays; tree unchanged
+        const synthOid = `blob_${sha256hex(opNew).slice(0, 32)}`;
+        synthBlobs.set(synthOid, opNew);
+        tree.set(b.path, synthOid);
+        break;
+      }
       // Apply this op's patch (opBase→opNew) onto the accumulated content. Disjoint
       // line changes compose (order-independent); an overlap with a prior concurrent op
       // keeps `current` (deterministic incumbent) — the overlap is reported separately
       // by detectFileConflicts over the full op set. Language-neutral: pure text.
-      const m = merge3(opBase, [current, opNew], { onConflict: "first" });
-      const synthOid = `blob_${sha256hex(m.merged).slice(0, 32)}`;
-      synthBlobs.set(synthOid, m.merged);
+      const m = merge3(opBase.toString("utf8"), [current.toString("utf8"), opNew.toString("utf8")], { onConflict: "first" });
+      const mergedBuf = Buffer.from(m.merged, "utf8");
+      const synthOid = `blob_${sha256hex(mergedBuf).slice(0, 32)}`;
+      synthBlobs.set(synthOid, mergedBuf);
       tree.set(b.path, synthOid);
       break;
     }

@@ -91,6 +91,7 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /snapshot/
 /locks/
 /packs/
+/private/
 /oplog
 /objlog
 /pending/
@@ -186,7 +187,7 @@ export class Repo {
   async reliability(): Promise<Map<string, number>> {
     const ops = await this.store.collect<Operation>("operation");
     const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
-    const decisions = await this.store.collect<Decision>("decision");
+    const decisions = this.#verifiedDecisions(await this.store.collect<Decision>("decision"));
     return computeReliability(ops, evidence, decisions);
   }
 
@@ -218,6 +219,42 @@ export class Repo {
     const { publicKey, privateKey } = generateKeypair();
     await this.registerPublicKey({ keyId, publicKey, actorId: actor.id, actorKind: actor.kind });
     return { keyId, privateKey, publicKey };
+  }
+
+  // ── local private keystore (issue #15 Layer 2 / B2) ────────────────────────
+  // Public keys live in `keys/` (trusted, shared). PRIVATE keys live ONLY here,
+  // locally on the owner's machine — never shared, never committed. The MCP server
+  // loads them to sign a decision on the owner's behalf AFTER an elicitation
+  // confirmation, so an agent (which never sees the key) cannot forge a human
+  // decision. gitignored in both modes: sidecar ignores all of .avcs/, committed
+  // lists /private/ explicitly.
+  #privateKeysDir(): string {
+    return join(this.store.root, "private");
+  }
+  /** Persist an actor's PRIVATE key locally (owner machine only), perms 0600. */
+  async saveLocalKey(actorId: string, privateKey: string): Promise<void> {
+    await mkdir(this.#privateKeysDir(), { recursive: true });
+    await writeFile(join(this.#privateKeysDir(), `${actorId}.json`), JSON.stringify({ actorId, privateKey }), { encoding: "utf8", mode: 0o600 });
+  }
+  /** Load a locally-held private key for `actorId`, or null if none is stored. */
+  async loadLocalKey(actorId: string): Promise<string | null> {
+    const p = join(this.#privateKeysDir(), `${actorId}.json`);
+    if (!existsSync(p)) return null;
+    try {
+      return (JSON.parse(await readFile(p, "utf8")) as { privateKey: string }).privateKey;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Provision an owner key: mint a keypair, register the public half as trusted, and
+   * store the private half in the LOCAL keystore so the MCP server can sign the
+   * owner's elicitation-confirmed decisions (issue #15). Returns the keyId.
+   */
+  async provisionOwnerKey(actor: Actor, keyId = actor.id): Promise<string> {
+    const { privateKey } = await this.generateActorKey(actor, keyId);
+    await this.saveLocalKey(actor.id, privateKey);
+    return keyId;
   }
   #sign(type: string, payload: Record<string, unknown>, signWith?: { keyId: string; privateKey: string }): Signature | undefined {
     if (!signWith) return undefined;
@@ -389,7 +426,7 @@ export class Repo {
     intentOid: string;
     actor: Actor;
     path: string;
-    content: string;
+    content: string | Uint8Array;
     declaredPurpose: string;
     causalDeps?: string[];
     effects?: Operation["effects"];
@@ -566,6 +603,21 @@ export class Repo {
       if (e.producedBy.kind === "ai_agent") return true; // policy ignores these anyway
       return this.keyring.verifyFor(e.producedBy.id, e.oid as string, e.sig);
     });
+  }
+
+  /**
+   * Decisions carry the same trust requirement as evidence (issue #15): a human/owner
+   * decision only takes effect if it bears a valid signature from that actor's
+   * registered key. Unsigned or forged decisions simply disappear, so the conflict
+   * they claimed to resolve stays open — an agent cannot fabricate a human sign-off
+   * (the MCP `kind === "human"` check is self-declared and not, by itself, a guarantee).
+   * With no keyring configured, fall back to Phase-1 behavior (keep all). Unlike
+   * evidence there is no ai_agent passthrough: a decision is an authority act, so every
+   * decision must verify once a keyring exists. Mirrors #verifiedEvidence.
+   */
+  #verifiedDecisions(all: Decision[]): Decision[] {
+    if (this.keyring.size === 0) return all;
+    return all.filter((d) => this.keyring.verifyFor(d.decidedBy.id, d.oid as string, d.sig));
   }
 
   // ── views & materialization ──────────────────────────────────────────────
@@ -1218,7 +1270,7 @@ export class Repo {
 
   async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"], useInc = false): Promise<ReductionResult> {
     const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
-    const decisions = await this.store.collect<Decision>("decision");
+    const decisions = this.#verifiedDecisions(await this.store.collect<Decision>("decision"));
 
     // Redactions overwrite blob bytes while keeping the oid, so they don't change op
     // oids — include them in the signature so a redaction invalidates the cache.
@@ -1264,10 +1316,10 @@ export class Repo {
     for await (const it of this.store.list<Intent>("intent")) intents.set(it.oid as string, it);
 
     // Preload blob content needed by edit_file's 3-way merge (base + new content).
-    const blobContent = new Map<string, string>();
+    const blobContent = new Map<string, Buffer>();
     for (const op of ops) {
       for (const oid of [op.body.blobOid, op.body.baseBlobOid]) {
-        if (oid && !blobContent.has(oid)) blobContent.set(oid, (await this.readBlob(oid)).toString("utf8"));
+        if (oid && !blobContent.has(oid)) blobContent.set(oid, await this.readBlob(oid));
       }
     }
 
@@ -1305,15 +1357,15 @@ export class Repo {
   }
 
   // ── git-like working tree (checkout / commit) ─────────────────────────────
-  /** Read a working directory's files (relative paths → content), skipping .avcs/. */
-  async #readWorkTree(workDir: string): Promise<Map<string, string>> {
-    const out = new Map<string, string>();
+  /** Read a working directory's files (relative paths → bytes), skipping .avcs/. */
+  async #readWorkTree(workDir: string): Promise<Map<string, Buffer>> {
+    const out = new Map<string, Buffer>();
     if (!existsSync(workDir)) return out;
     for (const ent of await readdir(workDir, { recursive: true, withFileTypes: true })) {
       if (!ent.isFile()) continue;
       const rel = join(ent.parentPath ?? (ent as { path?: string }).path ?? workDir, ent.name).slice(workDir.length + 1);
       if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel.startsWith(".git")) continue;
-      out.set(rel.split("\\").join("/"), await readFile(join(workDir, rel), "utf8"));
+      out.set(rel.split("\\").join("/"), await readFile(join(workDir, rel)));
     }
     return out;
   }
@@ -1326,7 +1378,7 @@ export class Repo {
       const full = join(workDir, path);
       await mkdir(dirname(full), { recursive: true });
       const synth = res.synthBlobs.get(blobOid);
-      await writeFile(full, synth !== undefined ? Buffer.from(synth, "utf8") : await this.readBlob(blobOid));
+      await writeFile(full, synth ?? await this.readBlob(blobOid));
       written.push(path);
     }
     return written.sort();
@@ -1343,14 +1395,14 @@ export class Repo {
   ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string }> {
     const view = opts.line ?? "main";
     const res = await this.materialize(view);
-    const current = new Map((await this.materializedFiles(res)).map((f) => [f.path, f.content]));
+    const current = new Map((await this.materializedBytes(res)).map((f) => [f.path, f.bytes]));
     const disk = await this.#readWorkTree(workDir);
     const added: string[] = [];
     const modified: string[] = [];
     const removed: string[] = [];
     for (const [path, content] of disk) {
       if (!current.has(path)) added.push(path);
-      else if (current.get(path) !== content) modified.push(path);
+      else if (!current.get(path)!.equals(content)) modified.push(path);
     }
     for (const path of current.keys()) if (!disk.has(path)) removed.push(path);
 
@@ -1833,7 +1885,7 @@ export class Repo {
       await mkdir(dirname(full), { recursive: true });
       // Symbol-merged files are synthesized content, not a stored blob.
       const synth = result.synthBlobs.get(blobOid);
-      await writeFile(full, synth !== undefined ? Buffer.from(synth, "utf8") : await this.readBlob(blobOid));
+      await writeFile(full, synth ?? await this.readBlob(blobOid));
     }
   }
 
@@ -1872,14 +1924,19 @@ export class Repo {
     return oid;
   }
 
-  /** Resolve the materialized tree into {path, content} entries. */
-  async materializedFiles(result: ReductionResult): Promise<{ path: string; content: string }[]> {
-    const out: { path: string; content: string }[] = [];
+  /** Resolve the materialized tree into {path, bytes} entries (byte-preserving). */
+  async materializedBytes(result: ReductionResult): Promise<{ path: string; bytes: Buffer }[]> {
+    const out: { path: string; bytes: Buffer }[] = [];
     for (const [path, blobOid] of result.tree) {
       const synth = result.synthBlobs.get(blobOid);
-      out.push({ path, content: synth ?? (await this.readBlob(blobOid)).toString("utf8") });
+      out.push({ path, bytes: synth ?? (await this.readBlob(blobOid)) });
     }
     return out;
+  }
+
+  /** Resolve the materialized tree into {path, content} entries (utf8 text view). */
+  async materializedFiles(result: ReductionResult): Promise<{ path: string; content: string }[]> {
+    return (await this.materializedBytes(result)).map(({ path, bytes }) => ({ path, content: bytes.toString("utf8") }));
   }
 
   /**
@@ -1908,7 +1965,7 @@ export class Repo {
     const checkpointOid = await this.createCheckpoint(viewName, opts.summary ?? `release of ${viewName}`);
     const checkpoint = await this.store.get<Checkpoint>(checkpointOid);
     const { generateSbom } = await import("../release/sbom.ts");
-    const sbom = generateSbom(await this.materializedFiles(result));
+    const sbom = generateSbom(await this.materializedBytes(result));
 
     const release: import("../objects/types.ts").Release = {
       type: "release",
