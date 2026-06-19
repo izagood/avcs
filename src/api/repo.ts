@@ -1042,7 +1042,7 @@ export class Repo {
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
-  async materialize(viewName = "main"): Promise<ReductionResult> {
+  async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"] }): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
     // Compaction (B3): on a cold instance, seed the incremental base from the persisted
     // snapshot so this materialize re-reduces only ops added since it, not all history.
@@ -1084,7 +1084,10 @@ export class Repo {
     // Phase 11: in a governed repo, ops authored by non-members (outsiders) are
     // quarantined — excluded from the materialized tree until a reviewer promotes them.
     const { kept, quarantined } = await this.#partitionQuarantine(complete);
-    const res = await this.#reduceOpSet(kept, q.includeStatuses, true); // main path: opt-in incremental
+    // A caller may override the view's default status filter (e.g. to project pending/gated
+    // ops so their computed 3-way merge can be inspected before acceptance — issue #13).
+    const includeStatuses = opts?.includeStatuses ?? q.includeStatuses;
+    const res = await this.#reduceOpSet(kept, includeStatuses, true); // main path: opt-in incremental
     for (const oid of quarantined) res.statuses.set(oid, "quarantined");
     return res;
   }
