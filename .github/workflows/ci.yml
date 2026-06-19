@@ -1,12 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
-# Cancel in-progress runs for the same PR/branch when new commits land.
+# Cancel in-progress runs for the same PR when new commits land.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
