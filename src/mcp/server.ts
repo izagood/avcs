@@ -14,9 +14,27 @@
 //   • A behavior change cannot be accepted without passing-test evidence.
 //   • On a conflict, produce options for a human; do not silently overwrite.
 
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Repo } from "../api/repo.ts";
 import type { Actor } from "../objects/types.ts";
+
+/**
+ * Read the installed package version off disk. Works for both the type-stripped
+ * source layout (src/mcp/server.ts) and the built layout (dist/mcp/server.js):
+ * in both, the package root is two directories up. Returns null if the file is
+ * missing or unparseable — callers treat that as "no drift signal", never a crash.
+ */
+function readPackageVersion(): string | null {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "..", "..", "package.json"), "utf8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
 
 const REPO_DIR = process.env.AVCS_REPO ?? process.cwd();
 
@@ -417,7 +435,8 @@ export async function startMcpServer(): Promise<void> {
     process.exit(1);
   }
 
-  const server = new sdk.Server({ name: "avcs", version: "0.0.1" }, { capabilities: { tools: {} } });
+  const bootVersion = readPackageVersion();
+  const server = new sdk.Server({ name: "avcs", version: bootVersion ?? "0.0.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(typesMod.ListToolsRequestSchema, async () => ({
     tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
@@ -426,10 +445,15 @@ export async function startMcpServer(): Promise<void> {
   // Reuse one Repo instance across tool calls so the reduce cache and metrics persist
   // for the life of the server (the long-lived agent-facing process M1's cache targets).
   let repo: Repo | null = null;
+  // Count of tool calls currently executing. The reload watcher only exits when this
+  // is zero, so an update never interrupts in-progress work — including a call parked
+  // on a human elicitation prompt (the await keeps it counted as in-flight).
+  let inFlight = 0;
   server.setRequestHandler(typesMod.CallToolRequestSchema, async (req) => {
     const tool = TOOLS.find((t) => t.name === req.params.name);
     if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
     if (!repo) repo = await Repo.open(REPO_DIR);
+    inFlight++;
     const ctx: ToolCtx = {
       // Bridge to MCP elicitation; surface a friendly error if the client lacks support.
       elicit: async (message, requestedSchema) => {
@@ -443,12 +467,41 @@ export async function startMcpServer(): Promise<void> {
         }
       },
     };
-    const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>, ctx);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    try {
+      const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>, ctx);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } finally {
+      inFlight--;
+    }
   });
 
+  // Reload-on-update: a long-lived stdio server holds the code it was spawned with, so
+  // an `npm i -g @izagood/avcs@latest` (or any update) does not reach a running process.
+  // We can't hot-swap the loaded module, so instead we watch the installed package
+  // version and, once it differs from what we booted with AND no tool call is in flight,
+  // exit cleanly so the MCP client respawns us on the new code. Set the interval to 0 to
+  // disable. `unref()` keeps the timer from holding the process alive on its own.
+  const reloadCheckMs = Number(process.env.AVCS_MCP_RELOAD_CHECK_MS ?? "10000");
+  if (bootVersion && Number.isFinite(reloadCheckMs) && reloadCheckMs > 0) {
+    const watcher = setInterval(() => {
+      if (inFlight > 0) return;
+      const current = readPackageVersion();
+      if (!current || current === bootVersion) return;
+      clearInterval(watcher);
+      console.error(
+        `[avcs-mcp] installed version changed ${bootVersion} -> ${current}; no calls in flight, ` +
+          `exiting so the MCP client respawns on the new code.`,
+      );
+      server.close().catch(() => {}).finally(() => process.exit(0));
+    }, reloadCheckMs);
+    watcher.unref?.();
+  }
+
   await server.connect(new stdio.StdioServerTransport());
-  console.error(`[avcs-mcp] serving repo ${REPO_DIR} over stdio (${TOOLS.length} tools)`);
+  console.error(
+    `[avcs-mcp] serving repo ${REPO_DIR} over stdio (${TOOLS.length} tools)` +
+      (bootVersion ? `, avcs v${bootVersion}` : ""),
+  );
 }
 
 // Only start the stdio server when run as the entry point — importing this module
