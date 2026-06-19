@@ -1357,17 +1357,54 @@ export class Repo {
   }
 
   // ── git-like working tree (checkout / commit) ─────────────────────────────
-  /** Read a working directory's files (relative paths → bytes), skipping .avcs/. */
-  async #readWorkTree(workDir: string): Promise<Map<string, Buffer>> {
+  /**
+   * Read a working directory's files (relative paths → bytes), skipping .avcs/ and honoring
+   * ignore rules (issue #10): the core's own `.avcsignore` (git-independent), plus an optional
+   * predicate the CLI bridge injects from `git check-ignore` so `.gitignore` is respected too.
+   * Walks manually and PRUNES ignored directories — an ignored dir is never descended into, so
+   * `node_modules/` etc. cost neither op-graph entries nor a recursive walk.
+   */
+  async #readWorkTree(workDir: string, ignorePredicate?: (rel: string) => boolean): Promise<Map<string, Buffer>> {
     const out = new Map<string, Buffer>();
     if (!existsSync(workDir)) return out;
-    for (const ent of await readdir(workDir, { recursive: true, withFileTypes: true })) {
-      if (!ent.isFile()) continue;
-      const rel = join(ent.parentPath ?? (ent as { path?: string }).path ?? workDir, ent.name).slice(workDir.length + 1);
-      if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel.startsWith(".git")) continue;
-      out.set(rel.split("\\").join("/"), await readFile(join(workDir, rel)));
-    }
+    const avcsIgnore = await this.#loadAvcsIgnore(workDir);
+    const ignored = (rel: string): boolean => avcsIgnore(rel) || (ignorePredicate?.(rel) ?? false);
+    const walk = async (dir: string): Promise<void> => {
+      for (const ent of await readdir(dir, { withFileTypes: true })) {
+        const rel = join(dir, ent.name).slice(workDir.length + 1).split("\\").join("/");
+        if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel.startsWith(".git")) continue;
+        if (ignored(rel)) continue; // prune: skip an ignored file, and never descend an ignored dir
+        if (ent.isDirectory()) await walk(join(dir, ent.name));
+        else if (ent.isFile()) out.set(rel, await readFile(join(dir, ent.name)));
+      }
+    };
+    await walk(workDir);
     return out;
+  }
+
+  /**
+   * Build an ignore predicate from a repo-root `.avcsignore`, kept git-independent so the core
+   * stays standalone (issue #10). Pragmatic subset of .gitignore: blank/`#` lines ignored; a
+   * `dir`/`path` matches itself and everything under it; a bare name matches any basename; and
+   * `*.ext` matches by suffix. Full .gitignore semantics are layered on by the CLI's git bridge.
+   */
+  async #loadAvcsIgnore(workDir: string): Promise<(rel: string) => boolean> {
+    const file = join(workDir, ".avcsignore");
+    if (!existsSync(file)) return () => false;
+    const patterns = (await readFile(file, "utf8"))
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"))
+      .map((l) => l.replace(/^\/+/, "").replace(/\/+$/, ""));
+    if (!patterns.length) return () => false;
+    return (rel: string): boolean => {
+      const base = rel.slice(rel.lastIndexOf("/") + 1);
+      return patterns.some((p) =>
+        p.startsWith("*")
+          ? rel.endsWith(p.slice(1)) || base.endsWith(p.slice(1))
+          : rel === p || rel.startsWith(p + "/") || base === p,
+      );
+    };
   }
 
   /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
@@ -1391,12 +1428,12 @@ export class Repo {
    */
   async commitWorkingTree(
     workDir: string,
-    opts: { message: string; actor: Actor; line?: string },
+    opts: { message: string; actor: Actor; line?: string; ignorePredicate?: (rel: string) => boolean },
   ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string }> {
     const view = opts.line ?? "main";
     const res = await this.materialize(view);
     const current = new Map((await this.materializedBytes(res)).map((f) => [f.path, f.bytes]));
-    const disk = await this.#readWorkTree(workDir);
+    const disk = await this.#readWorkTree(workDir, opts.ignorePredicate);
     const added: string[] = [];
     const modified: string[] = [];
     const removed: string[] = [];
@@ -1566,7 +1603,7 @@ export class Repo {
    * Git invocation (`git add`) is intentionally left to the caller/CLI so this core stays
    * git-agnostic; `.avcs/.gitignore` (ensured here) makes a plain `git add -A` mode-correct.
    */
-  async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string }): Promise<{
+  async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string };
     conflicts: ReductionResult["conflicts"];
@@ -1580,7 +1617,7 @@ export class Repo {
     const view = opts.line ?? "main";
     const lineOpt = opts.line ? { line: opts.line } : {};
     // 1. Capture direct working-tree edits as ops before anything else.
-    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt });
+    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}) });
     const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
