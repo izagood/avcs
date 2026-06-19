@@ -93,7 +93,9 @@ export function merge3(base: string, variants: string[], opts: Merge3Opts = {}):
       conflicts: [
         {
           baseStart: 0,
-          baseEnd: splitLines(base).length,
+          // Atomic: the whole content is one opaque conflict — line counts are
+          // meaningless here (may be binary), so don't pay/trust splitLines.
+          baseEnd: 1,
           base,
           mergedStart: 0,
           options: distinct.map((text, i) => ({ sides: [i], text })),

@@ -10,19 +10,22 @@ import type { Sbom, SbomComponent } from "../objects/types.ts";
 
 export interface FileEntry {
   path: string;
-  content: string;
+  bytes: Buffer;
 }
 
 export function generateSbom(files: FileEntry[]): Sbom {
   const components: SbomComponent[] = [];
 
   for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
-    components.push({ type: "file", name: f.path, hash: sha256hex(f.content) });
+    // Hash the raw bytes so binary files are addressed accurately. For text the
+    // utf8 byte hash equals the previous string hash, so text-only SBOMs do not
+    // regress. (sha256hex accepts Uint8Array; Buffer is a Uint8Array.)
+    components.push({ type: "file", name: f.path, hash: sha256hex(f.bytes) });
 
     // Declared dependencies from a package.json count as library components.
     if (f.path.endsWith("package.json")) {
       try {
-        const pkg = JSON.parse(f.content) as {
+        const pkg = JSON.parse(f.bytes.toString("utf8")) as {
           dependencies?: Record<string, string>;
           devDependencies?: Record<string, string>;
         };
