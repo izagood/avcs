@@ -75,6 +75,17 @@ function lineFor(dir: string, explicit?: string): string | undefined {
   return branch;
 }
 
+/** An ignore predicate backed by `git check-ignore`, so `git-sync` respects `.gitignore`
+ *  (and global excludes) without the core ever depending on git (issue #10). git absent or
+ *  not-a-repo ⇒ a no-op, leaving the core's own `.avcsignore` as the only filter. The core
+ *  prunes ignored directories, so this is invoked per surviving entry, not per ignored file. */
+function gitIgnorePredicate(dir: string): (rel: string) => boolean {
+  if (gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") return () => false;
+  // `git check-ignore -q <path>`: exit 0 (ignored) ⇒ gitCmd returns ""; exit 1 (not ignored)
+  // or any error ⇒ gitCmd returns null. So "ignored" is exactly a non-null result.
+  return (rel: string): boolean => gitCmd(dir, ["check-ignore", "-q", rel]) !== null;
+}
+
 /** Ensure the line/view exists before sync targets it (auto-forked from main on the first
  *  commit on a branch). No-op for the default `main` line/view, which always exists. */
 async function ensureLine(repo: Repo, line?: string): Promise<void> {
@@ -353,7 +364,7 @@ async function main(): Promise<void> {
       const author = flag("--author") ?? "human:cli";
       const line = lineFor(cwd, flag("--line"));
       await ensureLine(repo, line);
-      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}) });
+      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
@@ -483,7 +494,7 @@ async function main(): Promise<void> {
           // re-stage the canonical projection, and stash the provenance for the next hooks.
           const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
           await ensureLine(repo, line);
-          const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}) });
+          const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
           if (r.conflicts.length) {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
             process.exit(1); // abort the commit

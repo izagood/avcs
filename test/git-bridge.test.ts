@@ -239,3 +239,41 @@ test("git-sync from a linked git worktree shares one store and maps branch → l
 
   await rm(wt, { recursive: true, force: true });
 });
+
+test("git-sync honors .avcsignore — ignored dirs/files are not captured as ops (issue #10)", async () => {
+  const dir = await mkrepo();
+  const repo = await Repo.init(dir);
+  await repo.setGitMode("sidecar");
+
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(join(dir, "src/app.ts"), "export const v = 1\n", "utf8");
+  // junk that must never become ops: a whole ignored dir + an extension glob
+  await mkdir(join(dir, "node_modules/pkg"), { recursive: true });
+  await writeFile(join(dir, "node_modules/pkg/index.js"), "module.exports = 1\n", "utf8");
+  await writeFile(join(dir, "debug.log"), "noise\n", "utf8");
+  await writeFile(join(dir, ".avcsignore"), "node_modules/\n*.log\n", "utf8");
+
+  const r = await repo.gitSync({ message: "init", actor: dev });
+  assert.ok(r.captured.added.includes("src/app.ts"), "source file captured");
+  assert.ok(!r.captured.added.some((p) => p.startsWith("node_modules/")), "node_modules/ pruned, not captured");
+  assert.ok(!r.captured.added.some((p) => p.endsWith(".log")), "*.log ignored, not captured");
+});
+
+test("git-sync respects an injected ignore predicate — the CLI's git check-ignore bridge (issue #10)", async () => {
+  const dir = await mkrepo();
+  const repo = await Repo.init(dir);
+  await repo.setGitMode("sidecar");
+
+  await mkdir(join(dir, "build"), { recursive: true });
+  await writeFile(join(dir, "build/out.js"), "1\n", "utf8");
+  await writeFile(join(dir, "keep.ts"), "export const k = 1\n", "utf8");
+
+  // The CLI bridge injects a predicate derived from `git check-ignore`; simulate it marking build/ ignored.
+  const r = await repo.gitSync({
+    message: "init",
+    actor: dev,
+    ignorePredicate: (rel) => rel === "build" || rel.startsWith("build/"),
+  });
+  assert.ok(r.captured.added.includes("keep.ts"), "non-ignored file captured");
+  assert.ok(!r.captured.added.some((p) => p.startsWith("build/")), "injected predicate prunes build/");
+});
