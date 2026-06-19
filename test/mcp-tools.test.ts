@@ -156,3 +156,138 @@ test("history and metrics tools return structured data", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("object.show returns a blob's decoded text and an operation's structure (issue #12)", async () => {
+  const { repo, dir } = await tmpRepo();
+  try {
+    const intentOid = (await tool("avcs.intent.create").handler(repo, { title: "t", owner: "human:h" })) as string;
+    const sessionOid = (await tool("avcs.session.start").handler(repo, {
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+    })) as string;
+    const opOid = (await tool("avcs.operation.propose").handler(repo, {
+      sessionOid,
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+      path: "s.ts",
+      content: "export const x = 1;\n",
+      declaredPurpose: "seed",
+    })) as string;
+
+    // op oid → the structured operation, carrying the put_file blobOid
+    const opObj = (await tool("avcs.object.show").handler(repo, { oid: opOid })) as {
+      kind: string;
+      object: { body: { kind: string; blobOid: string } };
+    };
+    assert.equal(opObj.kind, "operation");
+    assert.equal(opObj.object.body.kind, "put_file");
+    const blobOid = opObj.object.body.blobOid;
+    assert.ok(blobOid, "operation carries a blobOid");
+
+    // blob oid → decoded utf8 text (the MCP equivalent of CLI `show`)
+    const blob = (await tool("avcs.object.show").handler(repo, { oid: blobOid })) as {
+      kind: string;
+      encoding: string;
+      binary: boolean;
+      text: string;
+    };
+    assert.equal(blob.kind, "blob");
+    assert.equal(blob.binary, false);
+    assert.equal(blob.encoding, "utf8");
+    assert.equal(blob.text, "export const x = 1;\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("operation.propose routes to a 3-way-mergeable edit_file when a base is declared (issue #20)", async () => {
+  const { repo, dir } = await tmpRepo();
+  try {
+    const intentOid = (await tool("avcs.intent.create").handler(repo, { title: "t", owner: "human:h" })) as string;
+    const sessionOid = (await tool("avcs.session.start").handler(repo, {
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+    })) as string;
+    const base = "alpha\nbeta\ngamma\n";
+    const propose = (args: Record<string, unknown>) =>
+      tool("avcs.operation.propose").handler(repo, {
+        sessionOid,
+        intentOid,
+        actor: { kind: "ai_agent", id: "ai:a" },
+        ...args,
+      }) as Promise<string>;
+
+    // a real base must exist in the tree first (put_file), then two disjoint edits over it
+    const scaffold = await propose({ path: "m.ts", content: base, declaredPurpose: "scaffold" });
+    const opA = await propose({
+      path: "m.ts",
+      content: "ALPHA\nbeta\ngamma\n",
+      baseText: base,
+      causalDeps: [scaffold],
+      declaredPurpose: "edit line 1",
+    });
+    const opB = await propose({
+      path: "m.ts",
+      content: "alpha\nbeta\nGAMMA\n",
+      baseText: base,
+      causalDeps: [scaffold],
+      declaredPurpose: "edit line 3",
+    });
+
+    // a declared base routes to edit_file (not the whole-file put_file) and carries a 3-way merge base
+    const aObj = (await tool("avcs.object.show").handler(repo, { oid: opA })) as {
+      object: { body: { kind: string; baseBlobOid?: string } };
+    };
+    assert.equal(aObj.object.body.kind, "edit_file");
+    assert.ok(aObj.object.body.baseBlobOid, "edit_file carries a baseBlobOid");
+
+    // disjoint concurrent edits against the same base auto-merge — no conflict, both lines applied
+    const res = await repo.materialize("main");
+    assert.equal(res.conflicts.length, 0, "disjoint edits merge without conflict");
+    const got = (await repo.materializedFiles(res)).find((f) => f.path === "m.ts")?.content;
+    assert.equal(got, "ALPHA\nbeta\nGAMMA\n", "both disjoint edits survive the auto-merge");
+    assert.equal(res.statuses.get(opB), "accepted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("view.materialize includeStatuses projects gated ops and reports the dropped (issue #13)", async () => {
+  const { repo, dir } = await tmpRepo();
+  try {
+    const intentOid = (await tool("avcs.intent.create").handler(repo, { title: "t", owner: "human:h" })) as string;
+    const sessionOid = (await tool("avcs.session.start").handler(repo, {
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+    })) as string;
+    // a behavior-changing op with no passing-test evidence stays gated (not accepted)
+    const opOid = (await tool("avcs.operation.propose").handler(repo, {
+      sessionOid,
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+      path: "impl.ts",
+      content: "export const f = () => 2;\n",
+      declaredPurpose: "behavior change",
+      effects: { changesBehavior: true },
+    })) as string;
+
+    // default (accepted only): the gated op is NOT in the tree, but IS surfaced as dropped (no silent omission)
+    const def = (await tool("avcs.view.materialize").handler(repo, {})) as {
+      files: string[];
+      status: Record<string, string>;
+      dropped: { oid: string; status: string }[];
+    };
+    assert.ok(!def.files.includes("impl.ts"), "gated op omitted from the default tree");
+    assert.notEqual(def.status[opOid], "accepted");
+    assert.ok(def.dropped.some((d) => d.oid === opOid), "gated op surfaced in `dropped`");
+
+    // opt-in: include the gated op's status → it projects into the tree, so its merge is inspectable
+    const incl = (await tool("avcs.view.materialize").handler(repo, {
+      includeStatuses: ["accepted", def.status[opOid]],
+    })) as { files: string[]; dropped: { oid: string }[] };
+    assert.ok(incl.files.includes("impl.ts"), "gated op projected once its status is included");
+    assert.ok(!incl.dropped.some((d) => d.oid === opOid), "no longer dropped once included");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -18,7 +18,8 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Repo } from "../api/repo.ts";
-import type { Actor } from "../objects/types.ts";
+import { isBinary } from "../core/bytes.ts";
+import type { Actor, OperationStatus } from "../objects/types.ts";
 
 /**
  * Read the installed package version off disk. Works for both the type-stripped
@@ -121,7 +122,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.operation.propose",
-    description: "Propose a semantic change. MVP supports file writes. DECLARE EFFECTS honestly (changesBehavior, breaksPublicApi) — policy gates on them.",
+    description: "Propose a semantic change. MVP supports file writes. DECLARE EFFECTS honestly (changesBehavior, breaksPublicApi) — policy gates on them. Pass baseText or baseBlobOid to author a base-relative edit_file (3-way-mergeable with concurrent edits); omit both for a whole-file put_file.",
     inputSchema: {
       type: "object",
       properties: {
@@ -129,10 +130,12 @@ export const TOOLS: ToolDef[] = [
         intentOid: { type: "string" },
         actor: actorSchema,
         path: { type: "string" },
-        content: { type: "string" },
+        content: { type: "string", description: "the FULL new file content (used for both put_file and edit_file)" },
         declaredPurpose: { type: "string" },
         causalDeps: { type: "array", items: { type: "string" } },
         line: { type: "string", description: "lineage to author on; default 'main' (Phase 8)" },
+        baseText: { type: "string", description: "the base content this edit was derived from; its presence routes to a 3-way-mergeable edit_file" },
+        baseBlobOid: { type: "string", description: "oid of the base blob (alternative to baseText); fetch it via avcs.object.show" },
         effects: {
           type: "object",
           properties: {
@@ -144,18 +147,29 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["sessionOid", "intentOid", "actor", "path", "content", "declaredPurpose"],
     },
-    handler: (repo, i) =>
-      repo.proposeFileWrite({
+    handler: (repo, i) => {
+      const common = {
         sessionOid: String(i.sessionOid),
         intentOid: String(i.intentOid),
         actor: actorOf(i),
         path: String(i.path),
-        content: String(i.content),
         declaredPurpose: String(i.declaredPurpose),
         causalDeps: i.causalDeps as string[] | undefined,
         effects: i.effects as never,
         line: i.line as string | undefined,
-      }),
+      };
+      // A declared base (baseText or baseBlobOid) authors a base-relative edit_file, which
+      // 3-way line-merges with concurrent edits; otherwise a whole-file put_file (issue #20).
+      if (i.baseText !== undefined || i.baseBlobOid !== undefined) {
+        return repo.proposeEdit({
+          ...common,
+          newText: String(i.content),
+          baseText: i.baseText as string | undefined,
+          baseBlobOid: i.baseBlobOid as string | undefined,
+        });
+      }
+      return repo.proposeFileWrite({ ...common, content: String(i.content) });
+    },
   },
   {
     name: "avcs.line.create",
@@ -213,17 +227,35 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.view.materialize",
-    description: "Reduce the operation graph for a view into a code tree + per-op status + open conflicts. This is how an agent checks whether its work merges.",
-    inputSchema: { type: "object", properties: { view: { type: "string" } } },
+    description: "Reduce the operation graph for a view into a code tree + per-op status + open conflicts. This is how an agent checks whether its work merges. Pass includeStatuses (e.g. ['accepted','needs_decision']) to ALSO project gated/pending ops so their computed 3-way merge can be inspected before acceptance; `dropped` lists ops NOT in the tree (status outside includeStatuses) so omissions are never silent (issue #13).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        view: { type: "string" },
+        includeStatuses: {
+          type: "array",
+          items: { type: "string", enum: ["proposed", "validating", "accepted", "rejected", "superseded", "needs_decision", "quarantined"] },
+          description: "op statuses to project into the tree; default ['accepted']",
+        },
+      },
+    },
     handler: async (repo, i) => {
-      const res = await repo.materialize((i.view as string) ?? "main");
+      const include = i.includeStatuses as OperationStatus[] | undefined;
+      const res = await repo.materialize((i.view as string) ?? "main", include ? { includeStatuses: include } : undefined);
       const status: Record<string, string> = {};
       for (const [oid, s] of res.statuses) status[oid] = s;
+      // Surface what was NOT projected (status outside the include set) so a gated op is
+      // never silently missing from the materialized tree (issue #13).
+      const projected = new Set<string>(include ?? ["accepted"]);
+      const dropped = Object.entries(status)
+        .filter(([, s]) => !projected.has(s))
+        .map(([oid, s]) => ({ oid, status: s }));
       return {
         treeHash: res.treeHash,
         files: [...res.tree.keys()].sort(),
         status,
         conflicts: res.conflicts,
+        dropped,
       };
     },
   },
@@ -408,6 +440,22 @@ export const TOOLS: ToolDef[] = [
         signedBy: i.signedBy as string[] | undefined,
         artifacts: i.artifacts as never,
       }),
+  },
+  {
+    name: "avcs.object.show",
+    description: "Read an object by oid — the MCP equivalent of CLI `show`. For a blob, returns the decoded content (utf8 `text`, or `base64` if binary); for an operation/intent/etc., the structured object. Lets a pure-MCP agent inspect another agent's authored content, or fetch a base blob to declare as baseBlobOid on an edit_file propose (issue #12).",
+    inputSchema: { type: "object", properties: { oid: { type: "string" } }, required: ["oid"] },
+    handler: async (repo, i) => {
+      const oid = String(i.oid);
+      const obj = await repo.store.get(oid);
+      if ((obj as { type?: string }).type === "blob") {
+        const buf = await repo.readBlob(oid);
+        return isBinary(buf)
+          ? { oid, kind: "blob", encoding: "base64", binary: true, bytes: buf.length, data: buf.toString("base64") }
+          : { oid, kind: "blob", encoding: "utf8", binary: false, bytes: buf.length, text: buf.toString("utf8") };
+      }
+      return { oid, kind: (obj as { type?: string }).type ?? "object", object: obj };
+    },
   },
 ];
 
