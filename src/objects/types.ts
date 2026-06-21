@@ -177,6 +177,13 @@ export interface Operation extends BaseObject {
    * contending. See docs/09 G1.
    */
   line?: string;
+  /**
+   * Workspace scope (docs/16). Isolates an op to a converging build/verify workspace:
+   * a base-line view EXCLUDES workspace-tagged ops, while that workspace's own view sees
+   * base + its ops. Absent ⇒ the op belongs directly to its line. Distinct from `line`
+   * (which diverges long-term); a workspace converges and is meant to `land` onto its base.
+   */
+  workspace?: string;
   /** Provenance for a ported/backported/cherry-picked op: the source op's oid. */
   derivedFrom?: string;
   /** The op this one reverts (forward-only inverse). */
