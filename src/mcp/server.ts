@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Repo } from "../api/repo.ts";
 import { isBinary } from "../core/bytes.ts";
+import { ObjectStore } from "../store/objectStore.ts";
 import type { Actor, OperationStatus } from "../objects/types.ts";
 
 /**
@@ -37,7 +38,10 @@ function readPackageVersion(): string | null {
   }
 }
 
-const REPO_DIR = process.env.AVCS_REPO ?? process.cwd();
+// An explicit pin. When set, the server serves exactly this repo (resolved upward to its
+// `.avcs` root, so a subdirectory works too) and does NOT auto-discover — `AVCS_REPO` means
+// "fixed to this repo". When unset, the server discovers the target repo per call.
+const ENV_REPO = process.env.AVCS_REPO;
 
 /** Result of an MCP elicitation prompt (subset of the SDK's ElicitResult). */
 export interface ElicitOutcome {
@@ -72,6 +76,66 @@ const actorSchema = {
   },
   required: ["id"],
 };
+
+/** Optional per-call repo target. A single long-lived MCP server can serve many repos: a
+ *  tool call may carry `cwd` to say "operate on the repo owning this directory". Injected
+ *  into every advertised tool schema so it's discoverable without bloating each ToolDef. */
+const cwdSchema = {
+  type: "string",
+  description:
+    "Absolute path of the working directory to act on; the server resolves it upward to the " +
+    "owning AVCS repo (.avcs). Optional — defaults to the client's workspace root, then the " +
+    "server's own cwd. Ignored when the server is pinned via AVCS_REPO.",
+};
+
+/**
+ * Resolve which AVCS repo a tool call targets, returning its `.avcs` root dir.
+ *
+ * Precedence (each candidate is resolved upward via {@link ObjectStore.findRepoRoot}, so a
+ * subdirectory of a repo resolves to the repo):
+ *   1. `AVCS_REPO` — an explicit pin; if set, ONLY this is tried (a pin means a pin).
+ *   2. `callCwd` — the per-call `cwd` argument (one server, many repos).
+ *   3. client workspace roots — what the MCP client advertises via `roots` (the
+ *      protocol-blessed way to learn the agent's working dirs; absent for clients that
+ *      don't support it).
+ *   4. the server's own `process.cwd()` — last resort.
+ *
+ * Throws with the list of places searched when nothing resolves, so the failure is
+ * actionable rather than a bare "not an AVCS repo". `listRoots` is a callback (not the SDK
+ * server) so this is unit-testable and only invoked when earlier candidates miss.
+ */
+export async function resolveRepoDir(
+  callCwd: string | undefined,
+  listRoots: () => Promise<string[]>,
+): Promise<string> {
+  if (ENV_REPO) {
+    const root = ObjectStore.findRepoRoot(ENV_REPO);
+    if (root) return root;
+    throw new Error(
+      `AVCS_REPO=${ENV_REPO} is not an AVCS repo (no .avcs/ at or above it). ` +
+        "Run `avcs init` there, fix the path, or unset AVCS_REPO to auto-discover.",
+    );
+  }
+  const tried: string[] = [];
+  const tryDir = (d: string | undefined): string | null => {
+    if (!d) return null;
+    tried.push(d);
+    return ObjectStore.findRepoRoot(d);
+  };
+  let root = tryDir(callCwd);
+  if (root) return root;
+  for (const r of await listRoots()) {
+    root = tryDir(r);
+    if (root) return root;
+  }
+  root = tryDir(process.cwd());
+  if (root) return root;
+  throw new Error(
+    `could not locate an AVCS repo. Searched at and above: ${tried.join(", ") || "(nowhere)"}. ` +
+      "Pass `cwd` to the tool, register the server with AVCS_REPO (`avcs mcp install --repo <dir>`), " +
+      "or run `avcs init`.",
+  );
+}
 
 export const TOOLS: ToolDef[] = [
   {
@@ -487,12 +551,51 @@ export async function startMcpServer(): Promise<void> {
   const server = new sdk.Server({ name: "avcs", version: bootVersion ?? "0.0.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(typesMod.ListToolsRequestSchema, async () => ({
-    tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+    tools: TOOLS.map((t) => ({
+      name: t.name,
+      description: t.description,
+      // Advertise the universal optional `cwd` so per-call repo targeting is discoverable.
+      inputSchema: {
+        ...t.inputSchema,
+        properties: { ...((t.inputSchema.properties as Record<string, unknown>) ?? {}), cwd: cwdSchema },
+      },
+    })),
   }));
 
-  // Reuse one Repo instance across tool calls so the reduce cache and metrics persist
-  // for the life of the server (the long-lived agent-facing process M1's cache targets).
-  let repo: Repo | null = null;
+  // Ask the MCP client for its workspace roots (the protocol-blessed way to learn where the
+  // agent is working). Returns filesystem paths; empty when the client lacks the capability
+  // or advertises none — callers fall back to cwd. Never throws.
+  const clientRoots = async (): Promise<string[]> => {
+    try {
+      const res = (await server.listRoots()) as { roots?: Array<{ uri?: string }> };
+      const out: string[] = [];
+      for (const r of res.roots ?? []) {
+        if (typeof r.uri !== "string") continue;
+        try {
+          out.push(r.uri.startsWith("file://") ? fileURLToPath(r.uri) : r.uri);
+        } catch {
+          /* skip non-file roots */
+        }
+      }
+      return out;
+    } catch {
+      return []; // client did not declare the `roots` capability
+    }
+  };
+
+  // One Repo instance per resolved repo dir, reused across tool calls so each repo's reduce
+  // cache and metrics persist for the life of the server. A single server can serve several
+  // repos (different workspaces) without rebuilding state on every call.
+  const repos = new Map<string, Repo>();
+  const openRepo = async (callCwd: string | undefined): Promise<Repo> => {
+    const dir = await resolveRepoDir(callCwd, clientRoots);
+    let repo = repos.get(dir);
+    if (!repo) {
+      repo = await Repo.open(dir);
+      repos.set(dir, repo);
+    }
+    return repo;
+  };
   // Count of tool calls currently executing. The reload watcher only exits when this
   // is zero, so an update never interrupts in-progress work — including a call parked
   // on a human elicitation prompt (the await keeps it counted as in-flight).
@@ -500,7 +603,9 @@ export async function startMcpServer(): Promise<void> {
   server.setRequestHandler(typesMod.CallToolRequestSchema, async (req) => {
     const tool = TOOLS.find((t) => t.name === req.params.name);
     if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
-    if (!repo) repo = await Repo.open(REPO_DIR);
+    const argsIn = (req.params.arguments ?? {}) as Record<string, unknown>;
+    const callCwd = typeof argsIn.cwd === "string" ? argsIn.cwd : undefined;
+    const repo = await openRepo(callCwd);
     inFlight++;
     const ctx: ToolCtx = {
       // Bridge to MCP elicitation; surface a friendly error if the client lacks support.
@@ -516,7 +621,7 @@ export async function startMcpServer(): Promise<void> {
       },
     };
     try {
-      const result = await tool.handler(repo, (req.params.arguments ?? {}) as Record<string, unknown>, ctx);
+      const result = await tool.handler(repo, argsIn, ctx);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     } finally {
       inFlight--;
@@ -546,8 +651,11 @@ export async function startMcpServer(): Promise<void> {
   }
 
   await server.connect(new stdio.StdioServerTransport());
+  const target = ENV_REPO
+    ? `repo ${ENV_REPO} (pinned via AVCS_REPO)`
+    : "repo per call (cwd arg → client roots → server cwd)";
   console.error(
-    `[avcs-mcp] serving repo ${REPO_DIR} over stdio (${TOOLS.length} tools)` +
+    `[avcs-mcp] serving ${target} over stdio (${TOOLS.length} tools)` +
       (bootVersion ? `, avcs v${bootVersion}` : ""),
   );
 }

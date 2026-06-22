@@ -51,12 +51,15 @@ function gitCmd(dir: string, a: string[]): string | null {
   }
 }
 
-/** Locate the single AVCS store for a (possibly git-worktree) working dir: it's here
- *  if `.avcs` is present, otherwise it lives in the main git checkout (resolved via
- *  `git rev-parse --git-common-dir`, whose parent is the main work tree). Falls back to
- *  `dir` so `Repo.open` surfaces its normal "not an AVCS repo" error when truly absent. */
+/** Locate the single AVCS store for a (possibly git-worktree) working dir: it's at `dir`
+ *  or any ancestor if `.avcs` is present (AVCS's own upward root-finding — works with no
+ *  git, like `git` ascending to `.git`); otherwise it lives in the main git checkout
+ *  (resolved via `git rev-parse --git-common-dir`, whose parent is the main work tree).
+ *  Falls back to `dir` so `Repo.open` surfaces its normal "not an AVCS repo" error when
+ *  truly absent. */
 function storeDirFor(dir: string): string {
-  if (ObjectStore.isRepo(dir)) return dir; // non-worktree, or committed-mode main checkout
+  const root = ObjectStore.findRepoRoot(dir); // here, or any ancestor (non-git-dependent)
+  if (root) return root;
   const common = gitCmd(dir, ["rev-parse", "--git-common-dir"]);
   if (common) {
     const main = dirname(isAbsolute(common) ? common : join(dir, common)); // <main>/.git → <main>
