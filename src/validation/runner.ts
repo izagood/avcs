@@ -89,13 +89,21 @@ export async function runChecks(
   opts: {
     ops: string[];
     view?: string;
+    /** Validate a workspace view (docs/16): base + that workspace's isolated ops. */
+    workspace?: string;
     workspaceDir: string;
+    /**
+     * Materialize the view into `workspaceDir` before running (default true). Set false to
+     * run in place when the dir already holds the tree + build env (e.g. the working tree) —
+     * this is what lets validate_run work for Node/pnpm without avcs owning install (#11).
+     */
+    project?: boolean;
     ciActor: Actor;
     checks: CheckSpec[];
   },
 ): Promise<string[]> {
-  const result = await repo.materialize(opts.view ?? "main");
-  await repo.writeWorkspace(result, opts.workspaceDir);
+  const result = await repo.materialize(opts.view ?? "main", opts.workspace ? { workspace: opts.workspace } : undefined);
+  if (opts.project !== false) await repo.writeWorkspace(result, opts.workspaceDir);
 
   const evidenceOids: string[] = [];
   for (const check of opts.checks) {
@@ -114,6 +122,7 @@ export async function runChecks(
       producedBy: opts.ciActor,
       command: check.command,
       detail: truncate(detailParts.join("\n")),
+      treeHash: result.treeHash,
     });
     evidenceOids.push(oid);
   }

@@ -434,12 +434,15 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.validate.run",
-    description: "Run validation commands (test/lint/typecheck) against a materialized view and attach the results as signed-able Evidence. Behavior changes need passing evidence to be accepted.",
+    description: "Run validation commands against a view and attach treeHash-bound Evidence (docs/16 §8). By default materializes into a fresh temp dir. Pass `dir` (e.g. your working tree, which already has the build env like node_modules) to run there without avcs owning install — the fix for Node/pnpm (issue #11); with `dir` it runs in place unless `project:true`. Use `workspace` to validate a workspace view. Evidence trusts author≠signer, so pass a ciActor distinct from the op authors.",
     inputSchema: {
       type: "object",
       properties: {
         ops: { type: "array", items: { type: "string" } },
         view: { type: "string" },
+        workspace: { type: "string", description: "validate a workspace view (docs/16): base + that workspace's isolated ops" },
+        dir: { type: "string", description: "directory to run checks in; defaults to a fresh isolated temp dir. Pass a dir that already holds the build env (e.g. the working tree) to avoid reinstalling (issue #11)" },
+        project: { type: "boolean", description: "materialize the view into `dir` before running; defaults true for a temp dir, false when `dir` is given (run in place)" },
         ciActor: actorSchema,
         checks: {
           type: "array",
@@ -454,14 +457,23 @@ export const TOOLS: ToolDef[] = [
     },
     handler: async (repo, i) => {
       const { runChecks } = await import("../validation/runner.ts");
-      const { mkdtemp } = await import("node:fs/promises");
-      const { tmpdir } = await import("node:os");
-      const { join } = await import("node:path");
-      const workspaceDir = await mkdtemp(join(tmpdir(), "avcs-validate-"));
+      const dir = i.dir as string | undefined;
+      let workspaceDir = dir;
+      if (!workspaceDir) {
+        const { mkdtemp } = await import("node:fs/promises");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        workspaceDir = await mkdtemp(join(tmpdir(), "avcs-validate-"));
+      }
+      // A fresh temp dir is materialized into (project=true); a caller-supplied `dir` runs in
+      // place by default (it already holds the tree + build env), unless project is forced.
+      const project = i.project !== undefined ? (i.project as boolean) : !dir;
       return runChecks(repo, {
         ops: i.ops as string[],
         view: i.view as string | undefined,
+        workspace: i.workspace as string | undefined,
         workspaceDir,
+        project,
         ciActor: actorOf(i),
         checks: i.checks as { kind: never; command: string }[],
       });
