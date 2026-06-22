@@ -227,6 +227,13 @@ export interface Evidence extends BaseObject {
   producedBy: Actor;
   createdAt: string;
   /**
+   * The materialized treeHash this evidence was produced against (docs/16 §5). Binds the
+   * result to a specific tree so it can't be transplanted onto a different op-set, and so
+   * an integration whose treeHash differs is never silently treated as "verified". Optional
+   * for now (legacy/ad-hoc evidence omits it); validate_run fills it in.
+   */
+  treeHash?: string;
+  /**
    * Phase 11: produced by a secret-less, network-isolated runner over untrusted code.
    * Such evidence is NOT trusted for the policy gate (you must re-run in the trusted
    * lane after promotion) — it's the pull_request_target hazard guard.

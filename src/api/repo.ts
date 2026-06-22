@@ -501,6 +501,8 @@ export class Repo {
     producedBy: Actor;
     command?: string;
     detail?: string;
+    /** The materialized treeHash this evidence was produced against (docs/16 §5). */
+    treeHash?: string;
     /** Produced by a secret-less isolated runner over untrusted code (Phase 11). */
     fromUntrustedRunner?: boolean;
     /** Sign the evidence so the trust gate can verify it cryptographically. */
@@ -515,6 +517,7 @@ export class Repo {
       command: args.command,
       detail: args.detail,
       createdAt: new Date().toISOString(),
+      ...(args.treeHash ? { treeHash: args.treeHash } : {}),
       ...(args.fromUntrustedRunner ? { fromUntrustedRunner: true } : {}),
     };
     ev.sig = this.#sign("evidence", ev as unknown as Record<string, unknown>, args.signWith);

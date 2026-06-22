@@ -293,6 +293,7 @@ export const TOOLS: ToolDef[] = [
         actor: actorSchema,
         command: { type: "string" },
         detail: { type: "string" },
+        treeHash: { type: "string", description: "the materialized treeHash this evidence was produced against (docs/16); binds the result to a specific tree" },
       },
       required: ["forOps", "kind", "result"],
     },
@@ -304,6 +305,7 @@ export const TOOLS: ToolDef[] = [
         producedBy: actorOf(i),
         command: i.command as string | undefined,
         detail: i.detail as string | undefined,
+        treeHash: i.treeHash as string | undefined,
       }),
   },
   {

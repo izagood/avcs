@@ -130,7 +130,10 @@ export function evaluateOp(
   const trusted = evidenceForOp.filter(
     (e) =>
       !e.fromUntrustedRunner &&
-      (e.producedBy.kind !== "ai_agent" || e.producedBy.id !== op.actor.id),
+      // docs/16 §5: the author can't vouch for their own change — independent of actor
+      // kind. Trust comes from a DIFFERENT actor's signed evidence (author ≠ signer), not
+      // from being a human/ci_bot. Self-evidence is provisional (workspace-internal) only.
+      e.producedBy.id !== op.actor.id,
   );
   const ignored = evidenceForOp.length - trusted.length;
   if (ignored > 0) ev.notes.push(`${ignored} self-reported evidence ignored`);
