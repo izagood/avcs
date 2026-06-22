@@ -386,6 +386,7 @@ export class Repo {
     effects?: Operation["effects"];
     confidence?: number;
     line?: string;
+    workspace?: string;
     derivedFrom?: string;
     revertOf?: string;
     coAuthors?: Actor[];
@@ -408,6 +409,7 @@ export class Repo {
       // Only store `line` when it is non-default, so existing (line-less) repos and
       // their oids stay byte-identical — backward compatibility with "main".
       ...(args.line && args.line !== "main" ? { line: args.line } : {}),
+      ...(args.workspace ? { workspace: args.workspace } : {}),
       ...(args.derivedFrom ? { derivedFrom: args.derivedFrom } : {}),
       ...(args.revertOf ? { revertOf: args.revertOf } : {}),
       ...(args.coAuthors && args.coAuthors.length ? { coAuthors: args.coAuthors } : {}),
@@ -431,6 +433,7 @@ export class Repo {
     causalDeps?: string[];
     effects?: Operation["effects"];
     line?: string;
+    workspace?: string;
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const blobOid = await this.putBlob(args.content);
@@ -444,6 +447,7 @@ export class Repo {
       causalDeps: args.causalDeps,
       effects: args.effects,
       line: args.line,
+      workspace: args.workspace,
       signWith: args.signWith,
     });
   }
@@ -469,6 +473,7 @@ export class Repo {
     causalDeps?: string[];
     effects?: Operation["effects"];
     line?: string;
+    workspace?: string;
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
@@ -484,6 +489,7 @@ export class Repo {
       causalDeps: args.causalDeps,
       effects: args.effects,
       line: args.line,
+      workspace: args.workspace,
       signWith: args.signWith,
     });
   }
@@ -1042,7 +1048,7 @@ export class Repo {
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
-  async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"] }): Promise<ReductionResult> {
+  async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"]; workspace?: string }): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
     // Compaction (B3): on a cold instance, seed the incremental base from the persisted
     // snapshot so this materialize re-reduces only ops added since it, not all history.
@@ -1060,10 +1066,16 @@ export class Repo {
     const allOps = await this.#allOpsTailed();
     const inherited = await this.#inheritedOps(lineName, allOps);
 
+    const wsName = opts?.workspace;
     const ops: Operation[] = [];
     for (const op of allOps) {
       const onLine = (op.line ?? "main") === lineName || inherited.has(op.oid as string);
       if (!onLine) continue;
+      // Workspace isolation (docs/16): a base view (no wsName) excludes every workspace-
+      // tagged op; a workspace view (wsName=W) sees base ops + W's own, never another's.
+      // (land — promoting a workspace's ops onto its base — is a later slice.)
+      const opWs = op.workspace;
+      if (wsName ? (!!opWs && opWs !== wsName) : !!opWs) continue;
       if (exclude.has(op.oid as string)) continue;
       if (intentFilter && !intentFilter.has(op.intentOid)) continue;
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
