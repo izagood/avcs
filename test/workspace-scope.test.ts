@@ -66,3 +66,52 @@ test("concurrent same-file workspaces are isolated, not merged — no conflict s
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("land promotes a workspace's ops onto the base view (docs/16)", async () => {
+  const dir = await mk();
+  const repo = await Repo.init(dir);
+  try {
+    const intent = await repo.createIntent({ title: "t", owner: "human:h" });
+    const sess = await repo.startSession({ intentOid: intent, actor: A });
+    await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: A, path: "f.ts", content: "from A\n", declaredPurpose: "A", workspace: "wsA" });
+
+    const baseFiles = async () => (await repo.materializedFiles(await repo.materialize("main"))).map((f) => f.path);
+
+    // before land: base view excludes the workspace op
+    assert.deepEqual(await baseFiles(), []);
+    assert.deepEqual(await repo.landedWorkspaces(), []);
+
+    // land → base view now includes it; landed set reflects it; idempotent
+    await repo.landWorkspace("wsA");
+    await repo.landWorkspace("wsA"); // idempotent
+    assert.deepEqual(await repo.landedWorkspaces(), ["wsA"]);
+    const files = await repo.materializedFiles(await repo.materialize("main"));
+    assert.deepEqual(files.map((f) => f.path), ["f.ts"]);
+    assert.equal(files.find((f) => f.path === "f.ts")?.content, "from A\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("two landed workspaces with disjoint edits auto-merge on base — no rebase (docs/16)", async () => {
+  const dir = await mk();
+  const repo = await Repo.init(dir);
+  try {
+    const intent = await repo.createIntent({ title: "t", owner: "human:h" });
+    const sess = await repo.startSession({ intentOid: intent, actor: A });
+    const base = "alpha\nbeta\ngamma\n";
+    const scaffold = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: A, path: "m.ts", content: base, declaredPurpose: "scaffold" });
+    // two workspaces edit disjoint lines off the same base
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: A, path: "m.ts", baseText: base, newText: "ALPHA\nbeta\ngamma\n", causalDeps: [scaffold], declaredPurpose: "A", workspace: "wsA" });
+    await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: A, path: "m.ts", baseText: base, newText: "alpha\nbeta\nGAMMA\n", causalDeps: [scaffold], declaredPurpose: "B", workspace: "wsB" });
+
+    await repo.landWorkspace("wsA");
+    await repo.landWorkspace("wsB");
+    const res = await repo.materialize("main");
+    assert.equal(res.conflicts.length, 0, "disjoint landed edits auto-merge, no conflict");
+    const got = (await repo.materializedFiles(res)).find((f) => f.path === "m.ts")?.content;
+    assert.equal(got, "ALPHA\nbeta\nGAMMA\n", "both landed edits survive the merge on base");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
