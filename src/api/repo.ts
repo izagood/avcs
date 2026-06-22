@@ -1459,8 +1459,8 @@ export class Repo {
   }
 
   /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
-  async checkoutInto(workDir: string, view = "main"): Promise<string[]> {
-    const res = await this.materialize(view);
+  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+    const res = await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
     const written: string[] = [];
     for (const [path, blobOid] of res.tree) {
       const full = join(workDir, path);
