@@ -291,3 +291,39 @@ test("view.materialize includeStatuses projects gated ops and reports the droppe
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("operation.propose workspace + workspace.land/list manage isolation → convergence (docs/16, #26)", async () => {
+  const { repo, dir } = await tmpRepo();
+  try {
+    const intentOid = (await tool("avcs.intent.create").handler(repo, { title: "t", owner: "human:h" })) as string;
+    const sessionOid = (await tool("avcs.session.start").handler(repo, {
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+    })) as string;
+    await tool("avcs.operation.propose").handler(repo, {
+      sessionOid,
+      intentOid,
+      actor: { kind: "ai_agent", id: "ai:a" },
+      path: "w.ts",
+      content: "ws\n",
+      declaredPurpose: "ws work",
+      workspace: "wsA",
+    });
+
+    // base view excludes the un-landed workspace op; landed list empty
+    const base1 = (await tool("avcs.view.materialize").handler(repo, {})) as { files: string[] };
+    assert.ok(!base1.files.includes("w.ts"), "base view excludes un-landed workspace op");
+    assert.deepEqual(((await tool("avcs.workspace.list").handler(repo, {})) as { landed: string[] }).landed, []);
+
+    // land via the tool → returns the landed set
+    const landed = (await tool("avcs.workspace.land").handler(repo, { name: "wsA" })) as { landed: string[] };
+    assert.deepEqual(landed.landed, ["wsA"]);
+    assert.deepEqual(((await tool("avcs.workspace.list").handler(repo, {})) as { landed: string[] }).landed, ["wsA"]);
+
+    // base view now includes the landed workspace's op
+    const base2 = (await tool("avcs.view.materialize").handler(repo, {})) as { files: string[] };
+    assert.ok(base2.files.includes("w.ts"), "base view includes the landed workspace op");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

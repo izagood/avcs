@@ -575,6 +575,31 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "workspace": {
+      // Native build/verify isolation (docs/16): project a workspace's view to a dir,
+      // land it onto its base, or list landed workspaces. `project` is the physical
+      // checkout that lets concurrent agents build without colliding on disk.
+      const repo = await Repo.open(cwd);
+      const sub = args[1];
+      if (sub === "project") {
+        const name = args[2];
+        if (!name || name.startsWith("--")) throw new Error("usage: avcs workspace project <name> [--out <dir>]");
+        const out = flag("--out") ?? cwd;
+        const written = await repo.checkoutInto(out, "main", { workspace: name });
+        console.log(`projected workspace ${name}: ${written.length} file(s) to ${out}`);
+      } else if (sub === "land") {
+        const name = args[2];
+        if (!name) throw new Error("usage: avcs workspace land <name>");
+        await repo.landWorkspace(name);
+        console.log(`landed workspace ${name}`);
+      } else if (sub === "list") {
+        const landed = await repo.landedWorkspaces();
+        console.log(landed.length ? landed.join("\n") : "(no landed workspaces)");
+      } else {
+        throw new Error("usage: avcs workspace <project|land|list> ...");
+      }
+      break;
+    }
     case "checkpoint": {
       const repo = await Repo.open(cwd);
       const view = args[1] ?? "main";
