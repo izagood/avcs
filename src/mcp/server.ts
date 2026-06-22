@@ -198,6 +198,7 @@ export const TOOLS: ToolDef[] = [
         declaredPurpose: { type: "string" },
         causalDeps: { type: "array", items: { type: "string" } },
         line: { type: "string", description: "lineage to author on; default 'main' (Phase 8)" },
+        workspace: { type: "string", description: "isolate this op to a build/verify workspace (docs/16); a base view excludes it until the workspace is landed via avcs.workspace.land" },
         baseText: { type: "string", description: "the base content this edit was derived from; its presence routes to a 3-way-mergeable edit_file" },
         baseBlobOid: { type: "string", description: "oid of the base blob (alternative to baseText); fetch it via avcs.object.show" },
         effects: {
@@ -221,6 +222,7 @@ export const TOOLS: ToolDef[] = [
         causalDeps: i.causalDeps as string[] | undefined,
         effects: i.effects as never,
         line: i.line as string | undefined,
+        workspace: i.workspace as string | undefined,
       };
       // A declared base (baseText or baseBlobOid) authors a base-relative edit_file, which
       // 3-way line-merges with concurrent edits; otherwise a whole-file put_file (issue #20).
@@ -234,6 +236,21 @@ export const TOOLS: ToolDef[] = [
       }
       return repo.proposeFileWrite({ ...common, content: String(i.content) });
     },
+  },
+  {
+    name: "avcs.workspace.land",
+    description: "Land a workspace onto its base line (docs/16): its isolated ops join the base view and merge there via the normal 3-way reduce — disjoint edits auto-merge, overlaps surface as conflicts. Idempotent. Returns the current landed set.",
+    inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    handler: async (repo, i) => {
+      await repo.landWorkspace(String(i.name));
+      return { landed: await repo.landedWorkspaces() };
+    },
+  },
+  {
+    name: "avcs.workspace.list",
+    description: "List the workspaces that have landed onto their base line (docs/16). Un-landed workspaces stay isolated and are not reported here.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async (repo) => ({ landed: await repo.landedWorkspaces() }),
   },
   {
     name: "avcs.line.create",

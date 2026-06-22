@@ -115,3 +115,26 @@ test("two landed workspaces with disjoint edits auto-merge on base — no rebase
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("checkoutInto projects a workspace view to disk (docs/16 physical projection)", async () => {
+  const dir = await mk();
+  const repo = await Repo.init(dir);
+  const out = await mk();
+  try {
+    const intent = await repo.createIntent({ title: "t", owner: "human:h" });
+    const sess = await repo.startSession({ intentOid: intent, actor: A });
+    await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: A, path: "base.ts", content: "base\n", declaredPurpose: "base" });
+    await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: A, path: "ws.ts", content: "ws-only\n", declaredPurpose: "ws", workspace: "wsA" });
+
+    // base checkout sees only the base op
+    assert.deepEqual(await repo.checkoutInto(out, "main"), ["base.ts"]);
+    // workspace checkout sees base + the workspace's own file (isolated physical tree)
+    assert.deepEqual((await repo.checkoutInto(out, "main", { workspace: "wsA" })).sort(), ["base.ts", "ws.ts"]);
+
+    const { readFile } = await import("node:fs/promises");
+    assert.equal(await readFile(join(out, "ws.ts"), "utf8"), "ws-only\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(out, { recursive: true, force: true });
+  }
+});
