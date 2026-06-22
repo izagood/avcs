@@ -1048,6 +1048,41 @@ export class Repo {
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
+  /**
+   * Workspaces that have LANDED onto their base line (docs/16). A landed workspace's ops
+   * are included in the base view and merge with base/other-landed ops via the normal
+   * reduce 3-way merge; before landing they stay isolated. Stored as a single ref → JSON
+   * array of names, so the set rides the object store with no schema change. Changing it
+   * shifts the `kept` op-set, which already keys the reduce cache — no extra invalidation.
+   */
+  async #landedWorkspaces(): Promise<Set<string>> {
+    const ref = await this.store.getRef("workspaces.landed");
+    if (!ref) return new Set();
+    try {
+      return new Set(JSON.parse((await this.readBlob(ref)).toString("utf8")) as string[]);
+    } catch {
+      return new Set();
+    }
+  }
+
+  /** List the workspaces that have landed onto their base line. */
+  async landedWorkspaces(): Promise<string[]> {
+    return [...(await this.#landedWorkspaces())].sort();
+  }
+
+  /**
+   * Land a workspace onto its base line (docs/16): its ops join the base view and merge
+   * there. There is no "rebase" — reduce always 3-way-merges the full op set, and any
+   * overlap surfaces as a Conflict via the normal materialize path. Idempotent.
+   */
+  async landWorkspace(name: string): Promise<void> {
+    const cur = await this.#landedWorkspaces();
+    if (cur.has(name)) return;
+    cur.add(name);
+    const oid = await this.putBlob(JSON.stringify([...cur]));
+    await this.store.setRef("workspaces.landed", oid);
+  }
+
   async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"]; workspace?: string }): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
     // Compaction (B3): on a cold instance, seed the incremental base from the persisted
@@ -1067,15 +1102,16 @@ export class Repo {
     const inherited = await this.#inheritedOps(lineName, allOps);
 
     const wsName = opts?.workspace;
+    // A base view also includes ops from workspaces that have LANDED (promoted onto base).
+    const landed = wsName ? null : await this.#landedWorkspaces();
     const ops: Operation[] = [];
     for (const op of allOps) {
       const onLine = (op.line ?? "main") === lineName || inherited.has(op.oid as string);
       if (!onLine) continue;
-      // Workspace isolation (docs/16): a base view (no wsName) excludes every workspace-
-      // tagged op; a workspace view (wsName=W) sees base ops + W's own, never another's.
-      // (land — promoting a workspace's ops onto its base — is a later slice.)
+      // Workspace isolation (docs/16): a base view excludes workspace-tagged ops UNLESS
+      // that workspace has landed; a workspace view (wsName=W) sees base ops + W's own.
       const opWs = op.workspace;
-      if (wsName ? (!!opWs && opWs !== wsName) : !!opWs) continue;
+      if (wsName ? (!!opWs && opWs !== wsName) : (!!opWs && !landed!.has(opWs))) continue;
       if (exclude.has(op.oid as string)) continue;
       if (intentFilter && !intentFilter.has(op.intentOid)) continue;
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
