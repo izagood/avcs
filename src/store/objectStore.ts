@@ -12,7 +12,7 @@
 
 import { mkdir, readFile, readdir, stat, open, rename, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { Buffer } from "node:buffer";
 import { computeOid, sha256hex } from "../core/canonical.ts";
 import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
@@ -181,6 +181,25 @@ export class ObjectStore {
 
   static isRepo(repoDir: string): boolean {
     return existsSync(join(repoDir, ".avcs", "objects"));
+  }
+
+  /**
+   * Locate the AVCS repo that owns `startDir` by walking up the directory tree until a
+   * directory satisfies {@link isRepo} (i.e. has `.avcs/objects`). This is AVCS's own
+   * root-finding — analogous to how git ascends to find `.git`, but keyed entirely on
+   * AVCS's own marker so it works with no git present. Returns the owning repo dir, or
+   * `null` if no ancestor (including `startDir` itself) is a repo. Pure/synchronous so
+   * the CLI and MCP server can both resolve a working dir to its store cheaply.
+   */
+  static findRepoRoot(startDir: string): string | null {
+    let dir = resolve(startDir);
+    // Ascend until the parent stops changing (filesystem root reached).
+    for (;;) {
+      if (ObjectStore.isRepo(dir)) return dir;
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
   }
 
   #pathFor(oid: string): string {
