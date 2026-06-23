@@ -32,6 +32,11 @@ export type { FsckReport } from "./store/objectStore.ts";
 export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
 export type { HubHandle } from "./hub/hubServer.ts";
 export { pushToHub, pullFromHub, finalizeOnHub } from "./hub/hubClient.ts";
+export type { HubSigner } from "./hub/hubClient.ts";
+// SSH-style transport auth: embedders (e.g. a hosted hub) inject `resolvePublicKey` into
+// startHub({ auth }); these helpers also let a client build/verify the credential directly.
+export { buildAuthHeader, parseAuthHeader, verifyAuth, canonicalRequest, NonceCache, AUTH_SCHEME, DEFAULT_AUTH_WINDOW_MS } from "./hub/transportAuth.ts";
+export type { AuthCredential, AuthResult, PublicKeyResolver } from "./hub/transportAuth.ts";
 
 // Cryptographic actor identity (the app-layer authz backbone)
 export { Keyring, generateKeypair, signMessage, verifyMessage } from "./core/identity.ts";

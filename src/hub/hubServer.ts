@@ -18,13 +18,16 @@ import { computeOid } from "../core/canonical.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { MATERIALIZER_VERSION } from "../reducer/policy.ts";
+import { NonceCache, verifyAuth, type PublicKeyResolver } from "./transportAuth.ts";
 import type { Signature } from "../core/identity.ts";
 import type {
   AnyObject, Membership, Operation, Evidence, Decision, Approval, Promotion, Override, Redaction, RoleName,
 } from "../objects/types.ts";
 
-/** Wire-protocol version the hub speaks (have/objects/refs gossip). Bumped on breaking changes. */
-export const HUB_PROTOCOL_VERSION = 1;
+/** Wire-protocol version the hub speaks (have/objects/refs gossip). Bumped on breaking
+ *  changes. v2 adds SSH-style transport auth: write endpoints may require an AVCS-Sig
+ *  Authorization header (read endpoints stay public). */
+export const HUB_PROTOCOL_VERSION = 2;
 
 export interface HubHandle {
   url: string;
@@ -120,12 +123,32 @@ export async function startHub(opts: {
   repoDir: string; port?: number; gated?: boolean; logger?: Logger; metrics?: Metrics;
   /** App-layer per-actor push quota (E7). Omit to disable. */
   rateLimit?: { maxPerWindow: number; windowMs?: number };
+  /** SSH-style transport authentication of write requests (read endpoints stay public).
+   *  When `required` is true, POST /objects and /finalize must carry a valid AVCS-Sig
+   *  Authorization header (see transportAuth.ts) or get a 401. `resolvePublicKey` is the
+   *  pluggable hook (D3): an embedder injects its own keyId→publicKey lookup; when omitted
+   *  the hub resolves against its own `member:<keyId>` registry. */
+  auth?: { required?: boolean; resolvePublicKey?: PublicKeyResolver; windowMs?: number };
 }): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
   const gated = opts.gated ?? false;
   const logger = opts.logger ?? silentLogger();
   const metrics = opts.metrics ?? new Metrics();
+
+  // Transport auth (read-public, write-auth). The default resolver treats the hub's own
+  // membership registry as its authorized_keys: a keyId is accepted iff member:<keyId> is a
+  // live (non-revoked) membership whose actorId matches, and the request signature verifies
+  // against that membership's publicKey — the same key the actor signs objects with.
+  const authRequired = opts.auth?.required ?? false;
+  const resolvePublicKey: PublicKeyResolver = opts.auth?.resolvePublicKey ?? (async (keyId: string) => {
+    const memRef = await store.getRef(`member:${keyId}`);
+    if (!memRef || !(await store.has(memRef))) return null;
+    const m = await store.get<Membership>(memRef);
+    if (m.revokedAt || m.actorId !== keyId) return null;
+    return m.publicKey;
+  });
+  const authCtx: AuthCtx = { required: authRequired, resolve: resolvePublicKey, windowMs: opts.auth?.windowMs, nonceCache: new NonceCache(opts.auth?.windowMs) };
 
   // E7 operability: per-actor push quota (a rolling-window counter) + an append-only
   // audit log of accepted mutations (provenance beyond the signed object itself).
@@ -157,7 +180,7 @@ export async function startHub(opts: {
       metrics.inc(`hub.status.${Math.floor(res.statusCode / 100)}xx`);
       logger.info("hub.request", { method: req.method, path, status: res.statusCode, ms: Math.round(ms * 100) / 100 });
     });
-    handle(store, req, res, gated, metrics, opts.repoDir, ctx).catch((err) => {
+    handle(store, req, res, gated, metrics, opts.repoDir, ctx, authCtx).catch((err) => {
       // Last-resort guard: never let a handler rejection crash the server.
       metrics.inc("hub.errors");
       logger.error("hub.error", { method: req.method, path, error: String(err?.message ?? err) });
@@ -206,6 +229,39 @@ interface HubOps {
   allow(key: string): boolean;
 }
 
+/** Transport-auth context threaded into the request handler (SSH-style write-auth). */
+interface AuthCtx {
+  required: boolean;
+  resolve: PublicKeyResolver;
+  windowMs: number | undefined;
+  nonceCache: NonceCache;
+}
+
+/**
+ * Enforce transport auth on a write request. No-op (returns true) when auth is not
+ * required — a read-public/ungated hub still accepts unsigned writes, leaving object-level
+ * `authorizePush` as the only gate. When required, verifies the AVCS-Sig header over the
+ * exact raw body and sends a 401 on failure. A 401 here ("who are you") is deliberately
+ * distinct from the 403 `authorizePush` returns ("you may not push THIS object").
+ */
+async function enforceTransportAuth(auth: AuthCtx, req: IncomingMessage, res: ServerResponse, method: string, path: string, rawBody: string, metrics: Metrics): Promise<boolean> {
+  if (!auth.required) return true;
+  const result = await verifyAuth({
+    header: req.headers["authorization"],
+    method, path, body: rawBody,
+    resolvePublicKey: auth.resolve,
+    now: Date.now(),
+    windowMs: auth.windowMs,
+    nonceCache: auth.nonceCache,
+  });
+  if (!result.ok) {
+    metrics.inc("hub.unauthenticated");
+    sendJson(res, 401, { error: result.reason });
+    return false;
+  }
+  return true;
+}
+
 /** The actor a push is attributed to (for the audit log + quota): the object's signer
  *  field when there is one, else null (the caller falls back to the remote address). */
 function attributedActor(obj: AnyObject): string | null {
@@ -213,7 +269,7 @@ function attributedActor(obj: AnyObject): string | null {
   return typeof req === "object" ? req.signerId : null;
 }
 
-async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics, repoDir: string, ops: HubOps): Promise<void> {
+async function handle(store: ObjectStore, req: IncomingMessage, res: ServerResponse, gated: boolean, metrics: Metrics, repoDir: string, ops: HubOps, auth: AuthCtx): Promise<void> {
   // Parse path only (ignore query); the host is irrelevant for routing.
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -228,7 +284,9 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
   // GET /version → identify the hub and the gossip protocol/materializer it speaks, so a
   // client can refuse to sync against an incompatible peer.
   if (method === "GET" && path === "/version") {
-    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated });
+    // `auth` advertises that writes require an AVCS-Sig credential so a client can attach
+    // one up front (and an old client gets a clear 401 instead of a silent rejection).
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none" });
     return;
   }
 
@@ -293,6 +351,10 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 413, { error: String((err as Error).message) });
       return;
     }
+    // Transport auth (SSH-style): on a write-auth hub the request must be signed by a
+    // registered member before we do any work. Verified over the raw body so a captured
+    // header can't be replayed against different content.
+    if (!(await enforceTransportAuth(auth, req, res, "POST", "/objects", raw, metrics))) return;
     let obj: unknown;
     try {
       obj = JSON.parse(raw);
@@ -352,6 +414,7 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
   if (method === "POST" && path === "/finalize") {
     let raw: string;
     try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    if (!(await enforceTransportAuth(auth, req, res, "POST", "/finalize", raw, metrics))) return;
     let body: { view?: unknown; newCheckpoint?: unknown; parentHead?: unknown; by?: unknown; sig?: unknown };
     try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
     const { view, newCheckpoint, by } = body;
