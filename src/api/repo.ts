@@ -247,6 +247,32 @@ export class Repo {
     }
   }
   /**
+   * Resolve the local actor key used to authenticate hub writes (SSH-style transport auth):
+   * the avcs analogue of ssh picking `~/.ssh/id_*`. Resolution order, first hit wins:
+   *   1. an explicit actorId (CLI `--as`),
+   *   2. the `AVCS_ACTOR` env var,
+   *   3. `actorId` in `.avcs/config.json`,
+   *   4. the sole key in the private keystore (unambiguous default identity).
+   * Returns undefined when no local key resolves — an unsigned write still succeeds against
+   * a no-auth/read-public hub, so signing is opt-in by having a key, not mandatory.
+   */
+  async #resolveHubSigner(explicitActorId?: string): Promise<{ keyId: string; privateKey: string } | undefined> {
+    let actorId = explicitActorId ?? process.env.AVCS_ACTOR;
+    if (!actorId) {
+      const cfg = await this.#readConfig();
+      if (typeof cfg.actorId === "string") actorId = cfg.actorId;
+    }
+    if (!actorId) {
+      try {
+        const files = (await readdir(this.#privateKeysDir())).filter((f) => f.endsWith(".json"));
+        if (files.length === 1) actorId = files[0]!.replace(/\.json$/, "");
+      } catch { /* no private keystore yet */ }
+    }
+    if (!actorId) return undefined;
+    const privateKey = await this.loadLocalKey(actorId);
+    return privateKey ? { keyId: actorId, privateKey } : undefined;
+  }
+  /**
    * Provision an owner key: mint a keypair, register the public half as trusted, and
    * store the private half in the LOCAL keystore so the MCP server can sign the
    * owner's elicitation-confirmed decisions (issue #15). Returns the keyId.
@@ -1031,14 +1057,16 @@ export class Repo {
   }
 
   /** Push objects this repo holds that a network hub lacks (M2 / docs/10 WS-B). */
-  async pushHub(hubUrl: string): Promise<{ pushed: number; rejected: number }> {
+  async pushHub(hubUrl: string, opts?: { as?: string }): Promise<{ pushed: number; rejected: number }> {
     const { pushToHub } = await import("../hub/hubClient.ts");
-    return pushToHub(this.dir, hubUrl);
+    const signWith = await this.#resolveHubSigner(opts?.as);
+    return pushToHub(this.dir, hubUrl, signWith);
   }
   /** Request a finalize (= PR merge) on a network hub via its CAS endpoint (E6). */
   async finalizeHub(hubUrl: string, args: { view: string; newCheckpoint: string; parentHead: string | null; by: string; signWith?: { keyId: string; privateKey: string } }): Promise<{ status: number; finalized: boolean; head?: string; reason?: string }> {
     const { finalizeOnHub } = await import("../hub/hubClient.ts");
-    return finalizeOnHub(hubUrl, args);
+    const signWith = args.signWith ?? await this.#resolveHubSigner(args.by);
+    return finalizeOnHub(hubUrl, { ...args, signWith });
   }
   /** Pull objects a network hub holds that this repo lacks. */
   async pullHub(hubUrl: string): Promise<{ pulled: number }> {
