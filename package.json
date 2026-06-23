@@ -1,6 +1,6 @@
 {
   "name": "@izagood/avcs",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "type": "module",
   "description": "Agentic Version Control System — an AI-native VCS where intent, session, operation, evidence and decision are first-class objects and code is a materialized projection of an operation graph.",
   "license": "Apache-2.0",
