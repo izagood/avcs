@@ -9,7 +9,24 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ObjectStore } from "../store/objectStore.ts";
 import { keysOf } from "../reducer/reducer.ts";
+import { buildAuthHeader } from "./transportAuth.ts";
 import type { AnyObject, Operation } from "../objects/types.ts";
+
+/** The local actor key used to authenticate a write to a hub (SSH-style transport auth,
+ *  see transportAuth.ts). Optional: omit against a read-public/ungated hub that requires
+ *  no transport credential. The same keypair already used to sign objects is reused. */
+export interface HubSigner {
+  keyId: string;
+  privateKey: string;
+}
+
+/** Build fetch headers for a hub write, attaching an AVCS-Sig Authorization header when a
+ *  signer is supplied. `path` must equal the server's pathname or the signature won't verify. */
+function writeHeaders(signer: HubSigner | undefined, method: string, path: string, body: string): Record<string, string> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (signer) headers["authorization"] = buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method, path, body });
+  return headers;
+}
 
 /** GET /have → the set of oids the hub holds. */
 async function hubHave(hubUrl: string): Promise<Set<string>> {
@@ -57,7 +74,7 @@ async function indexIfOperation(store: ObjectStore, obj: AnyObject, oid: string)
  * missing ones. Private (stash) ops are local-only and never gossiped — same rule as
  * Repo.pull. Returns how many objects were pushed.
  */
-export async function pushToHub(localRepoDir: string, hubUrl: string): Promise<{ pushed: number; rejected: number }> {
+export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?: HubSigner): Promise<{ pushed: number; rejected: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
   const have = await hubHave(base);
@@ -67,13 +84,20 @@ export async function pushToHub(localRepoDir: string, hubUrl: string): Promise<{
     const oid = obj.oid as string;
     if (have.has(oid)) continue;
     if (obj.type === "operation" && (obj as Operation).private) continue; // stash stays local
+    const body = JSON.stringify(obj);
     const res = await fetch(`${base}/objects`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(obj),
+      headers: writeHeaders(signWith, "POST", "/objects", body),
+      body,
     });
+    if (res.status === 401) {
+      // Transport auth failed (no/invalid request signature): a write-auth hub refused the
+      // connection itself. Distinct from 403 (signed in, but this object's role/signature
+      // is insufficient). Surface it loudly — retrying object-by-object would all fail.
+      throw new Error(`POST /objects unauthorized (401) for ${oid}: ${(await res.json().catch(() => ({})) as { error?: string }).error ?? "transport auth required"}`);
+    }
     if (res.status === 403) {
-      rejected++; // gated hub refused an unauthorized op
+      rejected++; // gated hub refused an unauthorized op (object-level role/signature)
       continue;
     }
     if (!res.ok) throw new Error(`POST /objects failed for ${oid}: ${res.status} ${res.statusText}`);
@@ -143,7 +167,11 @@ export async function finalizeOnHub(
     const msg = `finalize:${args.view}:${args.newCheckpoint}:${args.parentHead ?? ""}`;
     body.sig = { keyId: args.signWith.keyId, alg: "ed25519", sig: signMessage(args.signWith.privateKey, msg) };
   }
-  const res = await fetch(`${base}/finalize`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  // The finalize request also carries a transport-auth header (write-auth hubs require it).
+  // Two distinct signatures: body.sig authenticates the finalize INTENT (object layer), the
+  // Authorization header authenticates the REQUEST (transport layer). Both use one keypair.
+  const raw = JSON.stringify(body);
+  const res = await fetch(`${base}/finalize`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/finalize", raw), body: raw });
   const j = (await res.json().catch(() => ({}))) as { finalized?: boolean; head?: string; reason?: string };
   return { status: res.status, finalized: j.finalized ?? false, head: j.head, reason: j.reason };
 }

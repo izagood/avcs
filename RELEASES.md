@@ -17,6 +17,33 @@ particular every change to the **reduce/merge algorithm** or the **operation for
   **Any change to the merge substrate MUST bump `MERGE3_VERSION`** so the stamp changes
   with it. Consumers can pin or branch on `MATERIALIZER_VERSION` to detect a boundary.
 
+## Unreleased
+
+**Added — SSH-style transport authentication for hub writes. `HUB_PROTOCOL_VERSION` 1 → 2.**
+
+- Hub write endpoints (`POST /objects`, `POST /finalize`) can now require an `Authorization:
+  AVCS-Sig …` credential: a per-request ed25519 signature over `METHOD\npath\nts\nnonce\n
+  sha256(body)`, verified against the signer's registered public key. This authenticates the
+  *request/connection* the way `git clone git@host` does — distinct from, and composable
+  with, the existing object-level `authorizePush` gating. Read endpoints stay public
+  (read-public, write-auth). Failure is **401** (vs the object gate's **403**).
+  - Client: `avcs push <hub-url> [--as <actorId>]` signs writes with the local actor key;
+    the key is auto-discovered (`--as` → `AVCS_ACTOR` → `.avcs/config.json` `actorId` → the
+    sole key in the private keystore), reusing the same keypair already used to sign objects.
+    An unsigned push still works against a hub that doesn't require auth.
+  - Server: `startHub({ auth: { required, resolvePublicKey, windowMs } })`. The default
+    resolver treats the hub's `member:<keyId>` registry as its `authorized_keys`; embedders
+    inject `resolvePublicKey` to authenticate principals from their own user store.
+  - Replay protection: a freshness window on `ts` (default 5 min) plus a bounded seen-nonce
+    cache. `GET /version` advertises `auth: "required" | "none"`.
+  - **Why:** the hub had no transport-layer authentication — only individual governance
+    objects were signed. A hosted/shared hub needs to authenticate the *connection* (reject
+    anonymous writes, attribute pushes) without inventing a new credential type; reusing the
+    existing ed25519 identity is the SSH model.
+  - **Compatibility:** protocol bump is backward-compatible for the conflict-free union
+    (an old client against a no-auth hub is unchanged). A `required` hub returns 401 to an
+    unsigned/old client — a clear error, not silent loss.
+
 ## 0.2.0
 
 **Added (non-breaking) — content-addressing & core are now importable.**

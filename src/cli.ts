@@ -252,8 +252,13 @@ async function main(): Promise<void> {
     case "push": {
       const repo = await Repo.open(cwd);
       const url = args[1];
-      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs push <hub-url>");
-      const r = await repo.pushHub(url);
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs push <hub-url> [--as <actorId>]");
+      // --as picks which local identity key signs the request (SSH `-i`); omitted, avcs
+      // auto-discovers it (AVCS_ACTOR → config.actorId → the sole private key), and an
+      // unsigned push still works against a hub that doesn't require transport auth.
+      const asIdx = args.indexOf("--as");
+      const as = asIdx >= 0 ? args[asIdx + 1] : undefined;
+      const r = await repo.pushHub(url, { as });
       console.log(`pushed ${r.pushed} object(s) to ${url}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
       break;
     }
@@ -714,7 +719,7 @@ async function main(): Promise<void> {
           "  reindex                     rebuild the entity index (after a git pull of .avcs objects)\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
           "  clone <hub-url> [dir]       create a repo from a hub\n" +
-          "  push <hub-url>              push objects to a hub\n" +
+          "  push <hub-url> [--as <id>] push objects to a hub (signs writes with the actor's key)\n" +
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +
           "  head [view]                 show the protected head\n" +
           "  lines                       list lineage lines (Phase 8)\n" +
