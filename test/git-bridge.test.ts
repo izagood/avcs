@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir, readFile, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -276,4 +276,30 @@ test("git-sync respects an injected ignore predicate — the CLI's git check-ign
   });
   assert.ok(r.captured.added.includes("keep.ts"), "non-ignored file captured");
   assert.ok(!r.captured.added.some((p) => p.startsWith("build/")), "injected predicate prunes build/");
+});
+
+// #33: a git-bridge hook must never hard-block git. With a deadline that the ingest
+// cannot possibly meet, the pre-commit hook fails open: git commit completes (with a
+// warning) instead of hanging or aborting.
+test("issue #33: an exceeded hook deadline fails open — git commit still completes", { skip: !hasGit }, async () => {
+  const dir = await mkrepo();
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", "Tester"], { cwd: dir });
+  // `avcs init` installs the bridge hooks into .git/hooks for this repo.
+  avcs(dir, "init");
+  await writeFile(join(dir, "a.txt"), "hello\n", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: dir });
+
+  // 1ms is far below any real ingest → the pre-commit hook is guaranteed to time out.
+  const res = spawnSync("git", ["commit", "-m", "first"], {
+    cwd: dir,
+    env: { ...process.env, AVCS_HOOK_TIMEOUT_MS: "1" },
+    encoding: "utf8",
+  });
+
+  assert.equal(res.status, 0, `commit must succeed (fail open), got status ${res.status}: ${res.stderr}`);
+  assert.match(res.stderr, /#33|proceeding without|timed out|exceeded/i, "warns that audit capture was skipped");
+  const log = execFileSync("git", ["log", "--oneline"], { cwd: dir }).toString();
+  assert.match(log, /first/, "the commit landed despite the hook timing out");
 });
