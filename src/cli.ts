@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import { Repo, type GitMode } from "./api/repo.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import type { Operation } from "./objects/types.ts";
+import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
 
 const args = process.argv.slice(2);
 let cmd = args[0];
@@ -491,18 +492,35 @@ async function main(): Promise<void> {
       // Internal dispatch target for the installed hook scripts (docs/14). Each phase is
       // designed to be safe to run by hand, and a no-op when there is nothing to do.
       const phase = args[1];
-      // cwd is the working tree (possibly a linked git worktree); the store may live in
-      // the main checkout. Resolve the single store, and map this worktree's branch → line.
-      const repo = await Repo.open(storeDirFor(cwd));
+      // A git-bridge hook must never hard-block git indefinitely (#33). Every store-touching
+      // step runs under a deadline; if it elapses we fail open — let git proceed, warn, and
+      // let the next sync catch up — rather than spinning forever. AVCS_HOOK_TIMEOUT_MS=0
+      // restores the old unbounded behavior; a non-zero value overrides the default.
+      const hookMs = hookTimeoutMs();
       const line = lineFor(cwd);
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
+      // cwd is the working tree (possibly a linked git worktree); the store may live in
+      // the main checkout. Opening the store can itself block under contention, so bound it.
+      const opened = await withDeadline(() => Repo.open(storeDirFor(cwd)), hookMs);
+      if (!opened.ok) {
+        console.error(`avcs: opening the store exceeded ${hookMs}ms — skipping git-hook ${phase} (#33). Another avcs process may be holding it; set AVCS_HOOK_TIMEOUT_MS=0 to wait.`);
+        break; // fail open: never block git on a busy store
+      }
+      const repo = opened.value;
       switch (phase) {
         case "pre-commit": {
           // Capture working-tree edits as ops, gate on conflicts, checkpoint, reproject,
           // re-stage the canonical projection, and stash the provenance for the next hooks.
           const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
-          await ensureLine(repo, line);
-          const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
+          const res = await withDeadline(async () => {
+            await ensureLine(repo, line);
+            return repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
+          }, hookMs);
+          if (!res.ok) {
+            console.error(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
+            break; // fail open: let git complete the commit
+          }
+          const r = res.value;
           if (r.conflicts.length) {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
             process.exit(1); // abort the commit
@@ -515,30 +533,39 @@ async function main(): Promise<void> {
           // args: [2]=msgFile [3]=source [4]=sha. Append the trailer if enabled & absent.
           const msgFile = args[2];
           if (!msgFile) break;
-          const pending = await repo.readGitPending(cwd);
-          if (!pending || !(await repo.gitTrailerEnabled())) break;
-          const { readFile, writeFile } = await import("node:fs/promises");
-          const cur = await readFile(msgFile, "utf8");
-          if (cur.includes("AVCS-Checkpoint:")) break;
-          const trailer = repo.gitTrailer({ checkpoint: pending.checkpoint, treeHash: pending.treeHash, ...(pending.intent ? { intent: pending.intent } : {}) });
-          await writeFile(msgFile, `${cur.replace(/\n*$/, "")}\n\n${trailer}\n`, "utf8");
+          const res = await withDeadline(async () => {
+            const pending = await repo.readGitPending(cwd);
+            if (!pending || !(await repo.gitTrailerEnabled())) return;
+            const { readFile, writeFile } = await import("node:fs/promises");
+            const cur = await readFile(msgFile, "utf8");
+            if (cur.includes("AVCS-Checkpoint:")) return;
+            const trailer = repo.gitTrailer({ checkpoint: pending.checkpoint, treeHash: pending.treeHash, ...(pending.intent ? { intent: pending.intent } : {}) });
+            await writeFile(msgFile, `${cur.replace(/\n*$/, "")}\n\n${trailer}\n`, "utf8");
+          }, hookMs);
+          if (!res.ok) console.error(`avcs: prepare-commit-msg exceeded ${hookMs}ms — commit trailer skipped (#33).`);
           break;
         }
         case "post-commit": {
-          const pending = await repo.readGitPending(cwd);
-          if (!pending) break;
-          const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
-          await repo.recordGitCommit(sha, pending.checkpoint);
-          await repo.clearGitPending(cwd);
+          const res = await withDeadline(async () => {
+            const pending = await repo.readGitPending(cwd);
+            if (!pending) return;
+            const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
+            await repo.recordGitCommit(sha, pending.checkpoint);
+            await repo.clearGitPending(cwd);
+          }, hookMs);
+          if (!res.ok) console.error(`avcs: post-commit bookkeeping exceeded ${hookMs}ms — commit↔checkpoint link deferred (#33).`);
           break;
         }
         case "post-merge": {
           // A git pull/merge unioned new objects (committed mode) straight onto disk:
           // rebuild the index and re-project deterministically from the merged op graph
           // into this worktree, for the branch's line.
-          await repo.reindex();
-          await ensureLine(repo, line);
-          await repo.checkoutInto(cwd, line ?? "main");
+          const res = await withDeadline(async () => {
+            await repo.reindex();
+            await ensureLine(repo, line);
+            await repo.checkoutInto(cwd, line ?? "main");
+          }, hookMs);
+          if (!res.ok) console.error(`avcs: post-merge reprojection exceeded ${hookMs}ms — skipped; run \`avcs reindex\` then re-checkout if the tree looks stale (#33).`);
           break;
         }
         default:
