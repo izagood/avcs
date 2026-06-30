@@ -546,10 +546,14 @@ async function main(): Promise<void> {
           break;
         }
         case "post-commit": {
+          // `git rev-parse` is a synchronous interop call that returns instantly; keep it
+          // outside the deadline, whose callback is meant to bound *async* store work — a
+          // sync call inside it would starve the timer (see deadline.ts). All store I/O
+          // (read/record/clear pending) stays within the bound.
+          const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
           const res = await withDeadline(async () => {
             const pending = await repo.readGitPending(cwd);
             if (!pending) return;
-            const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd }).toString().trim();
             await repo.recordGitCommit(sha, pending.checkpoint);
             await repo.clearGitPending(cwd);
           }, hookMs);

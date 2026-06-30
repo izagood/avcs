@@ -5,7 +5,10 @@
 ## 공통
 
 ```ts
-type ObjectType = "blob"|"intent"|"session"|"operation"|"evidence"|"decision"|"checkpoint"|"view"|"policy";
+type ObjectType =
+  | "blob"|"intent"|"session"|"operation"|"evidence"|"decision"|"checkpoint"|"view"|"policy"
+  // 후속 phase의 운영·거버넌스 객체 (단일 진실 공급원은 types.ts):
+  | "lease"|"release"|"line"|"membership"|"protection"|"promotion"|"redaction"|"override"|"approval";
 interface BaseObject { type: ObjectType; oid?: string }  // oid는 저장 시 채워짐
 interface Actor { kind: "human"|"ai_agent"|"ci_bot"; id: string; model?: string }
 ```
@@ -28,11 +31,11 @@ interface Actor { kind: "human"|"ai_agent"|"ci_bot"; id: string; model?: string 
 ```
 
 ### Operation — 진짜 히스토리
-의미 단위 변경 1개. MVP는 파일 단위지만 **의미 봉투(envelope)**를 함께 들고 있어 Phase-2 AST 업그레이드가 가산적이다.
+의미 단위 변경 1개. 파일은 텍스트로 다룬다(언어 중립, [15](15-language-neutral-core.md)). `put_file`은 전체 내용을 쓰고, `edit_file`은 에이전트가 생성한 새 내용과 그 파생 기준(base)을 함께 들고 있어 같은 파일의 겹치지 않는 동시 편집이 line-level 3-way로 자동 병합된다. 코드 구조(symbol/AST)는 인식하지 않는다.
 ```ts
 { sessionOid, intentOid, actor,
-  target: { entityKind: "file"|"symbol"|"contract"|"config"|"test", entityId },
-  body:   { kind: "put_file"|"delete_file"|"rename_file"|"note", path?, fromPath?, blobOid? },
+  target: { entityKind: "file"|"contract"|"config"|"test", entityId },
+  body:   { kind: "put_file"|"edit_file"|"delete_file"|"rename_file"|"note", path?, fromPath?, blobOid? },
   causalDeps[],            // 이 연산이 "보고 나서" 작성된 선행 연산들
   declaredPurpose,
   effects?: { reads[], changesBehavior?, breaksPublicApi? },
@@ -71,12 +74,8 @@ interface Actor { kind: "human"|"ai_agent"|"ci_bot"; id: string; model?: string 
 - **Blob** — raw 콘텐츠(base64; 추후 청크 분할).
 - **Policy** — reduce를 매개변수화하는 규칙 집합. [04](04-policy.md) 참조.
 
-## Entity ID가 핵심
+## 병합은 언어 중립이다
 
-파일 경로는 정체성이 아니다. MVP에선 `entityId = 파일 경로`지만, Phase 2에선:
-```
-symbol:UserService.findById   (이름이 바뀌어도 동일 id 유지)
-```
-덕분에 "A가 rename, B가 body edit"이 같은 symbol에 대한 두 연산으로 자동 병합된다. Pijul이 파일/디렉토리를 이름 vertex와 inode vertex로 분리하는 것과 같은 발상이다.
+머지 기질(substrate)은 코드 구조를 모른다([15](15-language-neutral-core.md)). `entityId`는 파일 경로이고, 파일은 텍스트로 취급된다. `edit_file`이 생성 내용과 그 base를 함께 운반하므로, 같은 파일에 대한 동시 편집 중 **겹치지 않는 라인 범위는 line-level 3-way(`merge3`)로 자동 병합**되고 겹치는 범위만 충돌로 승격된다. 초기 설계가 검토했던 symbol/AST 슬롯 머지(이름이 바뀌어도 유지되는 `symbol:UserService.findById` 같은 정체성)는 **채택하지 않았다** — 언어 종속성을 코어에 들이지 않기 위해서다.
 
 → 다음: [03 — Reducer](03-reducer.md)
