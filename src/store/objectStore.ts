@@ -145,6 +145,15 @@ export class ObjectStore {
     await this.#writeAtomic(p, data);
   }
 
+  /** Read an auxiliary file under the repo's `.avcs` root, or null when absent. The read
+   *  counterpart of {@link writeAux}: atomic writes guarantee old-or-complete, so a plain
+   *  read never observes a torn file. */
+  async readAux(relPath: string): Promise<Buffer | null> {
+    const p = join(this.root, relPath);
+    if (!existsSync(p)) return null;
+    return readFile(p);
+  }
+
   /** Durably append a line to an auxiliary log under the repo's `.avcs` root (e.g. the
    *  hub audit log, E7). Reuses the fsync-file + fsync-dir append path. */
   async appendAux(relPath: string, line: string): Promise<void> {
