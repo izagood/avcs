@@ -84,7 +84,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (21 tools); humans use the **CLI**. The behavior is pinned by a 176-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (24 tools); humans use the **CLI**. Next up (designed, not yet implemented): a hub-side **integration queue** that re-reduces stale submissions instead of rejecting them ("head moved — pull first" disappears), live convergence, and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 176-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -224,7 +224,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/release/sbom.ts` | SBOM generation (Phase 6) |
 | `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
-| `src/mcp/server.ts` | Agent-facing MCP interface (21 tools) |
+| `src/mcp/server.ts` | Agent-facing MCP interface (24 tools) |
 | `src/cli.ts` | Human-facing inspection/release CLI |
 | `src/demo.ts` | End-to-end scenario |
 
@@ -245,6 +245,10 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [12 — Local production](docs/12-local-production.md)
 - [13 — Hub production](docs/13-hub-production.md)
 - [14 — Git bridge (real-world compatibility)](docs/14-git-bridge.md)
+- [15 — Language-neutral core](docs/15-language-neutral-core.md)
+- [16 — Workspace scope](docs/16-workspace-scope.md)
+- [17 — Sync convergence: integration queue & live sync (design)](docs/17-sync-convergence.md)
+- [18 — MCP as the first-class connection (design)](docs/18-mcp-first-class.md)
 
 ## Contributing
 
