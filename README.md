@@ -84,7 +84,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (24 tools); humans use the **CLI**. Next up (designed, not yet implemented): a hub-side **integration queue** that re-reduces stale submissions instead of rejecting them ("head moved — pull first" disappears), live convergence, and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 176-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (24 tools); humans use the **CLI**. Next up (designed, not yet implemented): a hub-side **integration queue** that re-reduces stale submissions instead of rejecting them ("head moved — pull first" disappears), live convergence, and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 233-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 

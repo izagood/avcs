@@ -70,11 +70,11 @@ GitHub 실사용 36종 병렬 검토 결과는 **[09 — 사용 사례 커버리
 - **Phase 12 — Redaction/보안** ✅: admin 서명 `redact`로 유출 blob byte-eviction(oid 보존→treeHash 유효, BFG analog) + break-glass `grantOverride`(만료 waiver) + forward-only `rollbackTo`(CAS)
 - **소소** ✅: `revert` op(forward inverse+provenance) · `coAuthors` · `private` op(stash, gossip 제외) · Release semver+supportStatus · line-scoped Protection(per-view)
 
-## Phase 13–16 — 수렴 & MCP 일급화 ⬜ *(설계 합의, 구현 전)*
+## Phase 13–16 — 수렴 & MCP 일급화 🟡 *(구현 진행 중)*
 
 남은 git식 고통(stale finalize → 수동 pull → 재작업 퍼널, 수동 폴링 동기화, 뒤늦은 충돌 발견, opt-in incremental)과 MCP 공백(sync 도구 부재, ContextPack 미구현, 알림 없음)을 제거한다. 상세 설계: **[17 — 수렴](17-sync-convergence.md)** · **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**.
 
-- **Phase 13 — 수렴 기반** ⬜: 영속 remote(`.avcs/remotes.json`, S) · Lamport observe-on-import + multi-process reseed(S — HLC 아님, 순서 품질만) · **incremental reduce 기본 ON**(M, snapshot 자동 영속 + `MATERIALIZER_VERSION` 스탬프 무효화) · **evidence treeHash 바인딩 실체화**(S/M, `Checkpoint.evidenceBinding` + `Protection.requireBoundEvidence`) — 13.4는 Phase 14 게이트의 전제조건
+- **Phase 13 — 수렴 기반** 🟡: 영속 remote(`.avcs/remotes.json` + `repo.sync`/`avcs remote·sync`, clone이 origin 기록) ✅ · Lamport observe-on-import + multi-process reseed(HLC 아님, 순서 품질만) ✅ · **incremental reduce 기본 ON**(M, snapshot 자동 영속 + `MATERIALIZER_VERSION` 스탬프 무효화) ⬜ · **evidence treeHash 바인딩 실체화**(`Checkpoint.evidenceBinding` + `Protection.requireBoundEvidence`) ✅ — 13.4는 Phase 14 게이트의 전제조건
 - **Phase 14 — 통합 큐** ⬜ (헤드라인): stale 제출을 거부하는 대신 **허브/finalize 경로가 합집합 재환원을 대신** 수행. 신규 `Integration` 객체(멱등 티켓, append-only 감사, S) · `repo.submitIntegration`(frontier-합집합을 `materializeAt` 경로로 reduce — `materialize(view)` 금지, L) · hub `POST /integrate`(M, 기존 `/finalize` 불변) · 클라이언트/CLI `avcs submit`/MCP(M, 구 허브는 legacy 폴백) · evidence 모드(M, 기본 **carry-disjoint**: 서로소 델타면 승계+기록, 겹치면 `needs_evidence` 2단계 — 검증 1회, 재작업 0회). **계약: 제출 결과는 advanced | conflict 패킷 | needs_evidence | queued 넷뿐 — "pull 하고 다시"는 없다**
 - **Phase 15 — 라이브 수렴** ⬜: hub `GET /events` 롱폴(objlog 커서 공유, M) · `avcs sync --watch` 데몬 + materialize freshness 창(stale-while-revalidate, 읽기 비차단, M) · **충돌 조기 경보** `repo.contention`(entity index 기반, lease gossip과 결합해 기계 간 경보, M)
 - **Phase 16 — MCP 일급화 (M1–M5)** ⬜: 컴팩트 응답+에러 `nextActions`+유계 읽기+`avcs.guide`(M) · **`avcs.sync.land`**(push→reduce→checkpoint→통합 자동, 결과는 landed | conflict 패킷 둘뿐, L) · **`avcs.context.build`** ContextPack(결정적 토큰 예산 절단, M/L) · resources/prompts/알림(`head-advanced`·`foreign-op-hot-key`, M) · `--profile core` 13종 경량 광고 + docs/06 권위 레퍼런스화(S/M)
@@ -93,6 +93,6 @@ GitHub 실사용 36종 병렬 검토 결과는 **[09 — 사용 사례 커버리
 - content addressing은 canonical JSON(추후 CBOR). 직렬화는 `src/core/canonical.ts` 한 곳에 격리.
 - blob은 base64 통짜 저장(추후 청크/delta).
 - `view.query.includeStatuses`는 후보 선택보다 표시 의미에 가깝게 단순화됨.
-- 동기화는 수동 폴링(pull 실행 시에만 수렴, 이벤트/데몬 없음) → Phase 15에서 해소 예정([17](17-sync-convergence.md)).
-- Lamport clock은 단일 프로세스 가정(수입 op 미관찰, 같은 디렉토리 다중 프로세스 겹침 발급) → Phase 13.2에서 해소 예정. 결정론은 lamport 품질에 비의존(oid tie-break) — 개선되는 것은 순서 품질.
-- evidence의 `treeHash` 바인딩은 기록만 되고 checkpoint 집계/finalize 게이트에서 검사되지 않음 → Phase 13.4에서 실체화 예정.
+- 동기화는 수동 폴링(pull 실행 시에만 수렴, 이벤트/데몬 없음) → Phase 15에서 해소 예정([17](17-sync-convergence.md)). remote 영속화(`avcs sync`)까지는 Phase 13.1에서 완료.
+- ~~Lamport clock의 단일 프로세스 가정~~ → Phase 13.2에서 해소: pull/pullHub가 수입 op의 max lamport를 observe하고, propose 직전 op-log tail로 reseed(같은 `.avcs`의 CLI+MCP 겹침 발급 제거). 결정론은 애초에 lamport 품질에 비의존(oid tie-break) — 개선된 것은 순서 품질.
+- ~~evidence `treeHash` 바인딩은 장식~~ → Phase 13.4에서 실체화: checkpoint 집계가 bound(일치) 우선/불일치 제외/legacy 기록, `Protection.requireBoundEvidence`가 finalize에서 legacy를 거부.

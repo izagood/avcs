@@ -269,7 +269,48 @@ async function main(): Promise<void> {
       if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir]");
       const repo = await Repo.init(dir);
       const r = await repo.pullHub(url);
-      console.log(`cloned ${r.pulled} object(s) from ${url} into ${dir}`);
+      // Phase 13.1: remember where we came from — `avcs sync` now works with no URL.
+      await repo.addRemote("origin", url);
+      console.log(`cloned ${r.pulled} object(s) from ${url} into ${dir}  [remote origin recorded]`);
+      break;
+    }
+    case "remote": {
+      const repo = await Repo.open(cwd);
+      const sub = args[1];
+      if (sub === "add") {
+        const name = args[2];
+        const url = args[3];
+        if (!name || !url) throw new Error("usage: avcs remote add <name> <url> [--auto-sync] [--freshness-ms N]");
+        const freshness = flag("--freshness-ms");
+        await repo.addRemote(name, url, {
+          autoSync: args.includes("--auto-sync"),
+          freshnessMs: freshness !== undefined ? Number(freshness) : undefined,
+        });
+        console.log(`remote ${name} → ${url}`);
+      } else if (sub === "rm") {
+        const name = args[2];
+        if (!name) throw new Error("usage: avcs remote rm <name>");
+        console.log((await repo.removeRemote(name)) ? `removed remote ${name}` : `no such remote: ${name}`);
+      } else if (sub === "ls" || sub === undefined) {
+        const remotes = await repo.listRemotes();
+        const names = Object.keys(remotes).sort();
+        if (!names.length) console.log("(no remotes — add one with `avcs remote add origin <url>`)");
+        for (const n of names) {
+          const r = remotes[n]!;
+          console.log(`${n}\t${r.url}${r.autoSync ? "  [auto-sync]" : ""}${r.freshnessMs !== undefined ? `  [freshness ${r.freshnessMs}ms]` : ""}`);
+        }
+      } else {
+        throw new Error("usage: avcs remote <add|rm|ls> ...");
+      }
+      break;
+    }
+    case "sync": {
+      const repo = await Repo.open(cwd);
+      const remote = args[1] && !args[1].startsWith("--") ? args[1] : "origin";
+      const asIdx = args.indexOf("--as");
+      const as = asIdx >= 0 ? args[asIdx + 1] : undefined;
+      const r = await repo.sync(remote, { as });
+      console.log(`synced with ${remote}: pulled ${r.pulled}, pushed ${r.pushed}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
       break;
     }
     case "serve": {
@@ -749,7 +790,10 @@ async function main(): Promise<void> {
           "  install-hooks [--force]     install git hooks so `git commit`/`pull` auto-sync AVCS\n" +
           "  reindex                     rebuild the entity index (after a git pull of .avcs objects)\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
-          "  clone <hub-url> [dir]       create a repo from a hub\n" +
+          "  clone <hub-url> [dir]       create a repo from a hub (records remote `origin`)\n" +
+          "  remote add <name> <url>     register a named hub ([--auto-sync] [--freshness-ms N])\n" +
+          "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
+          "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +
           "  push <hub-url> [--as <id>] push objects to a hub (signs writes with the actor's key)\n" +
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +
           "  head [view]                 show the protected head\n" +
