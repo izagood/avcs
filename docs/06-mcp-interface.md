@@ -2,20 +2,70 @@
 
 AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전트는 git status/diff/commit을 이해할 필요 없이, MCP tool과 skill로 사용법을 즉시 주입받는다. 구현: [`src/mcp/server.ts`](../src/mcp/server.ts).
 
-> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. AVCS는 이를 전부 활용하도록 설계됐다 — MVP는 `tools`를 구현, `resources`(ContextPack)·`prompts`(skill 템플릿)는 Phase 3.
+> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. AVCS는 이를 전부 활용하도록 설계됐다 — 현재 `tools` 24종 구현. `resources`(ContextPack)·`prompts`(skill 템플릿)·sync 도구·알림은 **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**에 설계됨(구현 전).
 
-## Tool 표면 (MVP: 8종)
+## Tool 표면 (현재: 24종)
+
+모든 도구는 공통 선택 인자 `cwd`(대상 저장소 힌트, 아래 repo discovery)를 받는다.
+
+**intent / session**
 
 | tool | 역할 |
 |------|------|
 | `avcs.intent.create` | 목적·제약·허용 범위 개시. 모든 작업의 출발점 |
+| `avcs.intent.read` | intent와 제약 읽기 — propose 전에 반드시 |
+| `avcs.intent.list` | intent 목록 |
 | `avcs.session.start` | intent에 대한 작업 세션 시작 → sessionOid |
-| `avcs.operation.propose` | 의미 변경 제출 (MVP: 파일 쓰기). **effects 정직 선언** |
-| `avcs.evidence.attach` | test/typecheck/... 증거 첨부 |
-| `avcs.view.materialize` | 연산 그래프 → tree + status + conflicts (내 작업이 병합되는지 확인) |
+
+**변경 제안**
+
+| tool | 역할 |
+|------|------|
+| `avcs.operation.propose` | 의미 변경 제출. `baseText`/`baseBlobOid`가 있으면 3-way 병합 가능한 `edit_file`, 없으면 `put_file`. **effects 정직 선언**, 선택 `line`/`workspace`/`causalDeps` |
+| `avcs.operation.backport` | op를 다른 line으로 이식(cherry-pick/backport, `derivedFrom` provenance) |
+
+**검증 / 수리**
+
+| tool | 역할 |
+|------|------|
+| `avcs.evidence.attach` | test/typecheck/... 증거 첨부 (선택 `treeHash` 바인딩) |
+| `avcs.validate.run` | 실제 셸 체크를 실행해 treeHash 바인딩 Evidence 생성 |
+| `avcs.repair.context` | 실패 op의 최소 수리 패킷(전체 재독 대신) — 토큰 절약 장치 |
+
+**view / 충돌 / 결정**
+
+| tool | 역할 |
+|------|------|
+| `avcs.view.materialize` | 연산 그래프 → treeHash + 파일 목록 + status + conflicts + dropped (내 작업이 병합되는지 확인; 파일 **내용**은 `object.show`로) |
 | `avcs.conflict.list` | 사람이 결정할 충돌 목록 |
-| `avcs.decision.record` | 사람/owner의 충돌 해결 기록 |
+| `avcs.decision.record` | 충돌 해결 기록. **사람 전용** — 로컬 서명 키 + elicitation 확인 요구 |
+
+**checkpoint / release**
+
+| tool | 역할 |
+|------|------|
 | `avcs.checkpoint.create` | 검증된 상태 벡터 동결 |
+| `avcs.release.cut` | 검증된 checkpoint + 증거 + SBOM + 서명 아티팩트로 릴리스 |
+
+**동시성 / line / workspace**
+
+| tool | 역할 |
+|------|------|
+| `avcs.lease.request` | 편집 전 scope soft 선점 — 시작 시점 충돌 예방 |
+| `avcs.line.create` / `avcs.line.list` | 장수 라인 분기/목록 |
+| `avcs.workspace.land` / `avcs.workspace.list` | 격리 workspace를 base line에 land / 목록 |
+
+**관측**
+
+| tool | 역할 |
+|------|------|
+| `avcs.blame` | 엔티티의 현재 소유 op — 누가/왜 |
+| `avcs.history` | 엔티티 인과 순서 히스토리 (entity index, O(ops-on-entity)) |
+| `avcs.diff` | 두 view의 added/removed/modified 경로 |
+| `avcs.object.show` | oid로 임의 객체/blob 읽기 (타 에이전트 내용·base blob 조회) |
+| `avcs.metrics` | reduce 캐시 hit/miss 등 인프로세스 메트릭 |
+
+> **아직 CLI 전용인 것**: pull/push/clone/finalize/serve 등 분산·거버넌스 표면. 이를 MCP로 올리는 설계(`avcs.sync.land`, `avcs.context.build`, 알림/구독, core 프로필)는 [18 — MCP 일급 커넥션](18-mcp-first-class.md), 허브측 통합 큐는 [17 — 수렴](17-sync-convergence.md) 참조.
 
 실행 — `avcs mcp`가 stdio MCP 서버를 띄운다(이것이 에이전트가 spawn하는 1급 진입점):
 ```bash
@@ -52,15 +102,15 @@ claude mcp list                   # "avcs" 가 Connected 인지 확인
 
 ```
 1. avcs.intent.read         (intent와 제약 파악)
-2. avcs.context.build       (관련 symbol/test/decision 로드 — Phase 3)
-3. avcs.lease.request        (scope 선점 — Phase 3)
+2. avcs.context.build       (관련 symbol/test/decision 로드 — 설계: 18)
+3. avcs.lease.request        (scope 선점)
 4. (코드 작업)
 5. avcs.operation.propose    (변경을 operation으로 제출)
-6. avcs.evidence.attach      (테스트 결과 첨부)
+6. avcs.validate.run / avcs.evidence.attach  (검증·증거 첨부)
 7. avcs.view.materialize     (병합 가능 여부 확인)
-8. 실패 → repair op 덧붙임 (기존 op를 숨기지 않음)
+8. 실패 → avcs.repair.context → repair op 덧붙임 (기존 op를 숨기지 않음)
 9. 충돌 → avcs.conflict.list → 사람에게 선택지 제시
-10. accepted → avcs.checkpoint.create
+10. accepted → avcs.checkpoint.create (→ 설계: avcs.sync.land, 18)
 ```
 
 핵심: 에이전트는 **git commit부터 하지 않는다.** 먼저 operation + evidence를 제출하고, 코드 트리는 마지막 materialization이다.
