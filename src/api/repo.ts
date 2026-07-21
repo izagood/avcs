@@ -73,6 +73,18 @@ import type {
  */
 export type GitMode = "sidecar" | "committed";
 
+/**
+ * A named hub URL persisted in `.avcs/remotes.json` (Phase 13.1). Per-replica
+ * configuration — an aux file, never an object, never gossiped. `autoSync` +
+ * `freshnessMs` are read by the live-convergence layer (Phase 15): a materialize
+ * older than the freshness window fires a background sync.
+ */
+export interface RemoteConfig {
+  url: string;
+  autoSync?: boolean;
+  freshnessMs?: number;
+}
+
 // Sidecar: ignore EVERYTHING under .avcs/ (the `*` also ignores this file itself), so the
 // directory contributes nothing to git — the team's git history is untouched by AVCS.
 const GITIGNORE_SIDECAR = `# AVCS — sidecar mode (default).
@@ -401,6 +413,21 @@ export class Repo {
     return ops;
   }
 
+  /** Highest Lamport timestamp visible in the op-log (0 when empty) — the reseed source
+   *  for multi-process authoring (Phase 13.2). Reads through the warm op cache. */
+  async #maxLamportSeen(): Promise<number> {
+    let max = 0;
+    for (const op of await this.#allOpsTailed()) max = Math.max(max, op.lamport);
+    return max;
+  }
+
+  /** Observe an imported history's max lamport (Phase 13.2 observe-on-import): after a
+   *  pull, locally issued lamports must sort after everything just imported. No-op when
+   *  our clock is already ahead. */
+  #observeImported(maxLamport: number): void {
+    if (maxLamport > this.#clock.value) this.#clock.observe(maxLamport);
+  }
+
   async proposeOperation(args: {
     sessionOid: string;
     intentOid: string;
@@ -419,6 +446,14 @@ export class Repo {
     private?: boolean;
     signWith?: { keyId: string; privateKey: string };
   }): Promise<string> {
+    // Multi-process reseed (Phase 13.2): two processes sharing one .avcs (e.g. CLI + MCP)
+    // each hold their own in-memory clock, so both could issue the same lamport. Before
+    // stamping, re-observe the highest lamport visible in the op-log tail (cached ops —
+    // the log is the choke point every op enters through, whatever the process). This
+    // improves ordering QUALITY only; correctness never depended on it (the reducer
+    // tie-breaks by (lamport, oid), which is total regardless).
+    const maxSeen = await this.#maxLamportSeen();
+    const lamport = maxSeen >= this.#clock.value ? this.#clock.observe(maxSeen) : this.#clock.tick();
     const op: Operation = {
       type: "operation",
       sessionOid: args.sessionOid,
@@ -429,7 +464,7 @@ export class Repo {
       declaredPurpose: args.declaredPurpose,
       causalDeps: args.causalDeps ?? [],
       effects: args.effects,
-      lamport: this.#clock.tick(),
+      lamport,
       createdAt: new Date().toISOString(),
       confidence: args.confidence,
       // Only store `line` when it is non-default, so existing (line-less) repos and
@@ -866,8 +901,14 @@ export class Repo {
       const cp = await this.store.get<Checkpoint>(args.newCheckpoint);
       const waived = await this.#activeWaivers(args.view);
       for (const k of prot?.requiredChecks ?? []) {
-        if (cp.evidence[k] !== "pass" && !waived.has(k)) {
+        if (waived.has(k)) continue;
+        if (cp.evidence[k] !== "pass") {
           return { finalized: false as const, reason: `required check ${k} not pass` };
+        }
+        // Phase 13.4: a protection may insist the pass is PROVEN for this exact tree —
+        // legacy (treeHash-less) evidence stops satisfying the gate once opted in.
+        if (prot?.requireBoundEvidence && cp.evidenceBinding?.[k] !== "bound") {
+          return { finalized: false as const, reason: `required check ${k} passed but its evidence is not bound to this tree (legacy) — re-run validation against treeHash ${cp.treeHash}` };
         }
       }
       // causal-complete gate (docs/08 C-3): never finalize a partially-synced tree —
@@ -1025,6 +1066,7 @@ export class Repo {
     const other = new ObjectStore(otherDir);
     let copied = 0;
     let rejected = 0;
+    let maxLamport = 0;
     for await (const obj of other.list()) {
       const oid = obj.oid as string;
       if (await this.store.has(oid)) continue;
@@ -1039,9 +1081,13 @@ export class Repo {
         }
       }
       await this.store.put(obj as never);
-      if (obj.type === "operation") for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
+      if (obj.type === "operation") {
+        for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
+        maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
+      }
       copied++;
     }
+    this.#observeImported(maxLamport);
     // Propagate redactions: evict plaintext for any blob we already had before a peer
     // redacted it (pull skips already-present oids, so the redaction must be applied).
     await this.applyRedactions();
@@ -1075,7 +1121,68 @@ export class Repo {
     // pull may have applied redactions (blob bytes overwritten under stable oids) and
     // wrote through a separate ObjectStore; drop the warm blob cache so reads re-hit disk.
     this.#blobCache.clear();
-    return r;
+    this.#observeImported(r.maxLamport); // Phase 13.2: sort after the imported history
+    return { pulled: r.pulled };
+  }
+
+  // ── remotes (Phase 13.1) ────────────────────────────────────────────────────
+  // Named hub URLs persisted in `.avcs/remotes.json` — an aux file, NOT an object:
+  // where you sync from is per-replica configuration, not shared history, so it is
+  // never gossiped (an old replica simply ignores the file). `sync-cursors.json`
+  // stays keyed by URL (transport optimization; renaming a remote loses no state).
+
+  async #readRemotes(): Promise<Record<string, RemoteConfig>> {
+    const raw = await this.store.readAux("remotes.json");
+    if (!raw) return {};
+    try { return JSON.parse(raw.toString("utf8")) as Record<string, RemoteConfig>; } catch { return {}; }
+  }
+
+  async #writeRemotes(remotes: Record<string, RemoteConfig>): Promise<void> {
+    await this.store.writeAux("remotes.json", JSON.stringify(remotes, null, 2) + "\n");
+  }
+
+  /** Register (or update) a named remote hub. */
+  async addRemote(name: string, url: string, opts: { autoSync?: boolean; freshnessMs?: number } = {}): Promise<void> {
+    if (!/^https?:\/\//.test(url)) throw new Error(`remote url must be http(s): ${url}`);
+    const remotes = await this.#readRemotes();
+    remotes[name] = { url: url.replace(/\/$/, ""), ...(opts.autoSync ? { autoSync: true } : {}), ...(opts.freshnessMs !== undefined ? { freshnessMs: opts.freshnessMs } : {}) };
+    await this.#writeRemotes(remotes);
+  }
+
+  /** Remove a named remote. Returns whether it existed. */
+  async removeRemote(name: string): Promise<boolean> {
+    const remotes = await this.#readRemotes();
+    if (!(name in remotes)) return false;
+    delete remotes[name];
+    await this.#writeRemotes(remotes);
+    return true;
+  }
+
+  /** All configured remotes, name → config. */
+  async listRemotes(): Promise<Record<string, RemoteConfig>> {
+    return this.#readRemotes();
+  }
+
+  /** Resolve a remote name (or a literal URL, for one-off syncs) to a hub URL. */
+  async #resolveRemote(nameOrUrl: string): Promise<string> {
+    if (/^https?:\/\//.test(nameOrUrl)) return nameOrUrl.replace(/\/$/, "");
+    const remotes = await this.#readRemotes();
+    const r = remotes[nameOrUrl];
+    if (!r) throw new Error(`unknown remote: ${nameOrUrl} (run \`avcs remote add ${nameOrUrl} <url>\`)`);
+    return r.url;
+  }
+
+  /**
+   * Bidirectional convergence with a named remote (default "origin"): pull what the hub
+   * has that we lack, then push what we have that it lacks. Pure object gossip — union
+   * semantics, no rebase, no working-tree mutation beyond redaction propagation.
+   */
+  async sync(remote = "origin", opts?: { as?: string }): Promise<{ pulled: number; pushed: number; rejected: number }> {
+    const url = await this.#resolveRemote(remote);
+    const { pulled } = await this.pullHub(url);
+    const { pushed, rejected } = await this.pushHub(url, opts);
+    this.logger.info("sync.completed", { remote, url, pulled, pushed, rejected });
+    return { pulled, pushed, rejected };
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
@@ -2012,6 +2119,7 @@ export class Repo {
     const view = await this.getView(viewName);
     const result = await this.materialize(viewName);
     const evidence: Checkpoint["evidence"] = {};
+    const evidenceBinding: NonNullable<Checkpoint["evidenceBinding"]> = {};
     // Deterministic aggregation: process evidence in canonical (createdAt, oid) order
     // so the "last result wins per kind" outcome is replica-independent.
     const allEvidence = (await this.store.collect<Evidence>("evidence")).sort(
@@ -2022,9 +2130,17 @@ export class Repo {
     for (const ev of allEvidence) {
       // Only count trusted evidence for accepted ops.
       if (ev.producedBy.kind === "ai_agent") continue;
-      if (ev.forOps.some((o) => result.statuses.get(o) === "accepted")) {
-        evidence[ev.kind] = ev.result;
-      }
+      if (!ev.forOps.some((o) => result.statuses.get(o) === "accepted")) continue;
+      // treeHash binding (Phase 13.4): evidence stamped against a DIFFERENT tree proves
+      // that tree, not this one — exclude it. Stamped-and-matching evidence is "bound";
+      // unstamped (legacy) evidence is accepted but recorded as such, so a protection
+      // with requireBoundEvidence can refuse it at the finalize gate.
+      if (ev.treeHash && ev.treeHash !== result.treeHash) continue;
+      const binding = ev.treeHash ? "bound" : "legacy";
+      // Bound evidence outranks legacy for the same kind; within a rank, last wins.
+      if (evidenceBinding[ev.kind] === "bound" && binding === "legacy") continue;
+      evidence[ev.kind] = ev.result;
+      evidenceBinding[ev.kind] = binding;
     }
     const cp: Checkpoint = {
       type: "checkpoint",
@@ -2034,6 +2150,9 @@ export class Repo {
       policyOid: (await this.store.getRef("policy")) as string,
       materializerVersion: MATERIALIZER_VERSION,
       evidence,
+      // Only present when some evidence aggregated — an evidence-less checkpoint's
+      // bytes (and oid) are identical to pre-13.4.
+      ...(Object.keys(evidenceBinding).length ? { evidenceBinding } : {}),
       status: result.conflicts.length === 0 ? "verified" : "draft",
       summary,
       createdAt: new Date().toISOString(),

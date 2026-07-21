@@ -287,6 +287,14 @@ export interface Checkpoint extends BaseObject {
   policyOid: string;
   materializerVersion: string;
   evidence: Partial<Record<EvidenceKind, EvidenceResult>>;
+  /**
+   * Phase 13.4: how each aggregated evidence kind was bound to this checkpoint's tree.
+   * "bound" — the evidence carries `treeHash` and it equals this checkpoint's treeHash;
+   * "legacy" — the evidence predates treeHash stamping (no `treeHash` field). Evidence
+   * whose treeHash differs from this tree is excluded from aggregation entirely (it
+   * proves a different tree). Optional so pre-13.4 checkpoint oids are unchanged.
+   */
+  evidenceBinding?: Partial<Record<EvidenceKind, "bound" | "legacy">>;
   status: "draft" | "verified" | "released";
   summary: string;
   createdAt: string;
@@ -426,6 +434,13 @@ export interface Protection extends BaseObject {
   requireSignedOps: boolean;
   requireUpToDate: boolean; // reject stale (non-fast-forward) finalize
   allowForcePush: boolean; // even admins can't roll the head back unless true
+  /**
+   * Phase 13.4: when true, a required check only satisfies the finalize gate if the
+   * checkpoint's evidenceBinding for that kind is "bound" (treeHash-verified) — legacy
+   * (unstamped) evidence is rejected. Default false: legacy evidence keeps passing,
+   * so existing repos/tests are unaffected until a protection opts in.
+   */
+  requireBoundEvidence?: boolean;
   createdAt: string;
 }
 

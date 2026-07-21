@@ -108,9 +108,12 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
 
 /**
  * Pull objects the local store lacks: GET /have, then GET each missing /objects/:oid
- * and put it locally (idempotent, content-addressed). Returns how many were pulled.
+ * and put it locally (idempotent, content-addressed). Returns how many were pulled,
+ * plus the highest Lamport timestamp among the imported operations (0 when none) so
+ * the caller can advance its clock past the imported history (Phase 13.2
+ * observe-on-import — subsequently issued lamports sort after what was pulled).
  */
-export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise<{ pulled: number }> {
+export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise<{ pulled: number; maxLamport: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
   await store.init(); // tolerate a fresh local repo dir
@@ -119,6 +122,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
   const since = cursors[base] ?? 0;
   const { oids, cursor } = await discover(base, since);
   let pulled = 0;
+  let maxLamport = 0;
   for (const oid of oids) {
     if (await store.has(oid)) continue;
     const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`);
@@ -127,6 +131,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
     const obj = (await res.json()) as AnyObject;
     await store.put(obj as never);
     await indexIfOperation(store, obj, oid);
+    if (obj.type === "operation") maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
     pulled++;
   }
   // Advance the cursor only after the loop completed (a throw aborts before this, so a
@@ -147,7 +152,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
   // Propagate redactions: evict plaintext for blobs redacted after we pulled them.
   const { applyRedactions } = await import("./../store/applyRedactions.ts");
   await applyRedactions(store);
-  return { pulled };
+  return { pulled, maxLamport };
 }
 
 /**
