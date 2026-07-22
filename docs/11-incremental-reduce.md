@@ -119,6 +119,33 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   materialize==full(충돌/결정 히스토리 포함), base+delta==full, 그리고 **INCREMENTAL+COMPACT+VERIFY 3플래그
   ON으로 전체 122 테스트 통과**(가드 미발화). opt-in(prod 기본 OFF). **Track B 완료.**
 
+## Phase 13.3 — 기본값 반전 (default ON)
+
+[17 — 수렴](17-sync-convergence.md) §13.3 구현(2026-07-22). Phase 14 통합 큐가 제출마다 허브 reduce를
+1회 수행하므로 허브 처리량이 이 경로에 직접 의존한다 — opt-in을 뒤집어 **incremental + 영속 base가 기본**이
+됐다:
+
+- **플래그 반전**: `#pass1Reduce`·cold 로드가 기본 ON, `AVCS_INCREMENTAL=0`으로 opt-out(pre-13.3 동작).
+  `AVCS_COMPACT` 게이트 제거 — cold materialize는 항상 base 로드를 시도하고, 손상/비호환이면 기존 처리
+  그대로 full reduce로 폴백(정확성은 파일에 비의존).
+- **base 헤더 스탬프**: 영속 snapshot에 `MATERIALIZER_VERSION` + policy oid를 스탬프. cold 로드가 둘 중
+  하나라도 어긋나면 거부(`snapshot.cold.rejected` 메트릭) — 머지 알고리즘/정책 변경이 stale base를 조용히
+  무효화한다(웜 무효화는 기존 `NonIncrementalError` 폴백). pre-13.3 헤더 없는 파일도 거부(신뢰하지 않음).
+- **상각 자동 compaction**: 주 경로 materialize 후 live snapshot이 마지막 영속 base보다
+  `AUTO_COMPACT_DELTA`(256) op 이상 앞서면 `withLock("snapshot:<view>")` 하에 자동 재영속
+  (`snapshot.auto.persisted`) — cold start가 무한히 자라는 히스토리를 재replay하지 않는다. best-effort:
+  실패는 로그만, 읽기 경로는 절대 의존하지 않음.
+- **VERIFY는 CI 잡으로**: `AVCS_VERIFY_INCREMENTAL=1` 전체 스위트를 전용 CI 잡(`verify-incremental`)으로
+  이동 — 핫패스 권장 해제, 결정론 그물은 그대로.
+- **검증**: 전체 계약 스위트 238/238 green(기본값 ON) + 신규 `test/incremental-default.test.ts`(cold 로드
+  메트릭, 버전 bump 무효화, 정책 변경 무효화, headerless 거부, opt-out 동치, 자동 compaction 임계/무churn).
+- **측정(2026-07-22, bench/incremental-bench.ts — set_symbol→edit_file 현대화 후)**: +1op 컴퓨트
+  `N=500: full 1.40ms/inc 1.84ms(0.76x)` · `N=1500: 3.90/2.77ms(1.40x)` · `N=3000: 7.15/6.42ms(1.11x)`,
+  reuse 99.4–99.9%. **정직한 결론**: 이 규모에서 컴퓨트 이득은 소폭(잔여 비용은 그룹 재조립·tree 재구성 등
+  O(N) 패스)이고, 13.3의 실질 가치는 (a) cold start가 base 이후 delta만 처리(히스토리 재replay 제거),
+  (b) Phase 14 허브의 제출당 reduce가 warm snapshot을 재사용, (c) 기본 ON이어야 base가 자동으로 최신으로
+  유지된다는 것.
+
 ## Track C — 인프라 의존 (sandbox 밖, 인터페이스만)
 
 object-storage(S3/GCS)·governance DB(Postgres/etcd CAS)·mTLS/OIDC·native tree-sitter·HSM/threshold
