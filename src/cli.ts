@@ -363,7 +363,7 @@ async function main(): Promise<void> {
       const repo = await Repo.open(cwd);
       const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
       const r = await repo.compact(view);
-      console.log(`compacted ${view}: persisted a base snapshot over ${r.baseOps} op(s) (run with AVCS_COMPACT=1 to use it)`);
+      console.log(`compacted ${view}: persisted a base snapshot over ${r.baseOps} op(s) (cold materialize loads it automatically; AVCS_INCREMENTAL=0 to opt out)`);
       break;
     }
     case "bundle": {
@@ -602,15 +602,22 @@ async function main(): Promise<void> {
           break;
         }
         case "post-merge": {
-          // A git pull/merge unioned new objects (committed mode) straight onto disk:
-          // rebuild the index and re-project deterministically from the merged op graph
-          // into this worktree, for the branch's line.
+          // A git pull/merge changed the working tree. Committed mode also unioned new
+          // `.avcs` objects straight onto disk — rebuild the rebuildable logs/indexes
+          // first so materialize sees them. Then CAPTURE-then-reproject (gitSync), not a
+          // bare checkoutInto: in sidecar mode the pulled content exists ONLY in git, and
+          // reprojecting a stale avcs view would silently revert files the pull just
+          // updated (observed live: a release version bump undone by the old hook).
+          // Capturing first ingests the pulled tree as ops, making reprojection a no-op
+          // on it; in committed mode the capture finds no diff and this reduces to the
+          // old behavior plus a checkpoint.
           const res = await withDeadline(async () => {
             await repo.reindex();
             await ensureLine(repo, line);
-            await repo.checkoutInto(cwd, line ?? "main");
+            return repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
-          if (!res.ok) console.error(`avcs: post-merge reprojection exceeded ${hookMs}ms — skipped; run \`avcs reindex\` then re-checkout if the tree looks stale (#33).`);
+          if (!res.ok) console.error(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
+          else if (res.value.conflicts.length) console.error(`avcs: ${res.value.conflicts.length} open conflict(s) after merge — run \`avcs conflicts ${line ?? "main"}\`.`);
           break;
         }
         default:

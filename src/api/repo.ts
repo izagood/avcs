@@ -126,13 +126,18 @@ export class Repo {
   // the rare mutations that can invalidate them (gc deletes; redaction overwrites bytes).
   #opCache = new Map<string, Operation>();
   #blobCache = new Map<string, Buffer>();
-  // Last full reduction's snapshot, for opt-in incremental reduce (docs/11 A6b). Only the
-  // main materialize path updates it; reduceIncremental is correct for ANY append-superset
-  // (harness-proven) and throws NonIncrementalError otherwise (→ fall back to full reduce),
-  // so no filter key is needed. Opt-in via AVCS_INCREMENTAL=1 (default off = full reduce);
-  // AVCS_VERIFY_INCREMENTAL=1 cross-checks every incremental result against a full reduce.
+  // Last full reduction's snapshot, for incremental reduce (docs/11 A6b — DEFAULT ON since
+  // Phase 13.3). Only the main materialize path updates it; reduceIncremental is correct for
+  // ANY append-superset (harness-proven) and throws NonIncrementalError otherwise (→ fall
+  // back to full reduce), so no filter key is needed. Opt OUT via AVCS_INCREMENTAL=0;
+  // AVCS_VERIFY_INCREMENTAL=1 cross-checks every incremental result against a full reduce
+  // (run as a dedicated CI job, not recommended on the hot path).
   #incSnap: ReduceSnapshot | null = null;
-  #forceSnapshot = false; // set by compact() to capture a snapshot regardless of env flags
+  #forceSnapshot = false; // set by compact() to capture a snapshot even when opted out
+  // Op count of the last PERSISTED base per view (Phase 13.3 amortized auto-compaction):
+  // once the live snapshot is ≥ AUTO_COMPACT_DELTA ops past it, materialize re-persists.
+  #persistedBaseOps = new Map<string, number>();
+  static readonly AUTO_COMPACT_DELTA = 256;
 
   private constructor(dir: string, store: ObjectStore) {
     this.dir = dir;
@@ -1223,9 +1228,11 @@ export class Repo {
 
   async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"]; workspace?: string }): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
-    // Compaction (B3): on a cold instance, seed the incremental base from the persisted
-    // snapshot so this materialize re-reduces only ops added since it, not all history.
-    if (process.env.AVCS_COMPACT === "1" && !this.#incSnap) await this.#loadPersistedSnapshot(viewName);
+    // Compaction (B3, default since 13.3): on a cold instance, seed the incremental base
+    // from the persisted snapshot so this materialize re-reduces only ops added since it,
+    // not all history. A corrupt/stale/version-mismatched snapshot is discarded (→ full
+    // reduce), so correctness never depends on the file.
+    if (process.env.AVCS_INCREMENTAL !== "0" && !this.#incSnap) await this.#loadPersistedSnapshot(viewName);
     const view = await this.getView(viewName);
     const q = view.query;
     const exclude = new Set(q.excludeOps ?? []);
@@ -1273,9 +1280,32 @@ export class Repo {
     // A caller may override the view's default status filter (e.g. to project pending/gated
     // ops so their computed 3-way merge can be inspected before acceptance — issue #13).
     const includeStatuses = opts?.includeStatuses ?? q.includeStatuses;
-    const res = await this.#reduceOpSet(kept, includeStatuses, true); // main path: opt-in incremental
+    const res = await this.#reduceOpSet(kept, includeStatuses, true); // main path: incremental by default
     for (const oid of quarantined) res.statuses.set(oid, "quarantined");
+    await this.#maybeAutoCompact(viewName, res);
     return res;
+  }
+
+  /**
+   * Amortized compaction (Phase 13.3): after a main-path materialize, re-persist the base
+   * snapshot once the live snapshot is ≥ AUTO_COMPACT_DELTA ops past the last persisted
+   * base, so a cold start never replays an unbounded history. The treeHash guard ties the
+   * in-memory snapshot to THIS view's result (a reduce-cache hit may have left #incSnap
+   * pointing at another view's reduction). Best-effort: a persist failure only logs — the
+   * read path never depends on it.
+   */
+  async #maybeAutoCompact(viewName: string, res: ReductionResult): Promise<void> {
+    if (process.env.AVCS_INCREMENTAL === "0") return;
+    const snap = this.#incSnap;
+    if (!snap || snap.result.treeHash !== res.treeHash) return;
+    const base = this.#persistedBaseOps.get(viewName) ?? 0;
+    if (snap.input.ops.length - base < Repo.AUTO_COMPACT_DELTA) return;
+    try {
+      await this.store.withLock(`snapshot:${viewName}`, () => this.#persistSnapshot(viewName, snap));
+      this.metrics.inc("snapshot.auto.persisted");
+    } catch (e) {
+      this.logger.warn("snapshot.auto.failed", { view: viewName, error: (e as Error).message });
+    }
   }
 
   /**
@@ -1406,19 +1436,18 @@ export class Repo {
   }
 
   /**
-   * Pass-1 reduce (docs/11 A6b). With AVCS_INCREMENTAL=1 and a prior snapshot, re-reduce
-   * only the delta via `reduceIncremental` (falling back to a full `snapshotReduce` if the
-   * preconditions don't hold — e.g. policy changed, or `base` is not an append-superset of
-   * the snapshot). Default (flag off) is the plain full `reduce`, untouched. Only the main
-   * materialize path passes `useInc`, so subset reducers (materializeAt/history/bisect)
-   * never read or pollute the snapshot. AVCS_VERIFY_INCREMENTAL=1 cross-checks each
-   * incremental result against a full reduce and throws on any divergence (CI safety net).
+   * Pass-1 reduce (docs/11 A6b — incremental is the DEFAULT since Phase 13.3). With a prior
+   * snapshot, re-reduce only the delta via `reduceIncremental` (falling back to a full
+   * `snapshotReduce` if the preconditions don't hold — e.g. policy changed, or `base` is not
+   * an append-superset of the snapshot). Opt OUT with AVCS_INCREMENTAL=0 (plain full
+   * `reduce`, the pre-13.3 default). Only the main materialize path passes `useInc`, so
+   * subset reducers (materializeAt/history/bisect) never read or pollute the snapshot.
+   * AVCS_VERIFY_INCREMENTAL=1 cross-checks each incremental result against a full reduce
+   * and throws on any divergence (runs as a dedicated CI job).
    */
   #pass1Reduce(base: ReduceInput, useInc: boolean): ReductionResult {
-    // Opt-in incremental: AVCS_INCREMENTAL (warm in-process delta), AVCS_COMPACT (cold start
-    // from a persisted snapshot base, B3), or compact() capturing a fresh snapshot.
-    const optIn = useInc && (process.env.AVCS_INCREMENTAL === "1" || process.env.AVCS_COMPACT === "1" || this.#forceSnapshot);
-    if (!optIn) return reduce(base);
+    const on = useInc && (process.env.AVCS_INCREMENTAL !== "0" || this.#forceSnapshot);
+    if (!on) return reduce(base);
     let snap: ReduceSnapshot;
     if (this.#incSnap) {
       try {
@@ -1861,7 +1890,7 @@ export class Repo {
 
   /**
    * Compaction (docs/11 B3): persist the current reduction of `view` as a durable base
-   * snapshot. A later COLD materialize (with AVCS_COMPACT=1) loads it and `reduceIncremental`s
+   * snapshot. A COLD materialize loads it BY DEFAULT (Phase 13.3) and `reduceIncremental`s
    * only the ops added since — folding settled history into the base instead of replaying
    * it — while the original ops stay on disk (append-only audit preserved). Correctness is
    * the same invariant as Track A: reduceIncremental(base, current) ≡ full reduce, gated by
@@ -1875,24 +1904,45 @@ export class Repo {
       this.#forceSnapshot = false;
     }
     if (!this.#incSnap) return { baseOps: 0 };
-    // Atomic write (D2): a plain writeFile could leave a torn CBOR snapshot on a crash.
-    // writeAux routes through the store's temp→fsync→rename→fsync-dir path. A torn read
-    // would still fall back to a full reduce (#loadPersistedSnapshot catches decode
-    // errors), but a durable atomic write means the base is never silently corrupt.
-    await this.store.writeAux(join("snapshot", `${view}.cbor`), encodeCbor(serializeSnapshot(this.#incSnap)));
+    await this.#persistSnapshot(view, this.#incSnap);
     const baseOps = this.#incSnap.input.ops.length;
     this.logger.info("compact", { view, baseOps });
     return { baseOps };
   }
 
-  /** Load a persisted compaction base into the in-memory incremental snapshot (B3). */
+  /**
+   * Persist a snapshot as the view's durable compaction base, stamped with the
+   * materializer version + active policy oid (Phase 13.3): a cold load rejects the file
+   * when either changed, so a merge-algorithm or policy update silently invalidates stale
+   * bases (the warm path's invalidation is NonIncrementalError, handled in #pass1Reduce).
+   * Atomic write (D2): writeAux routes through the store's temp→fsync→rename→fsync-dir
+   * path, so a reader sees old-or-complete — never a torn CBOR file.
+   */
+  async #persistSnapshot(view: string, snap: ReduceSnapshot): Promise<void> {
+    const header = { materializerVersion: MATERIALIZER_VERSION, policyOid: (await this.store.getRef("policy")) ?? "default" };
+    await this.store.writeAux(join("snapshot", `${view}.cbor`), encodeCbor({ header, snapshot: serializeSnapshot(snap) }));
+    this.#persistedBaseOps.set(view, snap.input.ops.length);
+  }
+
+  /** Load a persisted compaction base into the in-memory incremental snapshot (B3).
+   *  Rejects (and ignores) a corrupt file, a pre-13.3 headerless file, or a header whose
+   *  materializer version / policy oid no longer matches — full reduce is always correct. */
   async #loadPersistedSnapshot(view: string): Promise<void> {
     const p = join(this.dir, ".avcs", "snapshot", `${view}.cbor`);
     if (!existsSync(p)) return;
     try {
-      this.#incSnap = deserializeSnapshot(decodeCbor(await readFile(p)));
+      const raw = decodeCbor(await readFile(p)) as { header?: { materializerVersion?: string; policyOid?: string }; snapshot?: unknown };
+      const policyOid = (await this.store.getRef("policy")) ?? "default";
+      if (raw.header?.materializerVersion !== MATERIALIZER_VERSION || raw.header?.policyOid !== policyOid || raw.snapshot === undefined) {
+        this.metrics.inc("snapshot.cold.rejected");
+        return; // stale/incompatible base → full reduce
+      }
+      this.#incSnap = deserializeSnapshot(raw.snapshot);
+      this.#persistedBaseOps.set(view, this.#incSnap.input.ops.length);
+      this.metrics.inc("snapshot.cold.loaded");
     } catch {
-      this.#incSnap = null; // corrupt/incompatible snapshot → full reduce (always correct)
+      this.#incSnap = null; // corrupt snapshot → full reduce (always correct)
+      this.metrics.inc("snapshot.cold.rejected");
     }
   }
 

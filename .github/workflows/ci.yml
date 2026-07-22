@@ -40,6 +40,30 @@ jobs:
       - name: Test
         run: npm test
 
+  # Phase 13.3: incremental reduce is the DEFAULT — this job re-runs the whole suite with
+  # every incremental result cross-checked against a full reduce (throws on divergence).
+  # Kept as a dedicated job so the determinism net stays wide without slowing the hot path.
+  verify-incremental:
+    name: test (AVCS_VERIFY_INCREMENTAL=1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test (incremental self-verify)
+        run: npm test
+        env:
+          AVCS_VERIFY_INCREMENTAL: '1'
+
   release-dry-run:
     name: release dry run (build + pack)
     runs-on: ubuntu-latest

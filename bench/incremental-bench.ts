@@ -7,38 +7,43 @@
 //
 // NB: this isolates reduce COMPUTE only (no disk IO). The end-to-end materialize win
 // also needs the persistent op-log + tail-read (A5) so the repo stops re-reading every
-// op from disk; this bench is the lower bound the wiring (A6) unlocks.
+// op from disk; this bench is the lower bound the wiring (A6) unlocks. Since Phase 13.3
+// the incremental path is the repo DEFAULT, so these numbers are what materialize pays.
 import { reduce, snapshotReduce, reduceIncremental } from "../src/reducer/reducer.ts";
 import { defaultPolicy } from "../src/reducer/policy.ts";
 import type { ReduceInput } from "../src/reducer/reducer.ts";
 import type { Operation as Op } from "../src/objects/types.ts";
+import { Buffer } from "node:buffer";
 
 const ai = { kind: "ai_agent" as const, id: "ai:a" };
 const ms = (n: number) => `${n.toFixed(2)}ms`;
 const blobOf = (s: string) => `blob_${s.length}_${s.replace(/\W/g, "").slice(0, 8)}`;
 
-/** A large, mostly-disjoint op set: `files` files, each scaffolded then edited twice. */
-function buildInput(n: number): { input: ReduceInput; blobContent: Map<string, string> } {
+/** A large, mostly-disjoint op set: `files` files, each scaffolded then edited twice
+ *  (language-neutral edit_file chain — 3-way merged at materialization, docs/15). */
+function buildInput(n: number): { input: ReduceInput; blobContent: Map<string, Buffer> } {
   const ops: Op[] = [];
-  const blobContent = new Map<string, string>();
+  const blobContent = new Map<string, Buffer>();
   const files = Math.ceil(n / 3);
   let made = 0;
   for (let f = 0; f < files && made < n; f++) {
     const path = `src/mod${f}.ts`;
     const c0 = `export function g${f}() { return "v0"; }\n`;
     const b0 = blobOf(c0);
-    blobContent.set(b0, c0);
+    blobContent.set(b0, Buffer.from(c0, "utf8"));
     const scaffold: Op = mk(`op_${made}`, path, { kind: "put_file", path, blobOid: b0 }, [], made);
     ops.push(scaffold);
     made++;
     let prev = scaffold.oid as string;
+    let prevBlob = b0;
     for (let e = 0; e < 2 && made < n; e++) {
       const text = `export function g${f}() { return "v${e + 1}"; }\n`;
       const b = blobOf(text);
-      blobContent.set(b, text);
-      const op: Op = mk(`op_${made}`, path, { kind: "set_symbol", path, symbolName: `g${f}`, blobOid: b }, [prev], made);
+      blobContent.set(b, Buffer.from(text, "utf8"));
+      const op: Op = mk(`op_${made}`, path, { kind: "edit_file", path, blobOid: b, baseBlobOid: prevBlob }, [prev], made);
       ops.push(op);
       prev = op.oid as string;
+      prevBlob = b;
       made++;
     }
   }
@@ -70,11 +75,11 @@ function main(): void {
     const newContent = `export const fresh = ${N}\n`;
     const nb = blobOf(newContent);
     const bc2 = new Map(blobContent);
-    bc2.set(nb, newContent);
+    bc2.set(nb, Buffer.from(newContent, "utf8"));
     const newOp = mk(`op_new`, "src/new.ts", { kind: "put_file", path: "src/new.ts", blobOid: nb }, [], N);
     const next: ReduceInput = { ...input, ops: [...input.ops, newOp], blobContent: bc2 };
 
-    // Full re-reduce (today's +1op cost) vs incremental.
+    // Full re-reduce (the AVCS_INCREMENTAL=0 +1op cost) vs incremental (the default).
     const [, fullMs] = timed(() => reduce(next));
     const [incSnap, incMs] = timed(() => reduceIncremental(snap, next));
     const s = incSnap.stats;
