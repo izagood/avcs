@@ -1,10 +1,9 @@
 // Storage B3 — compaction (docs/11). compact() persists the current reduction as a
-// durable base snapshot; a later COLD materialize (AVCS_COMPACT=1) loads it and
+// durable base snapshot; a later COLD materialize loads it BY DEFAULT (Phase 13.3) and
 // reduceIncremental's only the ops added since, folding settled history into the base
 // instead of replaying it. The original ops remain on disk (append-only audit). The
 // load-bearing invariant — identical to Track A — is that the compacted path equals a
 // full reduce; we run with the self-verify guard ON so any divergence throws.
-process.env.AVCS_COMPACT = "1";
 process.env.AVCS_VERIFY_INCREMENTAL = "1";
 
 import { test } from "node:test";
@@ -18,12 +17,12 @@ import type { Actor } from "../src/objects/types.ts";
 
 const ai: Actor = { kind: "ai_agent", id: "ai:a" };
 
-/** A full reduce from a process with no base and the compaction flags off. */
+/** A full reduce from a process with the incremental path opted out (AVCS_INCREMENTAL=0). */
 async function fullTreeHash(dir: string): Promise<string> {
-  const saved = process.env.AVCS_COMPACT;
-  delete process.env.AVCS_COMPACT;
+  const saved = process.env.AVCS_INCREMENTAL;
+  process.env.AVCS_INCREMENTAL = "0";
   try { return (await (await Repo.open(dir)).materialize()).treeHash; }
-  finally { if (saved) process.env.AVCS_COMPACT = saved; }
+  finally { if (saved === undefined) delete process.env.AVCS_INCREMENTAL; else process.env.AVCS_INCREMENTAL = saved; }
 }
 
 test("cold materialize from a persisted compaction base equals full reduce, then absorbs new ops", async () => {
