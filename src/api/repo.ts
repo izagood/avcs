@@ -1561,7 +1561,10 @@ export class Repo {
     const walk = async (dir: string): Promise<void> => {
       for (const ent of await readdir(dir, { withFileTypes: true })) {
         const rel = join(dir, ent.name).slice(workDir.length + 1).split("\\").join("/");
-        if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel.startsWith(".git")) continue;
+        // Skip AVCS's own state and git's OWN directory — but not `.github/`/`.gitignore`/
+        // `.gitattributes`: those are code (CI workflows, ignore rules) and must be captured,
+        // or verify-git can never match a real repo's committed tree (they'd be "+git only").
+        if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel === ".git" || rel.startsWith(".git/")) continue;
         if (ignored(rel)) continue; // prune: skip an ignored file, and never descend an ignored dir
         if (ent.isDirectory()) await walk(join(dir, ent.name));
         else if (ent.isFile()) out.set(rel, await readFile(join(dir, ent.name)));
