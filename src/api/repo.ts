@@ -38,6 +38,7 @@ import type {
   Evidence,
   EvidenceKind,
   EvidenceResult,
+  Integration,
   Intent,
   IntentKind,
   Line,
@@ -57,6 +58,50 @@ import type {
   ViewQuery,
   WorkLease,
 } from "../objects/types.ts";
+
+/**
+ * Phase 14 (docs/17 §14.2): the four-way contract of `submitIntegration`. There is no
+ * "pull and redo" outcome by design — ops are append-only, so no work is ever redone:
+ *  - advanced       — the head moved to an integrated checkpoint containing your work
+ *  - conflict       — a minimal repair packet (the ONLY human/agent decision point)
+ *  - needs_evidence — run validation ONCE against the integrated tree, resubmit the ticket
+ *  - queued         — another ticket holds the needs_evidence reservation; retry later
+ *  - rejected       — a hard gate (role/approvals/causal-incompleteness) refused it
+ */
+export type IntegrationResult =
+  | { verdict: "advanced"; head: string; integration: string }
+  | { verdict: "conflict"; packet: ConflictPacket; integration: string }
+  | { verdict: "needs_evidence"; integratedCheckpoint: string; treeHash: string; requiredChecks: EvidenceKind[]; missingLocally: string[]; ticketId: string; integration: string }
+  | { verdict: "rejected"; reason: string }
+  | { verdict: "queued"; behindTicket: string; retryAfterMs: number };
+
+/** The minimal repair packet a `conflict` verdict carries (docs/17 §14.2 step 5):
+ *  per-key counterpart ops + prior human rulings on the same key (decision memory), so
+ *  an agent can prepare a precedent-based decision proposal without re-reading the repo. */
+export interface ConflictPacket {
+  conflicts: {
+    key: string;
+    reason: string;
+    /** The contending ops on this key (oid + who/why), for a targeted repair. */
+    options: { op: string; actor: string; purpose: string }[];
+    /** Overlapping line regions when this is a text-merge conflict (merge3 shape). */
+    regions?: import("../merge/merge3.ts").ConflictRegion[];
+    /** Prior rulings on the same key — reuse instead of re-litigating (docs/17 §14.2). */
+    priorDecisions: { reason: string; futurePolicy?: string; decidedBy: string }[];
+  }[];
+}
+
+/** The persisted needs_evidence reservation (`.avcs/queue/<view>.json`, docs/17 §14.3):
+ *  survives a hub restart so an in-flight ticket keeps its slot until the TTL. */
+interface IntegrationReservation {
+  ticketId: string;
+  submittedCheckpoint: string;
+  integratedCheckpoint: string;
+  treeHash: string;
+  requiredChecks: EvidenceKind[];
+  by: string;
+  expiresAt: string;
+}
 
 /**
  * How AVCS history relates to a co-located git repo (docs/14). The git tree git tracks
@@ -949,6 +994,347 @@ export class Repo {
     return result;
   }
 
+  // ── integration queue (Phase 14, docs/17) ──────────────────────────────────
+  // The end of "head moved — pull and re-reduce first": since ops are an append-only
+  // union and reduce is deterministic, a stale submission is never rejected for
+  // staleness — the queue re-reduces the frontier UNION on the submitter's behalf.
+  // This is a repo API (not hub-only): it also kills the local multi-process funnel.
+
+  /** Causal closure (op oids) of a frontier. Missing objects are skipped — callers gate
+   *  completeness separately via #missingCausalDeps. */
+  async #closureOf(heads: string[]): Promise<Set<string>> {
+    const seen = new Set<string>();
+    const stack = [...heads];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (!(await this.store.has(id))) continue;
+      const op = await this.store.get<Operation>(id);
+      for (const d of op.causalDeps) if (!seen.has(d)) stack.push(d);
+    }
+    return seen;
+  }
+
+  #queueRel(view: string): string {
+    return join("queue", `${view}.json`);
+  }
+
+  async #readReservation(view: string): Promise<IntegrationReservation | null> {
+    const raw = await this.store.readAux(this.#queueRel(view));
+    if (!raw) return null;
+    try {
+      const r = JSON.parse(raw.toString("utf8")) as IntegrationReservation | null;
+      return r && typeof r.ticketId === "string" ? r : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async #writeReservation(view: string, resv: IntegrationReservation | null): Promise<void> {
+    await this.store.writeAux(this.#queueRel(view), JSON.stringify(resv) + "\n");
+  }
+
+  /** Record an Integration verdict (append-only audit) and point the idempotency ref at it. */
+  async #recordIntegration(fields: Omit<Integration, "type" | "createdAt">): Promise<string> {
+    const integ: Integration = { type: "integration", ...fields, createdAt: new Date().toISOString() };
+    const oid = await this.store.put(integ);
+    await this.store.setRef(`integration:${fields.view}:${fields.ticketId}`, oid);
+    return oid;
+  }
+
+  /** Author a checkpoint AT an integrated frontier (never `materialize(view)` — §1-(A):
+   *  a view materialize would sweep in un-submitted third-party ops). */
+  async #authorIntegratedCheckpoint(view: string, integrated: ReductionResult, evidence: Checkpoint["evidence"], evidenceBinding: Checkpoint["evidenceBinding"], summary: string): Promise<string> {
+    const v = await this.getView(view);
+    const cp: Checkpoint = {
+      type: "checkpoint",
+      viewOid: v.oid as string,
+      headOps: integrated.headOps,
+      treeHash: integrated.treeHash,
+      policyOid: (await this.store.getRef("policy")) as string,
+      materializerVersion: MATERIALIZER_VERSION,
+      evidence,
+      ...(evidenceBinding && Object.keys(evidenceBinding).length ? { evidenceBinding } : {}),
+      status: integrated.conflicts.length === 0 ? "verified" : "draft",
+      summary,
+      createdAt: new Date().toISOString(),
+    };
+    return this.store.put(cp);
+  }
+
+  /** Verified (non-agent, canonically ordered) evidence bound to exactly `treeHash`. */
+  async #boundEvidenceFor(treeHash: string): Promise<Partial<Record<EvidenceKind, EvidenceResult>>> {
+    const out: Partial<Record<EvidenceKind, EvidenceResult>> = {};
+    const all = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence")).sort(
+      (a, b) =>
+        (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) ||
+        ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1),
+    );
+    for (const ev of all) {
+      if (ev.producedBy.kind === "ai_agent") continue;
+      if (ev.treeHash === treeHash) out[ev.kind] = ev.result;
+    }
+    return out;
+  }
+
+  /** Keys touched by a set of op oids (contention surface of a delta). */
+  async #keysOfOps(oids: Iterable<string>): Promise<Set<string>> {
+    const keys = new Set<string>();
+    for (const oid of oids) {
+      if (!(await this.store.has(oid))) continue;
+      const op = await this.store.get<Operation>(oid);
+      for (const k of keysOf(op)) keys.add(k);
+    }
+    return keys;
+  }
+
+  /**
+   * Submit a draft checkpoint to the integration queue (docs/17 §14.2). Runs under the
+   * same `finalize:<view>` lock as finalize — the existing mkdir lock IS the serializer
+   * (no separate queue structure in v1). The outcome is always one of the four verdicts;
+   * "pull and redo" does not exist on any path.
+   *
+   * Idempotency: an `advanced` ticket replays its recorded verdict forever. Non-terminal
+   * verdicts (conflict/needs_evidence/rejected/expired) re-evaluate on resubmission —
+   * the world legitimately changes under them (a decision lands, evidence arrives, a
+   * missing object syncs), and a frozen replay would wedge the ticket.
+   */
+  async submitIntegration(args: {
+    view: string;
+    checkpoint: string;
+    by: string;
+    ticketId?: string;
+    signWith?: { keyId: string; privateKey: string };
+  }): Promise<IntegrationResult> {
+    const view = args.view;
+    const ticketId = args.ticketId ?? sha256hex(`${view}:${args.checkpoint}`);
+    const result = await this.store.withLock(`finalize:${view}`, async (): Promise<IntegrationResult> => {
+      // 1. Idempotency — a terminal success replays as-is (safe resubmission).
+      const priorRef = await this.store.getRef(`integration:${view}:${ticketId}`);
+      if (priorRef && (await this.store.has(priorRef))) {
+        const prior = await this.store.get<Integration>(priorRef);
+        if (prior.verdict === "advanced") {
+          return { verdict: "advanced", head: prior.resultCheckpoint!, integration: priorRef };
+        }
+      }
+
+      // 2. Reservation — one in-flight needs_evidence ticket at a time (TTL-bounded).
+      let resv = await this.#readReservation(view);
+      if (resv && Date.parse(resv.expiresAt) <= Date.now()) {
+        // Expired: audit it and let the queue move on (docs/17 §14 contract test).
+        await this.#recordIntegration({
+          view, ticketId: resv.ticketId, submittedCheckpoint: resv.submittedCheckpoint,
+          baseHead: await this.protectedHead(view), resultCheckpoint: resv.integratedCheckpoint,
+          verdict: "expired", reason: `needs_evidence reservation expired at ${resv.expiresAt}`, by: resv.by,
+        });
+        await this.#writeReservation(view, null);
+        resv = null;
+      }
+      if (resv && resv.ticketId !== ticketId) {
+        return { verdict: "queued", behindTicket: resv.ticketId, retryAfterMs: 1000 + Math.floor(Math.random() * 500) };
+      }
+
+      // 3. Causal completeness — never judge (or advance to) a partially-synced tree.
+      const cp = await this.store.get<Checkpoint>(args.checkpoint);
+      const missing = await this.#missingCausalDeps(cp.headOps);
+      if (missing.length) {
+        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason: `incomplete causal history: ${missing.length} object(s) missing`, by: args.by });
+        return { verdict: "rejected", reason: `incomplete causal history: ${missing.length} object(s) missing — push them first (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""})` };
+      }
+
+      // Role gate (same as finalize).
+      const prot = await this.getProtection(view);
+      if (prot && !(await this.hasRole(args.by, prot.finalizeRole ?? "maintainer"))) {
+        const reason = `${args.by} lacks role ${prot.finalizeRole ?? "maintainer"} to integrate ${view}`;
+        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason, by: args.by });
+        return { verdict: "rejected", reason };
+      }
+
+      // 4. Integration reduce — the frontier UNION via the materializeAt path (NEVER
+      // materialize(view): §1-(A), un-submitted third-party ops must stay out).
+      const baseHead = await this.protectedHead(view);
+      const curHeads = baseHead ? (await this.store.get<Checkpoint>(baseHead)).headOps : [];
+      const unionHeads = [...new Set([...curHeads, ...cp.headOps])];
+      const integrated = await this.materializeAt(unionHeads);
+      const subClosure = await this.#closureOf(cp.headOps);
+      const fastForward = curHeads.every((h) => subClosure.has(h));
+
+      // 5. Conflicts — the ONLY outcome that needs a human/agent decision, and it
+      // arrives as a minimal repair packet with decision memory, not "pull and redo".
+      if (integrated.conflicts.length > 0) {
+        const packet: ConflictPacket = { conflicts: [] };
+        for (const c of integrated.conflicts) {
+          const fc = integrated.fileConflicts.find((f) => `file:${f.file}` === c.key);
+          packet.conflicts.push({
+            key: c.key,
+            reason: c.reason,
+            options: c.options.map((o) => ({ op: o.opOid, actor: o.actor, purpose: o.purpose })),
+            ...(fc ? { regions: fc.regions } : {}),
+            priorDecisions: await this.recallDecisions(c.key),
+          });
+        }
+        const integration = await this.#recordIntegration({
+          view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
+          verdict: "conflict", conflictKeys: packet.conflicts.map((c) => c.key), by: args.by,
+        });
+        return { verdict: "conflict", packet, integration };
+      }
+
+      // 6. Gates: approvals carry from the SUBMITTED checkpoint to the integrated one
+      // (GitHub counts PR approvals independently of the merge commit — same isomorphism).
+      let carriedApprovals: string[] | undefined;
+      if (prot && (prot.requiredApprovals > 0 || prot.requireOwnerApproval)) {
+        const verdicts = await this.#approvalVerdicts(args.checkpoint);
+        if ([...verdicts.values()].includes("request_changes")) {
+          const reason = "changes requested by a reviewer";
+          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+          return { verdict: "rejected", reason };
+        }
+        const approvers = [...verdicts].filter(([, v]) => v === "approve").map(([id]) => id);
+        if (approvers.length < prot.requiredApprovals) {
+          const reason = `needs ${prot.requiredApprovals} approval(s), have ${approvers.length}`;
+          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+          return { verdict: "rejected", reason };
+        }
+        if (prot.requireOwnerApproval) {
+          let owner = false;
+          for (const id of approvers) if (await this.hasRole(id, "maintainer")) { owner = true; break; }
+          if (!owner) {
+            const reason = "requires an owner (maintainer+) approval";
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            return { verdict: "rejected", reason };
+          }
+        }
+        if (prot.integration?.carryApprovals !== false) {
+          carriedApprovals = (await this.store.collect<Approval>("approval"))
+            .filter((a) => a.checkpointOid === args.checkpoint)
+            .map((a) => a.oid as string);
+        }
+      }
+
+      const waived = await this.#activeWaivers(view);
+      const required = (prot?.requiredChecks ?? []).filter((k) => !waived.has(k));
+      const advance = async (headCp: string, evidenceBinding: Integration["evidenceBinding"], resultIsSubmitted = false): Promise<IntegrationResult> => {
+        await this.store.setRef(`head:${view}`, headCp);
+        const integration = await this.#recordIntegration({
+          view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
+          resultCheckpoint: resultIsSubmitted ? undefined : headCp,
+          verdict: "advanced", evidenceBinding, ...(carriedApprovals ? { carriedApprovals } : {}), by: args.by,
+        });
+        if (resv?.ticketId === ticketId) await this.#writeReservation(view, null);
+        this.logger.info("integrate.advanced", { view, ticketId, head: headCp, evidenceBinding });
+        return { verdict: "advanced", head: headCp, integration };
+      };
+
+      // 7a. Fast-forward — the current head is inside the submission's causal closure:
+      // classic finalize semantics, fresh binding, no re-authored checkpoint.
+      if (fastForward) {
+        for (const k of required) {
+          if (cp.evidence[k] !== "pass") {
+            const reason = `required check ${k} not pass`;
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            return { verdict: "rejected", reason };
+          }
+          if (prot?.requireBoundEvidence && cp.evidenceBinding?.[k] !== "bound") {
+            const reason = `required check ${k} passed but its evidence is not bound to this tree`;
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            return { verdict: "rejected", reason };
+          }
+        }
+        return advance(args.checkpoint, "fresh", true);
+      }
+
+      // 7b. Head moved: the integrated tree differs from the submitted one, so the
+      // submitted evidence does NOT prove it (docs/17 §14.5). Decide by evidence mode.
+      const T = integrated.treeHash;
+      const needsEvidence = async (): Promise<IntegrationResult> => {
+        const draft = resv?.ticketId === ticketId && resv.treeHash === T
+          ? resv.integratedCheckpoint
+          : await this.#authorIntegratedCheckpoint(view, integrated, {}, undefined, `integration ${ticketId.slice(0, 12)} (awaiting evidence)`);
+        const ttl = prot?.integration?.reserveTtlMs ?? 10 * 60_000;
+        await this.#writeReservation(view, {
+          ticketId, submittedCheckpoint: args.checkpoint, integratedCheckpoint: draft,
+          treeHash: T, requiredChecks: required, by: args.by,
+          expiresAt: new Date(Date.now() + ttl).toISOString(),
+        });
+        // What the submitter is missing locally to reproduce T: the head-side delta ops
+        // plus the blobs they reference (determinism does the rest — docs/17 §14.5 fresh).
+        const headClosure = await this.#closureOf(curHeads);
+        const missingLocally: string[] = [];
+        for (const oid of headClosure) {
+          if (subClosure.has(oid)) continue;
+          missingLocally.push(oid);
+          if (await this.store.has(oid)) {
+            const op = await this.store.get<Operation>(oid);
+            for (const b of [op.body.blobOid, op.body.baseBlobOid]) if (b) missingLocally.push(b);
+          }
+        }
+        const integration = await this.#recordIntegration({
+          view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
+          resultCheckpoint: draft, verdict: "needs_evidence", by: args.by,
+        });
+        return { verdict: "needs_evidence", integratedCheckpoint: draft, treeHash: T, requiredChecks: required, missingLocally, ticketId, integration };
+      };
+
+      // Resubmission holding the reservation: accept iff fresh evidence bound to the
+      // reserved tree now covers the required checks — exactly one validation run.
+      if (resv && resv.ticketId === ticketId && resv.treeHash === T) {
+        const bound = await this.#boundEvidenceFor(T);
+        if (required.every((k) => bound[k] === "pass")) {
+          const binding: Checkpoint["evidenceBinding"] = {};
+          for (const k of Object.keys(bound) as EvidenceKind[]) binding[k] = "bound";
+          const finalCp = await this.#authorIntegratedCheckpoint(view, integrated, bound, binding, `integration ${ticketId.slice(0, 12)}`);
+          return advance(finalCp, "fresh");
+        }
+        return needsEvidence(); // reservation refreshed; still exactly one validation owed
+      }
+
+      if (required.length === 0) {
+        // Nothing to prove — integrate directly (evidence-less views).
+        const finalCp = await this.#authorIntegratedCheckpoint(view, integrated, {}, undefined, `integration ${ticketId.slice(0, 12)}`);
+        return advance(finalCp, "fresh");
+      }
+
+      const mode = prot?.integration?.evidenceMode ?? "carry-disjoint";
+      let carry = mode === "carry-always";
+      if (mode === "carry-disjoint") {
+        const headClosure = await this.#closureOf(curHeads);
+        const oursOnly = [...subClosure].filter((o) => !headClosure.has(o));
+        const theirsOnly = [...headClosure].filter((o) => !subClosure.has(o));
+        const ourKeys = await this.#keysOfOps(oursOnly);
+        const theirKeys = await this.#keysOfOps(theirsOnly);
+        // Disjoint deltas + zero new conflicts (checked above) ⇒ the same risk a git
+        // user already accepts when merging two independently-green branches — but
+        // machine-checked, recorded, and opt-out-able (docs/17 §14.5).
+        carry = [...ourKeys].every((k) => !theirKeys.has(k));
+      }
+      // Carried evidence is not tree-bound; a protection that demands bound evidence
+      // therefore forces the fresh path whenever the head has moved.
+      if (prot?.requireBoundEvidence) carry = false;
+
+      if (carry) {
+        for (const k of required) {
+          if (cp.evidence[k] !== "pass") {
+            const reason = `required check ${k} not pass`;
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            return { verdict: "rejected", reason };
+          }
+        }
+        // The carry is never silent: recorded on BOTH the checkpoint and the Integration.
+        const binding: Checkpoint["evidenceBinding"] = {};
+        for (const k of Object.keys(cp.evidence) as EvidenceKind[]) binding[k] = "carried";
+        const finalCp = await this.#authorIntegratedCheckpoint(view, integrated, cp.evidence, binding, `integration ${ticketId.slice(0, 12)} (carried evidence)`);
+        return advance(finalCp, "carried");
+      }
+      return needsEvidence();
+    });
+    if (result.verdict !== "advanced") {
+      this.logger.info("integrate.verdict", { view, ticketId, verdict: result.verdict });
+    }
+    return result;
+  }
+
   // ── security (Phase 12) ────────────────────────────────────────────────────
   /**
    * Redact (tombstone) a blob's bytes — for a leaked secret. Admin-only. The oid is
@@ -1175,6 +1561,51 @@ export class Repo {
     const r = remotes[nameOrUrl];
     if (!r) throw new Error(`unknown remote: ${nameOrUrl} (run \`avcs remote add ${nameOrUrl} <url>\`)`);
     return r.url;
+  }
+
+  /** Public remote-name → hub-URL resolution (a literal URL passes through). */
+  async remoteUrl(nameOrUrl: string): Promise<string> {
+    return this.#resolveRemote(nameOrUrl);
+  }
+
+  /**
+   * Submit a draft checkpoint to a REMOTE hub's integration queue (Phase 14, docs/17
+   * §14.4), with capability detection: a hub advertising `integrate` on GET /version
+   * gets the queue path (one judgment, no redo); an older hub falls back to the legacy
+   * finalize + pull retry funnel (bounded) — the exact loop the queue exists to kill,
+   * kept only for backward compatibility.
+   */
+  async integrateHub(
+    remoteOrUrl: string,
+    args: { view: string; checkpoint: string; by: string; ticketId?: string; signWith?: { keyId: string; privateKey: string } },
+  ): Promise<{ verdict: IntegrationResult["verdict"]; legacy?: boolean } & Record<string, unknown>> {
+    const url = await this.#resolveRemote(remoteOrUrl);
+    const signWith = args.signWith ?? (await this.#resolveHubSigner(args.by));
+    let hasIntegrate = false;
+    try {
+      const v = (await (await fetch(`${url}/version`)).json()) as { integrate?: boolean };
+      hasIntegrate = v.integrate === true;
+    } catch { /* unreachable /version → treat as legacy */ }
+
+    if (hasIntegrate) {
+      const { integrateWithHub } = await import("../hub/hubClient.ts");
+      const r = await integrateWithHub(this.dir, url, { ...args, signWith });
+      // needs_evidence pulled delta objects through a separate store — refresh caches.
+      this.#blobCache.clear();
+      return r as { verdict: IntegrationResult["verdict"] } & Record<string, unknown>;
+    }
+
+    // Legacy fallback (old hub): finalize CAS + pull, bounded retries. This CAN lose
+    // races (that is exactly the funnel Phase 14 removes) — surfaced honestly.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.pullHub(url);
+      const parentHead = await this.protectedHead(args.view);
+      await this.pushHub(url, { as: args.by });
+      const r = await this.finalizeHub(url, { view: args.view, newCheckpoint: args.checkpoint, parentHead, by: args.by, signWith });
+      if (r.finalized) return { verdict: "advanced", head: r.head ?? args.checkpoint, legacy: true };
+      if (!/head moved/.test(r.reason ?? "")) return { verdict: "rejected", reason: r.reason ?? `finalize failed (${r.status})`, legacy: true };
+    }
+    return { verdict: "rejected", reason: "legacy hub: lost the finalize CAS race 3 times — retry, or upgrade the hub for queue semantics", legacy: true };
   }
 
   /**
