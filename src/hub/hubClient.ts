@@ -156,6 +156,49 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
 }
 
 /**
+ * Submit a draft checkpoint to the hub's integration queue (Phase 14, docs/17 §14.4):
+ * push the local delta, POST /integrate, and on `needs_evidence` pull ONLY the
+ * `missingLocally` oids the hub says are needed to reproduce the integrated tree.
+ * NO retry loop, NO re-proposal, NO redo — the caller's next action is at most "run
+ * validation once against exactly the integrated tree → attach evidence → resubmit the
+ * same ticket". Returns the hub's structured verdict plus the HTTP status.
+ */
+export async function integrateWithHub(
+  localRepoDir: string,
+  hubUrl: string,
+  args: { view: string; checkpoint: string; by: string; ticketId?: string; signWith?: HubSigner },
+): Promise<{ status: number; verdict: string } & Record<string, unknown>> {
+  const base = hubUrl.replace(/\/$/, "");
+  // 1. Delta push: whatever the hub lacks (the draft checkpoint, its ops/blobs, evidence).
+  await pushToHub(localRepoDir, hubUrl, args.signWith);
+  // 2. One judgment call. Two signatures as with finalize: body.sig authenticates the
+  // integrate INTENT (object layer), the Authorization header the REQUEST (transport).
+  const body: Record<string, unknown> = { view: args.view, checkpoint: args.checkpoint, by: args.by, ...(args.ticketId ? { ticketId: args.ticketId } : {}) };
+  if (args.signWith) {
+    const { signMessage } = await import("../core/identity.ts");
+    const msg = `integrate:${args.view}:${args.checkpoint}:${args.ticketId ?? ""}`;
+    body.sig = { keyId: args.signWith.keyId, alg: "ed25519", sig: signMessage(args.signWith.privateKey, msg) };
+  }
+  const raw = JSON.stringify(body);
+  const res = await fetch(`${base}/integrate`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/integrate", raw), body: raw });
+  const j = (await res.json().catch(() => ({}))) as { verdict?: string; missingLocally?: string[] } & Record<string, unknown>;
+  // 3. needs_evidence: fetch exactly the head-side delta so `materializeAt` can reproduce
+  // the integrated tree locally (determinism guarantees the same treeHash).
+  if (Array.isArray(j.missingLocally) && j.missingLocally.length) {
+    const store = new ObjectStore(localRepoDir);
+    for (const oid of j.missingLocally) {
+      if (typeof oid !== "string" || (await store.has(oid))) continue;
+      const or = await fetch(`${base}/objects/${encodeURIComponent(oid)}`);
+      if (!or.ok) continue; // raced eviction — the resubmission will re-report it
+      const obj = (await or.json()) as AnyObject;
+      await store.put(obj as never);
+      await indexIfOperation(store, obj, oid);
+    }
+  }
+  return { status: res.status, verdict: j.verdict ?? "rejected", ...j };
+}
+
+/**
  * Request a finalize (= PR merge) on the hub (E6): POST /finalize with the view, the new
  * checkpoint, the parent head being compare-and-swapped, and the finalizer. The hub runs
  * the authoritative CAS+lock+gates. When `signWith` is given the request is signed so a

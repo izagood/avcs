@@ -2,9 +2,9 @@
 
 AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전트는 git status/diff/commit을 이해할 필요 없이, MCP tool과 skill로 사용법을 즉시 주입받는다. 구현: [`src/mcp/server.ts`](../src/mcp/server.ts).
 
-> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. AVCS는 이를 전부 활용하도록 설계됐다 — 현재 `tools` 24종 구현. `resources`(ContextPack)·`prompts`(skill 템플릿)·sync 도구·알림은 **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**에 설계됨(구현 전).
+> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. AVCS는 이를 전부 활용하도록 설계됐다 — 현재 `tools` 26종 구현. `resources`(ContextPack)·`prompts`(skill 템플릿)·알림은 **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**에 설계됨(구현 전).
 
-## Tool 표면 (현재: 24종)
+## Tool 표면 (현재: 26종)
 
 모든 도구는 공통 선택 인자 `cwd`(대상 저장소 힌트, 아래 repo discovery)를 받는다.
 
@@ -40,12 +40,14 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 | `avcs.conflict.list` | 사람이 결정할 충돌 목록 |
 | `avcs.decision.record` | 충돌 해결 기록. **사람 전용** — 로컬 서명 키 + elicitation 확인 요구 |
 
-**checkpoint / release**
+**checkpoint / release / 통합**
 
 | tool | 역할 |
 |------|------|
 | `avcs.checkpoint.create` | 검증된 상태 벡터 동결 |
 | `avcs.release.cut` | 검증된 checkpoint + 증거 + SBOM + 서명 아티팩트로 릴리스 |
+| `avcs.integration.submit` | Phase 14 통합 큐 제출 — 결과는 항상 verdict(advanced/conflict 패킷/needs_evidence/queued), **절대 pull-and-redo 아님** |
+| `avcs.integration.status` | 티켓 verdict 멱등 조회(폴링) |
 
 **동시성 / line / workspace**
 

@@ -32,7 +32,8 @@ export type ObjectType =
   | "promotion"
   | "redaction"
   | "override"
-  | "approval";
+  | "approval"
+  | "integration";
 
 /** ed25519 signature over an object's oid. Excluded from the oid hash. */
 export interface Signature {
@@ -292,9 +293,12 @@ export interface Checkpoint extends BaseObject {
    * "bound" — the evidence carries `treeHash` and it equals this checkpoint's treeHash;
    * "legacy" — the evidence predates treeHash stamping (no `treeHash` field). Evidence
    * whose treeHash differs from this tree is excluded from aggregation entirely (it
-   * proves a different tree). Optional so pre-13.4 checkpoint oids are unchanged.
+   * proves a different tree). Phase 14 adds "carried" — evidence inherited from the
+   * submitted checkpoint by the integration queue under the carry rules (it proves the
+   * submitted tree, not this integrated one; the carry is never silent — recorded here
+   * AND on the Integration verdict). Optional so pre-13.4 checkpoint oids are unchanged.
    */
-  evidenceBinding?: Partial<Record<EvidenceKind, "bound" | "legacy">>;
+  evidenceBinding?: Partial<Record<EvidenceKind, "bound" | "legacy" | "carried">>;
   status: "draft" | "verified" | "released";
   summary: string;
   createdAt: string;
@@ -438,9 +442,56 @@ export interface Protection extends BaseObject {
    * Phase 13.4: when true, a required check only satisfies the finalize gate if the
    * checkpoint's evidenceBinding for that kind is "bound" (treeHash-verified) — legacy
    * (unstamped) evidence is rejected. Default false: legacy evidence keeps passing,
-   * so existing repos/tests are unaffected until a protection opts in.
+   * so existing repos/tests are unaffected until a protection opts in. The integration
+   * queue honors it too: carried evidence is not bound, so `true` forces the fresh
+   * (needs_evidence) path whenever the head has moved.
    */
   requireBoundEvidence?: boolean;
+  /**
+   * Phase 14: integration-queue policy for this view (docs/17 §14.5). `evidenceMode`
+   * decides what happens when the head moved and the integrated tree differs from the
+   * submitted one: "carry-disjoint" (default) inherits the submitted checkpoint's
+   * evidence iff the two deltas touch disjoint key sets with zero new conflicts;
+   * "fresh" always demands one validation run against the integrated tree;
+   * "carry-always" always inherits (explicit admission of semantic-conflict risk).
+   * `carryApprovals` (default true) counts approvals bound to the submitted checkpoint
+   * for the integrated one (the GitHub PR-approval ↔ merge-commit isomorphism).
+   * `reserveTtlMs` bounds a needs_evidence reservation (default 10 minutes).
+   */
+  integration?: {
+    evidenceMode: "fresh" | "carry-disjoint" | "carry-always";
+    carryApprovals?: boolean;
+    reserveTtlMs?: number;
+  };
+  createdAt: string;
+}
+
+/**
+ * Phase 14 (docs/17 §14.1): the append-only audit record of one integration-queue
+ * verdict. Authored ONLY by the integration path (hub or local finalize-lock holder) —
+ * hubs reject pushed `integration` objects; replicas receive them via normal pull.
+ * Inert to the reducer (like checkpoints, it never projects into the tree).
+ */
+export interface Integration extends BaseObject {
+  type: "integration";
+  view: string;
+  /** Idempotency key (client-chosen, or sha256 of view+submittedCheckpoint). */
+  ticketId: string;
+  /** The draft checkpoint the client submitted. */
+  submittedCheckpoint: string;
+  /** The protected head at judgment time. */
+  baseHead: string | null;
+  /** The integrated checkpoint the queue authored (advanced / needs_evidence). */
+  resultCheckpoint?: string;
+  verdict: "advanced" | "conflict" | "needs_evidence" | "rejected" | "expired";
+  /** How the integrated checkpoint's evidence was satisfied (advanced only). */
+  evidenceBinding?: "fresh" | "carried" | "waived";
+  /** Approval oids inherited from the submitted checkpoint (carryApprovals). */
+  carriedApprovals?: string[];
+  /** Conflicting keys (verdict = conflict). */
+  conflictKeys?: string[];
+  reason?: string;
+  by: string;
   createdAt: string;
 }
 
@@ -512,4 +563,5 @@ export type AnyObject =
   | Promotion
   | Redaction
   | Override
-  | Approval;
+  | Approval
+  | Integration;

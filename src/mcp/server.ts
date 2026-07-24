@@ -408,6 +408,46 @@ export const TOOLS: ToolDef[] = [
     handler: (repo, i) => repo.createCheckpoint((i.view as string) ?? "main", (i.summary as string) ?? "checkpoint"),
   },
   {
+    name: "avcs.integration.submit",
+    description:
+      "Submit a draft checkpoint to a remote hub's integration queue (Phase 14, docs/17). NEVER pull-and-redo: the result is always a verdict to act on — `advanced` (done: the hub re-reduced the frontier union and moved the head), `conflict` (a minimal repair packet with counterpart ops + prior decisions: decide via avcs.decision.record, then resubmit), `needs_evidence` (run avcs.validate.run ONCE against the returned integrated tree — the needed delta objects were already pulled — attach evidence, resubmit the SAME ticketId), `queued` (retry after retryAfterMs), or `rejected` (hard gate). Omit `checkpoint` to checkpoint the view automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        view: { type: "string", description: "default 'main'" },
+        remote: { type: "string", description: "remote name or hub url; default 'origin'" },
+        checkpoint: { type: "string", description: "draft checkpoint oid; created from the view when omitted" },
+        message: { type: "string", description: "checkpoint summary when auto-creating" },
+        actor: actorSchema,
+        ticketId: { type: "string", description: "resubmission: reuse the ticketId from the needs_evidence verdict" },
+      },
+      required: ["actor"],
+    },
+    handler: async (repo, i) => {
+      const view = (i.view as string) ?? "main";
+      const checkpoint = (i.checkpoint as string | undefined) ?? (await repo.createCheckpoint(view, (i.message as string) ?? `submit ${view}`));
+      return repo.integrateHub((i.remote as string) ?? "origin", { view, checkpoint, by: actorOf(i).id, ticketId: i.ticketId as string | undefined });
+    },
+  },
+  {
+    name: "avcs.integration.status",
+    description: "Idempotent lookup of an integration ticket's recorded verdict on a remote hub (polling companion to avcs.integration.submit).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ticketId: { type: "string" },
+        view: { type: "string", description: "default 'main'" },
+        remote: { type: "string", description: "remote name or hub url; default 'origin'" },
+      },
+      required: ["ticketId"],
+    },
+    handler: async (repo, i) => {
+      const url = await repo.remoteUrl((i.remote as string) ?? "origin");
+      const res = await fetch(`${url}/integrations/${encodeURIComponent(String(i.ticketId))}?view=${encodeURIComponent((i.view as string) ?? "main")}`);
+      return res.json();
+    },
+  },
+  {
     name: "avcs.lease.request",
     description: "Request a soft write-lease over entity scopes BEFORE editing, to avoid duplicating another agent's in-flight work. Returns the lease oid, or the conflicting holders.",
     inputSchema: {

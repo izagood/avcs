@@ -26,8 +26,11 @@ import type {
 
 /** Wire-protocol version the hub speaks (have/objects/refs gossip). Bumped on breaking
  *  changes. v2 adds SSH-style transport auth: write endpoints may require an AVCS-Sig
- *  Authorization header (read endpoints stay public). */
-export const HUB_PROTOCOL_VERSION = 2;
+ *  Authorization header (read endpoints stay public). v3 (additive) adds the integration
+ *  queue: POST /integrate + GET /integrations/:ticketId; `GET /version` advertises
+ *  `integrate: true` so a client can capability-detect before falling back to legacy
+ *  POST /finalize (which is unchanged). */
+export const HUB_PROTOCOL_VERSION = 3;
 
 export interface HubHandle {
   url: string;
@@ -61,6 +64,10 @@ function authRequirement(obj: AnyObject): AuthReq {
     case "override": return { signerId: (obj as Override).by, minRole: "admin" };
     case "redaction": return { signerId: (obj as Redaction).by, minRole: "admin" };
     case "membership": case "protection": case "policy": return "reject";
+    // Phase 14: integration verdicts are authored ONLY by the integration path (the hub
+    // or a local finalize-lock holder). A pushed one would forge queue history — reject;
+    // replicas receive genuine ones via normal pull.
+    case "integration": return "reject";
     default: return "allow";
   }
 }
@@ -223,6 +230,18 @@ async function verifyFinalizeSig(store: ObjectStore, by: string, view: string, n
   return verifyMessage(m.publicKey, `finalize:${view}:${newCheckpoint}:${parentHead ?? ""}`, s.sig);
 }
 
+/** Authenticate an integrate request (Phase 14) — the same member-signed pattern as
+ *  finalize, over the canonical `integrate:<view>:<checkpoint>:<ticketId>` message. */
+async function verifyIntegrateSig(store: ObjectStore, by: string, view: string, checkpoint: string, ticketId: string, sig: unknown): Promise<boolean> {
+  const s = sig as Signature | undefined;
+  if (!s || typeof s.sig !== "string") return false;
+  const memRef = await store.getRef(`member:${by}`);
+  if (!memRef || !(await store.has(memRef))) return false;
+  const m = await store.get<Membership>(memRef);
+  if (m.revokedAt || m.actorId !== by) return false;
+  return verifyMessage(m.publicKey, `integrate:${view}:${checkpoint}:${ticketId}`, s.sig);
+}
+
 /** E7 operability hooks threaded into the request handler. */
 interface HubOps {
   audit(rec: Record<string, unknown>): Promise<void>;
@@ -286,7 +305,9 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
   if (method === "GET" && path === "/version") {
     // `auth` advertises that writes require an AVCS-Sig credential so a client can attach
     // one up front (and an old client gets a clear 401 instead of a silent rejection).
-    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none" });
+    // `integrate` advertises the Phase 14 integration queue (capability detection: a
+    // client without it falls back to legacy POST /finalize).
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true });
     return;
   }
 
@@ -388,6 +409,12 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
         return;
       }
     }
+    // Phase 14: integration objects are queue-authored only — reject even on an
+    // ungated hub (a pushed one would forge queue history at its content address).
+    if ((obj as AnyObject).type === "integration") {
+      sendJson(res, 403, { error: "integration objects are authored by the integration queue; they cannot be pushed" });
+      return;
+    }
     // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
     // poison the store — it lands at its true content address (or is a no-op if present).
     const oid = await store.put(obj as AnyObject);
@@ -436,6 +463,57 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // A stale parentHead (lost the CAS race) is a 409 conflict; everything else (role,
     // checks, approvals, incomplete history) is a 422 unprocessable.
     sendJson(res, /head moved/.test(result.reason) ? 409 : 422, result);
+    return;
+  }
+
+  // POST /integrate → the Phase 14 integration queue (docs/17 §14.3): instead of
+  // rejecting a stale submission, the hub re-reduces the frontier union on the
+  // submitter's behalf. Verdict → HTTP: advanced 200 / conflict 409 (packet attached) /
+  // needs_evidence 428 / queued 202 / rejected 422. Legacy POST /finalize is unchanged.
+  if (method === "POST" && path === "/integrate") {
+    let raw: string;
+    try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    if (!(await enforceTransportAuth(auth, req, res, "POST", "/integrate", raw, metrics))) return;
+    let body: { view?: unknown; checkpoint?: unknown; by?: unknown; ticketId?: unknown; sig?: unknown };
+    try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
+    const { view, checkpoint, by } = body;
+    if (typeof view !== "string" || typeof checkpoint !== "string" || typeof by !== "string") {
+      sendJson(res, 400, { error: "integrate requires string { view, checkpoint, by }" });
+      return;
+    }
+    const ticketId = typeof body.ticketId === "string" ? body.ticketId : undefined;
+    if (gated && !(await verifyIntegrateSig(store, by, view, checkpoint, ticketId ?? "", body.sig))) {
+      sendJson(res, 403, { error: "integrate not signed by the claimed member" });
+      return;
+    }
+    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
+    if (!(await store.has(checkpoint))) {
+      sendJson(res, 422, { verdict: "rejected", reason: `checkpoint ${checkpoint} not on the hub — push it first` });
+      return;
+    }
+    const { Repo } = await import("../api/repo.ts");
+    const repo = await Repo.open(repoDir);
+    const result = await repo.submitIntegration({ view, checkpoint, by, ticketId });
+    await ops.audit({ action: "integrate", view, checkpoint, ticketId: "ticketId" in result ? result.ticketId : ticketId, by, verdict: result.verdict }); // E7
+    const status = result.verdict === "advanced" ? 200
+      : result.verdict === "conflict" ? 409
+      : result.verdict === "needs_evidence" ? 428
+      : result.verdict === "queued" ? 202
+      : 422;
+    sendJson(res, status, result);
+    return;
+  }
+
+  // GET /integrations/:ticketId?view= → idempotent verdict lookup (polling).
+  if (method === "GET" && path.startsWith("/integrations/")) {
+    const ticketId = decodeURIComponent(path.slice("/integrations/".length));
+    const view = url.searchParams.get("view") ?? "main";
+    const ref = await store.getRef(`integration:${view}:${ticketId}`);
+    if (!ref || !(await store.has(ref))) {
+      sendJson(res, 404, { error: "no such integration ticket", view, ticketId });
+      return;
+    }
+    sendJson(res, 200, await store.get(ref));
     return;
   }
 

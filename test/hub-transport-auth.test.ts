@@ -128,7 +128,7 @@ test("write-auth hub: writes require a valid member signature, reads stay public
     // /version advertises the requirement so clients/old peers learn it up front.
     const ver = await (await fetch(`${hub.url}/version`)).json() as { auth: string; protocol: number };
     assert.equal(ver.auth, "required");
-    assert.equal(ver.protocol, 2);
+    assert.equal(ver.protocol, 3); // v3 = +integration queue (additive; v2 = transport auth)
   } finally {
     await hub.close();
     await rm(dir, { recursive: true, force: true });
