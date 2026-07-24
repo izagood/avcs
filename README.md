@@ -48,7 +48,7 @@ Every meaningful thing is a content-addressed, append-only object. Code is a *pr
 | `release` | A signed, provenance-bearing checkpoint — replaces a tag |
 | `policy` | The deterministic merge rules the reducer is parameterized by |
 
-…plus `blob` for raw content and the governance objects (`lease`, `membership`, `protection`, `promotion`, `redaction`, `override`, `approval`, `line`) used by the multi-machine and security phases.
+…plus `blob` for raw content and the governance objects (`lease`, `membership`, `protection`, `promotion`, `redaction`, `override`, `approval`, `line`, `integration`) used by the multi-machine and security phases.
 
 ## Conflict resolution levels
 
@@ -84,7 +84,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (24 tools); humans use the **CLI**. Next up (designed, not yet implemented): a hub-side **integration queue** that re-reduces stale submissions instead of rejecting them ("head moved — pull first" disappears), live convergence, and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 233-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (26 tools); humans use the **CLI**. Since Phase 14 the hub runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the hub re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Next up (designed, not yet implemented): live convergence (long-poll events, sync daemon, contention early-warning) and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 247-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -224,7 +224,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/release/sbom.ts` | SBOM generation (Phase 6) |
 | `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
-| `src/mcp/server.ts` | Agent-facing MCP interface (24 tools) |
+| `src/mcp/server.ts` | Agent-facing MCP interface (26 tools) |
 | `src/cli.ts` | Human-facing inspection/release CLI |
 | `src/demo.ts` | End-to-end scenario |
 

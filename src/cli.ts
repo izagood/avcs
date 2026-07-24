@@ -313,6 +313,47 @@ async function main(): Promise<void> {
       console.log(`synced with ${remote}: pulled ${r.pulled}, pushed ${r.pushed}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
       break;
     }
+    case "submit": {
+      // Phase 14 (docs/17): checkpoint the view and submit it to the remote's integration
+      // queue. The result is ALWAYS a verdict — never "pull and redo".
+      const repo = await Repo.open(cwd);
+      const view = flag("--view") ?? "main";
+      const remote = flag("--remote") ?? "origin";
+      const by = flag("--as") ?? process.env.AVCS_ACTOR ?? "human:cli";
+      const checkpoint = await repo.createCheckpoint(view, flag("-m") ?? `submit ${view}`);
+      const r = await repo.integrateHub(remote, { view, checkpoint, by });
+      switch (r.verdict) {
+        case "advanced":
+          console.log(`✓ advanced — head is now ${String(r.head).slice(0, 24)}…${r.legacy ? "  [legacy hub fallback]" : ""}`);
+          break;
+        case "conflict": {
+          const packet = r.packet as import("./api/repo.ts").ConflictPacket | undefined;
+          console.error(`✗ conflict — ${packet?.conflicts.length ?? 0} key(s) need a decision (repair packet below):`);
+          for (const c of packet?.conflicts ?? []) {
+            console.error(`  ● ${c.key} — ${c.reason}`);
+            for (const o of c.options) console.error(`     - ${o.op.slice(0, 24)}… ${o.actor} :: ${o.purpose}`);
+            for (const d of c.priorDecisions) console.error(`     ↩ precedent (${d.decidedBy}): ${d.reason}`);
+          }
+          console.error(`  decide via MCP avcs.decision.record, then resubmit.`);
+          process.exitCode = 1;
+          break;
+        }
+        case "needs_evidence":
+          console.log(`… needs_evidence — run validation ONCE against the integrated tree, then resubmit the same ticket:`);
+          console.log(`  integrated checkpoint : ${r.integratedCheckpoint}`);
+          console.log(`  treeHash              : ${r.treeHash}`);
+          console.log(`  required checks       : ${(r.requiredChecks as string[] | undefined)?.join(", ") ?? "(none)"}`);
+          console.log(`  ticketId              : ${r.ticketId}`);
+          break;
+        case "queued":
+          console.log(`… queued behind ticket ${String(r.behindTicket).slice(0, 16)}… — retry after ${r.retryAfterMs}ms`);
+          break;
+        default:
+          console.error(`✗ rejected — ${r.reason}`);
+          process.exitCode = 1;
+      }
+      break;
+    }
     case "serve": {
       const { startHub } = await import("./hub/hubServer.ts");
       const { consoleLogger } = await import("./observe/logger.ts");
@@ -801,6 +842,7 @@ async function main(): Promise<void> {
           "  remote add <name> <url>     register a named hub ([--auto-sync] [--freshness-ms N])\n" +
           "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
           "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +
+          "  submit [--view v] [--remote r] [-m msg] [--as <id>]  checkpoint + integration-queue submit (never pull-and-redo)\n" +
           "  push <hub-url> [--as <id>] push objects to a hub (signs writes with the actor's key)\n" +
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +
           "  head [view]                 show the protected head\n" +
