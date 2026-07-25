@@ -23,6 +23,19 @@ import { ObjectStore } from "../store/objectStore.ts";
 import { serializeResult, errorEnvelope, boundedLimit } from "./respond.ts";
 import { unifiedDiff } from "../query/diff.ts";
 import { buildGuide } from "./guide.ts";
+import { land } from "./land.ts";
+
+/** The hub's governance refs (`head:<view>`, policy, …). Empty when unreachable — a head
+ *  comparison is informational, so a dead hub degrades the answer instead of failing it. */
+async function fetchHubRefs(url: string): Promise<Record<string, string>> {
+  try {
+    const res = await fetch(`${url.replace(/\/$/, "")}/refs`);
+    if (!res.ok) return {};
+    return ((await res.json()) as { refs?: Record<string, string> }).refs ?? {};
+  } catch {
+    return {};
+  }
+}
 import type { Actor, OperationStatus } from "../objects/types.ts";
 
 /**
@@ -201,6 +214,96 @@ export const TOOLS: ToolDef[] = [
       },
     },
     handler: async (_repo, i) => buildGuide(TOOLS, typeof i.topic === "string" ? i.topic : undefined),
+  },
+  {
+    // ── M2 sync surface (docs/18 §M2): an agent never pulls by hand ──
+    name: "avcs.sync.pull",
+    description: "Pull objects from the hub (conflict-free gossip). dryRun reports what would arrive without importing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hub: { type: "string", description: "remote name or hub URL; default the persisted 'origin'" },
+        dryRun: { type: "boolean", description: "report the would-pull count and head comparison, import nothing" },
+      },
+    },
+    handler: async (repo, i) => {
+      const remote = typeof i.hub === "string" ? i.hub : "origin";
+      const url = await repo.remoteUrl(remote);
+      const hubRefs = await fetchHubRefs(url);
+      const view = "main";
+      const hubHead = hubRefs[`head:${view}`] ?? null;
+      if (i.dryRun === true) {
+        // Count what the hub holds and we lack, without importing any of it.
+        const have = (await (await fetch(`${url}/have`)).json()) as string[];
+        let missing = 0;
+        for (const oid of have) if (!(await repo.store.has(oid))) missing++;
+        const local = await repo.protectedHead(view);
+        return { pulled: missing, dryRun: true, head: { local, hub: hubHead }, converged: local === hubHead };
+      }
+      const { pulled } = await repo.pullHub(url);
+      const local = await repo.protectedHead(view);
+      return { pulled, head: { local, hub: hubHead }, converged: local === hubHead };
+    },
+  },
+  {
+    name: "avcs.sync.push",
+    description: "Push local objects to the hub. Returns how many were accepted and how many the gate rejected.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hub: { type: "string", description: "remote name or hub URL; default the persisted 'origin'" },
+        as: { type: "string", description: "actor id whose key signs the writes" },
+      },
+    },
+    handler: async (repo, i) => {
+      const url = await repo.remoteUrl(typeof i.hub === "string" ? i.hub : "origin");
+      return repo.pushHub(url, typeof i.as === "string" ? { as: i.as } : undefined);
+    },
+  },
+  {
+    name: "avcs.sync.land",
+    description: "Land work on a protected head in one call: push, merge-check, checkpoint, integrate. Result is landed or a conflict packet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        view: { type: "string", description: "default 'main'" },
+        summary: { type: "string", description: "checkpoint summary" },
+        by: { type: "string", description: "actor id landing the work" },
+        hub: { type: "string", description: "remote name or hub URL; omit for the persisted 'origin', or a local-only repo" },
+        maxAttempts: { type: "number", description: "bounded contention retries; default 5. Conflicts are never retried." },
+        workspace: { type: "string", description: "land this workspace onto the base line first" },
+      },
+      required: ["by"],
+    },
+    handler: (repo, i) =>
+      land(repo, {
+        view: i.view as string | undefined,
+        summary: i.summary as string | undefined,
+        by: String(i.by),
+        hub: i.hub as string | undefined,
+        maxAttempts: i.maxAttempts as number | undefined,
+        workspace: i.workspace as string | undefined,
+      }),
+  },
+  {
+    name: "avcs.workspace.project",
+    description: "Write a view to a directory on disk, so build/test loops outside validate.run need no CLI.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        out: { type: "string", description: "absolute target directory" },
+        view: { type: "string", description: "default 'main'" },
+        name: { type: "string", description: "project this workspace's isolated ops too" },
+      },
+      required: ["out"],
+    },
+    handler: async (repo, i) => {
+      const view = (i.view as string) ?? "main";
+      const workspace = typeof i.name === "string" ? i.name : undefined;
+      const files = await repo.checkoutInto(String(i.out), view, workspace ? { workspace } : undefined);
+      const res = await repo.materialize(view, workspace ? { workspace } : undefined);
+      return { dir: String(i.out), fileCount: files.length, treeHash: res.treeHash };
+    },
   },
   {
     name: "avcs.intent.create",

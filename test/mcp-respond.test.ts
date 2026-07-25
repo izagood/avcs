@@ -36,12 +36,12 @@ test("an unrecognized failure still produces a structured envelope with the mess
   assert.equal(env.nextActions, undefined, "no invented recovery for an unknown class");
 });
 
-test("a stale head translates to the integration queue — the agent never parses 'head moved'", () => {
-  // The whole point of the Phase 14 queue is that a submit is never told to pull and redo,
-  // so that is the recovery to name. M2 replaces it with avcs.sync.land, which wraps it.
+test("a stale head translates to land — the agent never parses 'head moved'", () => {
+  // Now that M2 ships avcs.sync.land, it is the one-call recovery: it re-pushes,
+  // re-checks the merge, re-checkpoints and re-integrates on its own.
   const env = errorEnvelope(new Error("head moved: abc -> def, pull first"));
   assert.ok(
-    env.nextActions?.some((a) => a.includes("avcs.integration.submit")),
+    env.nextActions?.some((a) => a.includes("avcs.sync.land")),
     `got ${JSON.stringify(env.nextActions)}`,
   );
 });

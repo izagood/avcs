@@ -44,6 +44,14 @@ test("with no topic the guide returns the canonical loop", async () => {
   }
 });
 
+test("the canonical loop ends at sync.land — landing is one call, not a checkpoint dance", async () => {
+  const loop = (await guide()).loop;
+  assert.equal(loop[loop.length - 1].tool, "avcs.sync.land", `loop tail: ${JSON.stringify(loop.map((s: any) => s.tool))}`);
+  const named = loop.map((s: any) => s.tool);
+  assert.ok(!named.includes("avcs.checkpoint.create"), "sync.land absorbs the checkpoint step");
+  assert.ok(!named.includes("avcs.integration.submit"), "sync.land absorbs the submit step");
+});
+
 test("every tool the canonical loop names is actually registered — the loop cannot drift", async () => {
   const registered = new Set(TOOLS.map((t) => t.name));
   for (const step of (await guide()).loop) {

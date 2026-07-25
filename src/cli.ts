@@ -351,6 +351,32 @@ async function main(): Promise<void> {
       console.log(`synced with ${remote}: pulled ${r.pulled}, pushed ${r.pushed}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
       break;
     }
+    case "land": {
+      // Phase 16 M2 (docs/18 §2.2): CLI parity over the same land loop the MCP tool uses,
+      // so a human and an agent get identical semantics — landed, or a conflict to decide.
+      const repo = await Repo.open(cwd);
+      const { land } = await import("./mcp/land.ts");
+      const r = await land(repo, {
+        view: flag("--view"),
+        summary: flag("-m"),
+        by: flag("--as") ?? process.env.AVCS_ACTOR ?? "human:cli",
+        hub: flag("--remote"),
+        workspace: flag("--workspace"),
+        maxAttempts: flag("--max-attempts") ? Number(flag("--max-attempts")) : undefined,
+      });
+      if (r.landed) {
+        console.log(`✓ landed — head is now ${r.head.slice(0, 24)}… (${r.attempts} attempt(s), via ${r.via})`);
+        break;
+      }
+      console.error(`✗ not landed (${r.reason}) after ${r.attempts} attempt(s)${r.detail ? ` — ${r.detail}` : ""}`);
+      for (const c of (r.conflicts ?? []) as { key?: string; reason?: string }[]) {
+        console.error(`  ● ${c.key ?? "?"} — ${c.reason ?? ""}`);
+      }
+      console.error("  next:");
+      for (const a of r.nextActions) console.error(`    - ${a}`);
+      process.exitCode = 1;
+      break;
+    }
     case "submit": {
       // Phase 14 (docs/17): checkpoint the view and submit it to the remote's integration
       // queue. The result is ALWAYS a verdict — never "pull and redo".
@@ -881,6 +907,7 @@ async function main(): Promise<void> {
           "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
           "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +
           "  sync --watch [remote]       live-convergence daemon: /events long-poll + contention early warning\n" +
+          "  land [--view v] [--remote r] [-m msg] [--as <id>] [--workspace w]  push+merge-check+checkpoint+integrate in one step\n" +
           "  submit [--view v] [--remote r] [-m msg] [--as <id>]  checkpoint + integration-queue submit (never pull-and-redo)\n" +
           "  push <hub-url> [--as <id>] push objects to a hub (signs writes with the actor's key)\n" +
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +

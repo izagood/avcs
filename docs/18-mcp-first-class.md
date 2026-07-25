@@ -60,7 +60,13 @@
 
 ---
 
-## M2 — sync 일급화: 에이전트는 손으로 pull하지 않는다
+## M2 — sync 일급화: 에이전트는 손으로 pull하지 않는다 ✅ *(구현 완료)*
+
+> **구현 결과.** `avcs.sync.pull`/`push`/`land`/`avcs.workspace.project` 4종 추가(28→32). land 루프는 `src/mcp/land.ts`에 분리해 SDK 없이 단위 테스트하며, CLI `avcs land`가 **같은 함수**를 호출한다(사람과 에이전트의 의미가 갈라지지 않는다).
+>
+> **M1이 남겨둔 연결을 완성:** `RECOVERY`의 "head moved" → `avcs.sync.land`, guide 정본 루프의 마지막 3단계(materialize→checkpoint→submit)가 `sync.land` 한 번으로 축약. M1의 드리프트 가드가 이 도구들이 실재하게 된 시점에 그대로 통과하며 연결됐다.
+>
+> **설계보다 결과를 하나 늘렸다.** §2.2는 결과를 `landed | conflict` 둘로 적었으나 통합 큐의 verdict는 넷이다(advanced·conflict·needs_evidence·queued). `queued`는 루프가 흡수하고(백오프 후 재시도), `needs_evidence`는 **흡수하면 안 된다** — 큐가 예약한 트리에 검증을 딱 1회 돌린 뒤 같은 티켓으로 전진하는 계약이라, 그냥 재시도하면 재예약만 반복한다. 그래서 `{landed:false, reason:"needs_evidence", nextActions:[validate.run, evidence.attach, land]}`로 돌려준다. 에이전트가 "pull 하고 다시"를 듣지 않는다는 계약은 그대로다.
 
 ### 2.1 `avcs.sync.pull` / `avcs.sync.push` — S
 

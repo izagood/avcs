@@ -16,9 +16,10 @@ export type GuideTopic = "workflow" | "tools" | "sync" | "rules" | "errors";
 
 /**
  * The canonical loop an agent runs. Every `tool` here must be REGISTERED — a loop naming a
- * tool that does not exist teaches the agent to fail. Phase 16 M2/M3 insert
- * `avcs.context.build` after intent.read and collapse the closing three steps into
- * `avcs.sync.land`; until those ship, this is the loop that actually works.
+ * tool that does not exist teaches the agent to fail, and unlike prose an agent would skim,
+ * a step it is told to run fails for certain. A test pins this against the live table.
+ *
+ * Phase 16 M3 inserts `avcs.context.build` after intent.read.
  */
 const LOOP: { step: number; tool: string; why: string }[] = [
   { step: 1, tool: "avcs.intent.read", why: "learn the declared goal and the scopes you may touch" },
@@ -29,8 +30,7 @@ const LOOP: { step: number; tool: string; why: string }[] = [
   { step: 6, tool: "avcs.validate.run", why: "produce evidence; a behaviour change is not acceptable without it" },
   { step: 7, tool: "avcs.evidence.attach", why: "bind that evidence to the ops it justifies" },
   { step: 8, tool: "avcs.view.materialize", why: "check the work actually merges, and read any open conflicts" },
-  { step: 9, tool: "avcs.checkpoint.create", why: "package the accepted state for submission" },
-  { step: 10, tool: "avcs.integration.submit", why: "land it; the queue re-reduces for you, so you are never told to pull and redo" },
+  { step: 9, tool: "avcs.sync.land", why: "land it in one call — push, checkpoint and integrate are inside; you get landed or a conflict to decide" },
 ];
 
 /** The agent obligations from docs/06, in a form a machine can carry in a system prompt. */
@@ -44,9 +44,11 @@ const RULES: string[] = [
 ];
 
 const SYNC: string[] = [
-  "avcs.integration.submit lands work; a moved head is re-reduced for you, not bounced back.",
-  "avcs.integration.status re-reads a ticket; the verdict is advanced | conflict | needs_evidence | queued.",
-  "A conflict verdict needs a human decision — avcs.conflict.list then avcs.decision.record.",
+  "avcs.sync.land is the way to land work: push, merge-check, checkpoint and integrate in one call.",
+  "land returns landed:true, or landed:false with a reason and nextActions. It never tells you to pull and redo.",
+  "A conflict is never retried through — it needs a human: avcs.conflict.list then avcs.decision.record, then land again.",
+  "avcs.sync.pull is safe any time (conflict-free gossip); dryRun reports what would arrive.",
+  "avcs.integration.status re-reads a ticket directly; verdicts are advanced | conflict | needs_evidence | queued.",
 ];
 
 /** Build the guide. `tools` is the live table so the index is generated, never restated. */

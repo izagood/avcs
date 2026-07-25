@@ -34,11 +34,12 @@ export interface RecoveryRule {
  */
 export const RECOVERY: RecoveryRule[] = [
   {
-    // The Phase 14 integration queue exists precisely so a submit is never told to pull
-    // and redo; naming it turns the one error an agent used to flail on into a call.
+    // The one error an agent used to flail on becomes a single call: land re-pushes,
+    // re-checks the merge, re-checkpoints and re-integrates, and the queue behind it
+    // re-reduces the frontier union rather than bouncing the submission back.
     re: /head moved|not up to date|stale (parent|head)/i,
-    hint: "the view's head advanced while you worked; the integration queue re-reduces for you",
-    nextActions: ["avcs.integration.submit", "avcs.integration.status"],
+    hint: "the view's head advanced while you worked; landing absorbs that for you",
+    nextActions: ["avcs.sync.land", "avcs.integration.status"],
   },
   {
     re: /no local signing key|signing key|keystore/i,
