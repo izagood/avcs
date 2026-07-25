@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 
 import { Repo, type GitMode } from "./api/repo.ts";
 import { ObjectStore } from "./store/objectStore.ts";
-import type { Operation } from "./objects/types.ts";
+import type { Operation, Actor } from "./objects/types.ts";
 import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
 
 const args = process.argv.slice(2);
@@ -202,6 +202,30 @@ async function main(): Promise<void> {
         }
       }
       break;
+    }
+    case "key": {
+      // Signing keys, reachable without writing a script (issue #51). `ls` prints actor
+      // ids only — a listing that emitted key material would be the disclosure it exists
+      // to help avoid.
+      const repo = await Repo.open(cwd);
+      const sub = args[1];
+      if (sub === "provision") {
+        const id = args[2];
+        if (!id) throw new Error("usage: avcs key provision <actor-id> [--kind human|ai_agent|ci_bot]");
+        const kind = (flag("--kind") ?? (id.startsWith("human:") ? "human" : id.startsWith("ci:") ? "ci_bot" : "ai_agent")) as Actor["kind"];
+        const r = await repo.ensureOwnerKey({ kind, id });
+        console.log(r.created ? `provisioned signing key for ${id}` : `${id} already has a local signing key (unchanged)`);
+        break;
+      }
+      if (sub === "ls" || sub === undefined) {
+        const [local, trusted] = await Promise.all([repo.listLocalKeys(), repo.listTrustedKeys()]);
+        console.log(`signable on this machine (${local.length}):`);
+        for (const a of local) console.log(`  ${a}`);
+        console.log(`trusted by this repo (${trusted.length}):`);
+        for (const a of trusted) console.log(`  ${a}`);
+        break;
+      }
+      throw new Error(`unknown key subcommand: ${sub} — use \`avcs key provision <actor-id>\` or \`avcs key ls\``);
     }
     case "conflicts": {
       const repo = await Repo.open(cwd);
@@ -887,6 +911,7 @@ async function main(): Promise<void> {
         "avcs <command>\n\n" +
           "  init [dir] [--mode m]       create a repo (--mode sidecar|committed, default sidecar)\n" +
           "  status [view]               operation/conflict summary\n" +
+          "  key provision <actor-id> | key ls   local signing keys (decisions, hub writes)\n" +
           "  conflicts [view]            list decisions a human owes\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +

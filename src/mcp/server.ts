@@ -432,6 +432,28 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    // ── keys (issue #51): signing must be reachable without writing a script ──
+    name: "avcs.key.provision",
+    description: "Mint a local signing key for an actor so its decisions and hub writes can be signed. Idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: { actor: actorSchema },
+      required: ["actor"],
+    },
+    // Idempotent by design: re-minting would orphan the previous key while signatures made
+    // with it stay in history, so an actor who provisions twice must not lose their identity.
+    handler: async (repo, i) => repo.ensureOwnerKey(actorOf(i)),
+  },
+  {
+    name: "avcs.key.list",
+    description: "Which actors this machine can sign as, and which public keys the repo trusts. Ids only, never key material.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async (repo) => ({
+      local: await repo.listLocalKeys(),
+      trusted: await repo.listTrustedKeys(),
+    }),
+  },
+  {
     name: "avcs.intent.create",
     description: "Open an intent: the goal + constraints + allowed scopes for a unit of work. Agents must work within an intent.",
     inputSchema: {

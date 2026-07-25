@@ -313,6 +313,45 @@ export class Repo {
     await mkdir(this.#privateKeysDir(), { recursive: true });
     await writeFile(join(this.#privateKeysDir(), `${actorId}.json`), JSON.stringify({ actorId, privateKey }), { encoding: "utf8", mode: 0o600 });
   }
+  /**
+   * Actor ids this machine holds a PRIVATE key for — i.e. who it can sign as. Returns ids
+   * only: the key material must never travel with a listing, or `key ls` becomes the
+   * disclosure it is meant to help avoid.
+   */
+  async listLocalKeys(): Promise<string[]> {
+    const dir = this.#privateKeysDir();
+    if (!existsSync(dir)) return [];
+    const { readdir } = await import("node:fs/promises");
+    return (await readdir(dir))
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => f.replace(/\.json$/, ""))
+      .sort();
+  }
+
+  /** Public keys this REPO trusts (shared/gossiped) — a different question from which
+   *  keys this machine can sign with. Returns actor ids only. */
+  async listTrustedKeys(): Promise<string[]> {
+    const dir = join(this.store.root, "keys");
+    if (!existsSync(dir)) return [];
+    const { readdir } = await import("node:fs/promises");
+    return (await readdir(dir))
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => f.replace(/\.json$/, ""))
+      .sort();
+  }
+
+  /**
+   * Mint a signing key for `actor` unless one is already held (issue #51).
+   *
+   * Idempotent on purpose: re-provisioning would orphan the previous key while any
+   * signature already made with it stays in history, so a caller who runs this twice must
+   * not silently lose the ability to be recognised as themselves.
+   */
+  async ensureOwnerKey(actor: Actor, keyId = actor.id): Promise<{ keyId: string; created: boolean }> {
+    if (await this.loadLocalKey(actor.id)) return { keyId, created: false };
+    return { keyId: await this.provisionOwnerKey(actor, keyId), created: true };
+  }
+
   /** Load a locally-held private key for `actorId`, or null if none is stored. */
   async loadLocalKey(actorId: string): Promise<string | null> {
     const p = join(this.#privateKeysDir(), `${actorId}.json`);
