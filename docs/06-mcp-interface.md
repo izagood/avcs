@@ -14,6 +14,17 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 |------|------|
 | `avcs.guide` | 정본 루프·에이전트 규칙·도구 색인·에러 복구. **먼저 호출한다.** 도구 색인과 에러맵은 live 테이블에서 생성되므로 서버와 어긋날 수 없다. `topic`: workflow(기본)·tools·sync·rules·errors |
 
+**동기화 / 랜딩** *(Phase 16 M2 — [18](18-mcp-first-class.md) §M2)*
+
+| tool | 역할 |
+|------|------|
+| `avcs.sync.land` | **정본 루프의 종점.** push → merge-check → checkpoint → 통합을 한 호출로. 결과는 `landed:true` 또는 `landed:false` + `reason`/`nextActions`. **"head moved"는 에이전트에게 도달하지 않는다** |
+| `avcs.sync.pull` | 허브에서 객체 pull(무충돌 gossip이라 언제든 안전). `dryRun`은 받아올 개수와 local/hub head 비교만 |
+| `avcs.sync.push` | 로컬 객체 push → `{pushed, rejected}` |
+| `avcs.workspace.project` | 뷰를 디스크에 기록 → `{dir, fileCount, treeHash}`. validate.run 밖 빌드/테스트 루프용 |
+
+> **land 계약.** 충돌은 **재시도하지 않는다** — 사람이 골라야 하므로 첫 시도에 `conflicts` + 결정 패킷 + `nextActions`(conflict.list → decision.record → land)를 돌려준다. 통합 큐의 `queued`는 루프가 백오프로 흡수하고, `needs_evidence`는 예약된 트리에 검증 1회가 필요하다는 뜻이라 `validate.run` → `evidence.attach` → `land`로 안내한다. 허브가 없거나 구버전이면 로컬 CAS finalize로 폴백하되 **계약은 동일**하다.
+
 > **응답 관례 (M1).** 모든 응답은 **컴팩트 직렬화**가 기본이다(들여쓰기는 에이전트가 매 호출 지불하는 토큰). 사람이 읽을 때만 범용 입력 `verbose: true`. 실패는 산문이 아니라 `{ error, hint?, nextActions? }` 봉투로 오므로, **에러 문자열을 파싱하지 말고 `nextActions`를 따른다.** 목록형 읽기는 유계다 — `history`(limit 20 + cursor), `intent.list`(limit 50), `view.materialize`(filesLimit 500 + `filesTotal`/`filesTruncated`), `object.show`(lines/maxBytes + `bytes`/`truncated`). `treeHash`·status·conflicts는 정확성 데이터라 **절대 잘리지 않는다.**
 
 **intent / session**
