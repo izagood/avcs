@@ -14,6 +14,28 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 |------|------|
 | `avcs.guide` | 정본 루프·에이전트 규칙·도구 색인·에러 복구. **먼저 호출한다.** 도구 색인과 에러맵은 live 테이블에서 생성되므로 서버와 어긋날 수 없다. `topic`: workflow(기본)·tools·sync·rules·errors |
 
+**거버넌스 / 리뷰** *(Phase 16 M4 — [18](18-mcp-first-class.md) §4.4)*
+
+| tool | 역할 |
+|------|------|
+| `avcs.governance.status` | 뷰의 protection·head·내 역할·유효 승인 (읽기 전용) |
+| `avcs.approval.record` | 리뷰어 판정 기록(로컬 키 서명, 역할 ≥ reviewer). `decision.record`와 달리 사람 elicitation 게이트가 없다 — 승인은 역할·서명으로 이미 게이트되므로 키를 가진 리뷰어 봇이 의도된 사용자다 |
+
+> **승인 조회는 게이트와 같은 뷰를 쓴다.** `repo.approvalsFor()`는 finalize가 쓰는 것과 동일한 신뢰 게이트를 지난다 — 역할을 잃은 actor의 승인은 빠지고, 같은 리뷰어의 나중 판정이 앞선 것을 덮는다. 리뷰 화면이 게이트가 세지 않을 승인을 보여줄 수 없다.
+
+**Resources (구독 가능)** — `capabilities.resources.subscribe: true`
+
+| uri | 내용 |
+|-----|------|
+| `avcs://view/{view}/head` | `{ view, head, treeHash }` — 구독하면 head 전진을 통보받는다 |
+| `avcs://view/{view}/conflicts` | 열린 충돌 (`avcs.conflict.list`와 동일 출력) |
+| `avcs://view/{view}/context` | 뷰 기본 ContextPack. **스코프는 "지금 판에 올라온 키"** — 열린 충돌의 키 + 최근 op 20개가 만진 키 |
+| `avcs://guide` | guide |
+
+**Prompts** — `avcs.onboard`(guide 인라인) · `avcs.propose-change`(intent 제약·범위 인라인) · `avcs.resolve-repair`(repair 패킷 인라인) · `avcs.review-change`(protection·승인·충돌 수 인라인)
+
+> **알림.** 로컬 워처가 `.avcs`를 주기 비교(`AVCS_MCP_WATCH_MS`, 기본 3000, `0`이면 off)해 `head-advanced`·`foreign-op-hot-key`·`conflict-opened`를 방출한다. 구독 중이면 `notifications/resources/updated`, 아니면 `notifications/message`로도 보내므로 구독 없는 클라이언트도 눈이 멀지 않는다. **폴링이 정확성 경로다** — `fs.watch`는 플랫폼별로 이벤트를 흘리고, head 전진을 놓치는 것이 이 기능이 막으려는 실패다.
+
 **컨텍스트 / 결정 메모리** *(Phase 16 M3 — [18](18-mcp-first-class.md) §M3)*
 
 | tool | 역할 |
