@@ -10,6 +10,7 @@
 // parse the raw shape, so only additive fields are allowed.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { serializeResult, errorEnvelope, RECOVERY } from "../src/mcp/respond.ts";
 import { TOOLS } from "../src/mcp/server.ts";
 
@@ -46,6 +47,24 @@ test("a stale head translates to land — the agent never parses 'head moved'", 
   );
 });
 
+test("every CLI command named by a recovery hint actually exists", async () => {
+  // The tool-name guard below deliberately skipped space-separated CLI invocations, and
+  // that exemption is exactly where a hint rotted: `avcs key provision` was suggested for
+  // a missing signing key and has never been a command. A nextAction is followed, not
+  // skimmed, so naming a command that does not exist guarantees the agent fails.
+  const cli = await readFile(new URL("../src/cli.ts", import.meta.url), "utf8");
+  const commands = new Set([...cli.matchAll(/case "([a-z-]+)":/g)].map((m) => m[1]!));
+  assert.ok(commands.size > 10, "parsed the CLI command table");
+
+  const referenced = RECOVERY.flatMap((r) => r.nextActions)
+    .map((a) => /^avcs\s+([a-z-]+)/.exec(a)?.[1])
+    .filter((c): c is string => !!c);
+  assert.ok(referenced.length > 0, "the table names at least one CLI command");
+  for (const c of referenced) {
+    assert.ok(commands.has(c), `recovery hint names nonexistent CLI command \`avcs ${c}\``);
+  }
+});
+
 test("every tool named by a recovery hint is actually registered — hints cannot drift", () => {
   // A nextAction that points at a tool which does not exist is worse than prose: the agent
   // follows it and fails. This pins the whole RECOVERY table against the live tool list.
@@ -60,9 +79,11 @@ test("every tool named by a recovery hint is actually registered — hints canno
   }
 });
 
-test("a missing signing key points at key provisioning", () => {
+test("a missing signing key explains provisioning in the hint, since no command does it", () => {
+  // There is deliberately no `avcs key …` nextAction: that command does not exist, and a
+  // hint the agent can read beats an instruction it would follow into a failure.
   const env = errorEnvelope(new Error("no local signing key for ai:claude"));
-  assert.ok(env.nextActions?.some((a) => /key/i.test(a)), `got ${JSON.stringify(env.nextActions)}`);
+  assert.match(String(env.hint), /provisionOwnerKey/);
 });
 
 test("being outside a repo points at cwd and init, the two things that actually fix it", () => {
