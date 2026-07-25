@@ -44,6 +44,14 @@ test("with no topic the guide returns the canonical loop", async () => {
   }
 });
 
+test("the canonical loop builds context before proposing — reading precedes writing", async () => {
+  const named = (await guide()).loop.map((s: any) => s.tool);
+  const ctx = named.indexOf("avcs.context.build");
+  const propose = named.indexOf("avcs.operation.propose");
+  assert.ok(ctx >= 0, `context.build is in the loop, got ${JSON.stringify(named)}`);
+  assert.ok(ctx < propose, "context comes before the first write");
+});
+
 test("the canonical loop ends at sync.land — landing is one call, not a checkpoint dance", async () => {
   const loop = (await guide()).loop;
   assert.equal(loop[loop.length - 1].tool, "avcs.sync.land", `loop tail: ${JSON.stringify(loop.map((s: any) => s.tool))}`);
