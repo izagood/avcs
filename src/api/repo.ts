@@ -1638,9 +1638,11 @@ export class Repo {
     return finalizeOnHub(hubUrl, { ...args, signWith });
   }
   /** Pull objects a network hub holds that this repo lacks. */
-  async pullHub(hubUrl: string): Promise<{ pulled: number }> {
+  async pullHub(hubUrl: string, opts?: { as?: string }): Promise<{ pulled: number }> {
     const { pullFromHub } = await import("../hub/hubClient.ts");
-    const r = await pullFromHub(this.dir, hubUrl);
+    // Sign reads when this replica holds a key (issue #50): a hub that gates reads refuses
+    // an unsigned GET, and a read-public hub ignores the header, so this is additive.
+    const r = await pullFromHub(this.dir, hubUrl, await this.#resolveHubSigner(opts?.as));
     // pull may have applied redactions (blob bytes overwritten under stable oids) and
     // wrote through a separate ObjectStore; drop the warm blob cache so reads re-hit disk.
     this.#blobCache.clear();
@@ -1730,7 +1732,7 @@ export class Repo {
     // Legacy fallback (old hub): finalize CAS + pull, bounded retries. This CAN lose
     // races (that is exactly the funnel Phase 14 removes) — surfaced honestly.
     for (let attempt = 0; attempt < 3; attempt++) {
-      await this.pullHub(url);
+      await this.pullHub(url, { as: args.by });
       const parentHead = await this.protectedHead(args.view);
       await this.pushHub(url, { as: args.by });
       const r = await this.finalizeHub(url, { view: args.view, newCheckpoint: args.checkpoint, parentHead, by: args.by, signWith });
@@ -1747,7 +1749,9 @@ export class Repo {
    */
   async sync(remote = "origin", opts?: { as?: string }): Promise<{ pulled: number; pushed: number; rejected: number }> {
     const url = await this.#resolveRemote(remote);
-    const { pulled } = await this.pullHub(url);
+    // Both halves carry the identity: a hub that gates reads refuses an unsigned pull, so
+    // passing `as` only to the push leg would leave sync broken there (issue #50).
+    const { pulled } = await this.pullHub(url, opts);
     const { pushed, rejected } = await this.pushHub(url, opts);
     await this.#recordSyncAt(remote); // Phase 15.2: the freshness window keys off this stamp
     this.logger.info("sync.completed", { remote, url, pulled, pushed, rejected });

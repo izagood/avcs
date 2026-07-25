@@ -28,9 +28,25 @@ function writeHeaders(signer: HubSigner | undefined, method: string, path: strin
   return headers;
 }
 
+/**
+ * Headers for a hub READ (issue #50).
+ *
+ * The reference hub is read-public (D2), so reads went out bare and the omission was
+ * invisible against it. It stops being invisible for an embedder with per-repo access
+ * control, which necessarily gates reads — and the failure there is total rather than
+ * partial, because `pushToHub` opens with GET /have, so a 401 on reads breaks push too.
+ *
+ * Best-effort by design: no signer, no header, and a read-public hub is unaffected. The
+ * signature covers the method, so a captured GET credential cannot be replayed as a write.
+ */
+function readHeaders(signer: HubSigner | undefined, path: string): Record<string, string> {
+  if (!signer) return {};
+  return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "" }) };
+}
+
 /** GET /have → the set of oids the hub holds. */
-async function hubHave(hubUrl: string): Promise<Set<string>> {
-  const res = await fetch(`${hubUrl.replace(/\/$/, "")}/have`);
+async function hubHave(hubUrl: string, signer?: HubSigner): Promise<Set<string>> {
+  const res = await fetch(`${hubUrl.replace(/\/$/, "")}/have`, { headers: readHeaders(signer, "/have") });
   if (!res.ok) throw new Error(`GET /have failed: ${res.status} ${res.statusText}`);
   const oids = (await res.json()) as string[];
   return new Set(oids);
@@ -49,9 +65,9 @@ async function readCursors(root: string): Promise<Record<string, number>> {
  * cursor. Falls back to the full `GET /have` against an older hub (cursor stays null).
  * Correctness never depends on the cursor — a wrong/stale one at worst transfers more.
  */
-async function discover(base: string, since: number): Promise<{ oids: string[]; cursor: number | null }> {
+async function discover(base: string, since: number, signer?: HubSigner): Promise<{ oids: string[]; cursor: number | null }> {
   try {
-    const res = await fetch(`${base}/sync?since=${since}`);
+    const res = await fetch(`${base}/sync?since=${since}`, { headers: readHeaders(signer, "/sync") });
     if (res.ok) {
       const j = (await res.json()) as { oids: string[]; cursor: number };
       return { oids: j.oids, cursor: j.cursor };
@@ -59,7 +75,7 @@ async function discover(base: string, since: number): Promise<{ oids: string[]; 
   } catch {
     // fall through to /have
   }
-  return { oids: [...(await hubHave(base))], cursor: null };
+  return { oids: [...(await hubHave(base, signer))], cursor: null };
 }
 
 /** Mirror Repo.pull's import side-effect: maintain the entity index for imported ops. */
@@ -77,7 +93,7 @@ async function indexIfOperation(store: ObjectStore, obj: AnyObject, oid: string)
 export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?: HubSigner): Promise<{ pushed: number; rejected: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
-  const have = await hubHave(base);
+  const have = await hubHave(base, signWith);
   let pushed = 0;
   let rejected = 0;
   for await (const obj of store.list()) {
@@ -113,19 +129,19 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
  * the caller can advance its clock past the imported history (Phase 13.2
  * observe-on-import — subsequently issued lamports sort after what was pulled).
  */
-export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise<{ pulled: number; maxLamport: number }> {
+export async function pullFromHub(localRepoDir: string, hubUrl: string, signWith?: HubSigner): Promise<{ pulled: number; maxLamport: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const store = new ObjectStore(localRepoDir);
   await store.init(); // tolerate a fresh local repo dir
   // Incremental discovery (E5): only consider oids the hub added since our last pull.
   const cursors = await readCursors(store.root);
   const since = cursors[base] ?? 0;
-  const { oids, cursor } = await discover(base, since);
+  const { oids, cursor } = await discover(base, since, signWith);
   let pulled = 0;
   let maxLamport = 0;
   for (const oid of oids) {
     if (await store.has(oid)) continue;
-    const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`);
+    const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`, { headers: readHeaders(signWith, `/objects/${encodeURIComponent(oid)}`) });
     if (res.status === 404) continue; // raced eviction; skip
     if (!res.ok) throw new Error(`GET /objects/${oid} failed: ${res.status} ${res.statusText}`);
     const obj = (await res.json()) as AnyObject;
@@ -141,7 +157,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string): Promise
   // Governance distribution: adopt the hub's authoritative governance refs (policy,
   // membership, protection, protected heads). The objects they point to were just
   // pulled above, so the refs resolve. Working refs (view:*/checkpoint:*) stay local.
-  const refsRes = await fetch(`${base}/refs`);
+  const refsRes = await fetch(`${base}/refs`, { headers: readHeaders(signWith, "/refs") });
   if (refsRes.ok) {
     const { refs } = (await refsRes.json()) as { refs: Record<string, string> };
     for (const [name, refOid] of Object.entries(refs)) {
