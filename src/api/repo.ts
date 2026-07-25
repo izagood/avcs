@@ -1547,6 +1547,18 @@ export class Repo {
     return out;
   }
 
+  /**
+   * Public read of the effective approval verdicts on a checkpoint (Phase 16 M4, docs/18
+   * §3): the same trust-gated view finalize uses, so a review surface cannot show an
+   * approval the gate would not count — only actors who still hold the reviewer role are
+   * included, and a later verdict from the same reviewer supersedes an earlier one.
+   */
+  async approvalsFor(checkpointOid: string): Promise<{ by: string; verdict: "approve" | "request_changes" }[]> {
+    return [...(await this.#approvalVerdicts(checkpointOid))]
+      .map(([by, verdict]) => ({ by, verdict }))
+      .sort((a, b) => a.by.localeCompare(b.by));
+  }
+
   /** Objects missing from the causal closure of a frontier (incomplete sync). */
   async #missingCausalDeps(headOps: string[]): Promise<string[]> {
     const seen = new Set<string>();
