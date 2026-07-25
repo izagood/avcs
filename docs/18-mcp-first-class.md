@@ -128,7 +128,19 @@
 
 ---
 
-## M4 — resources / prompts / 알림
+## M4 — resources / prompts / 알림 ✅ *(구현 완료)*
+
+> **구현 결과.** resources 4종(subscribe:true 광고) + prompts 4종 + 로컬 워처 + 거버넌스 도구 2종(`governance.status`·`approval.record`, 34→36). `repo.approvalsFor()` 공개 접근자 추가 — finalize가 쓰는 것과 **같은 신뢰 게이트 뷰**라 리뷰 화면이 게이트가 세지 않을 승인을 보여줄 수 없다.
+>
+> **resources는 도구 핸들러와 같은 repo 호출을 지난다** — 테스트가 `avcs://view/main/conflicts`와 `avcs.conflict.list`의 출력이 deepEqual임을 못박는다(진실은 하나, 문은 둘).
+>
+> **`avcs://view/{view}/context`의 스코프 문제(설계 미기재).** ContextPack은 스코프 없는 호출을 거부하는데(§3.1) 뷰 단위 resource에는 줄 스코프가 없다. 해결: **지금 판에 올라온 키** — 열린 충돌의 키 + 최근 op 20개가 만진 키. 뷰에 막 도착한 에이전트가 필요로 하는 집합이 정확히 그것이다.
+>
+> **워처는 폴링이 정확성 경로다.** `fs.watch`는 플랫폼별로 이벤트를 흘리는데(coalescing, 하위 디렉터리 누락, 네트워크 마운트에서 조용히 사망), **head 전진을 놓치는 것**이 이 기능이 막으려는 실패 그 자체다. 그래서 상태 비교가 주 경로이고 fs.watch는 조기 트리거일 뿐이다. 감지기(`RepoWatcher.poll()`)는 SDK 알림 배선과 분리해 직접 구동 테스트한다. 첫 poll은 baseline만 잡는다 — 이력이 있는 저장소에 **도착한 것**은 이벤트가 아니다.
+>
+> **`foreign-op-hot-key`의 스코프.** stdio 서버는 클라이언트당 1개이므로, 이 클라이언트가 `operation.propose`로 만진 키가 곧 정확한 hot set이다. 자기 op는 경보하지 않는다.
+>
+> **`avcs.bisect`는 설계대로 보류**(수요 확인 전).
 
 ### 4.1 Resources (`src/mcp/resources.ts`) — M
 

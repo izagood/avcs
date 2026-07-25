@@ -25,6 +25,9 @@ import { unifiedDiff } from "../query/diff.ts";
 import { buildGuide } from "./guide.ts";
 import { land } from "./land.ts";
 import { buildContextPack } from "./context.ts";
+import { RESOURCES, readResource } from "./resources.ts";
+import { PROMPTS, buildPrompt } from "./prompts.ts";
+import { RepoWatcher, watchIntervalMs } from "./watch.ts";
 
 /** The hub's governance refs (`head:<view>`, policy, …). Empty when unreachable — a head
  *  comparison is informational, so a dead hub degrades the answer instead of failing it. */
@@ -215,6 +218,55 @@ export const TOOLS: ToolDef[] = [
       },
     },
     handler: async (_repo, i) => buildGuide(TOOLS, typeof i.topic === "string" ? i.topic : undefined),
+  },
+  {
+    // ── M4 governance/review subset (docs/18 §4.4) ──
+    name: "avcs.governance.status",
+    description: "Read-only review state for a view: protection rules, head, your role, and the effective approvals.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        view: { type: "string", description: "default 'main'" },
+        as: { type: "string", description: "actor id whose role to report" },
+        checkpointOid: { type: "string", description: "report approvals for this checkpoint instead of the head" },
+      },
+    },
+    handler: async (repo, i) => {
+      const view = (i.view as string) ?? "main";
+      const [protection, head] = await Promise.all([repo.getProtection(view), repo.protectedHead(view)]);
+      const me = (i.as as string) ?? (await repo.localActorId());
+      const target = (i.checkpointOid as string) ?? head;
+      return {
+        view,
+        protection,
+        head,
+        myRole: me ? await repo.roleOf(me) : null,
+        approvals: target ? await repo.approvalsFor(target) : [],
+      };
+    },
+  },
+  {
+    name: "avcs.approval.record",
+    description: "Record a reviewer verdict on a checkpoint, signed with the reviewer's local key. Requires role >= reviewer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        checkpointOid: { type: "string" },
+        verdict: { type: "string", enum: ["approve", "request_changes"] },
+        by: { type: "string", description: "reviewer actor id" },
+        reason: { type: "string" },
+      },
+      required: ["checkpointOid", "by"],
+    },
+    // No human elicitation gate here, unlike decision.record: an approval is already gated
+    // downstream by role and signature, so a reviewer bot holding a key is the intended user.
+    handler: async (repo, i) =>
+      repo.approve(
+        String(i.checkpointOid),
+        String(i.by),
+        (i.verdict as "approve" | "request_changes") ?? "approve",
+        typeof i.reason === "string" ? { reason: i.reason } : {},
+      ),
   },
   {
     // ── M3 ContextPack (docs/18 §M3) ──
@@ -932,7 +984,12 @@ export async function startMcpServer(): Promise<void> {
   }
 
   const bootVersion = readPackageVersion();
-  const server = new sdk.Server({ name: "avcs", version: bootVersion ?? "0.0.0" }, { capabilities: { tools: {} } });
+  // Phase 16 M4: resources are advertised as subscribable so a client can be TOLD the head
+  // moved instead of polling for it; prompts carry their facts pre-inlined.
+  const server = new sdk.Server(
+    { name: "avcs", version: bootVersion ?? "0.0.0" },
+    { capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} } },
+  );
 
   server.setRequestHandler(typesMod.ListToolsRequestSchema, async () => ({
     tools: TOOLS.map((t) => ({
@@ -1002,11 +1059,59 @@ export async function startMcpServer(): Promise<void> {
       },
     };
     try {
-      return await runTool(tool, repo, argsIn, ctx);
+      const out = await runTool(tool, repo, argsIn, ctx);
+      // Phase 16 M4.3: what this client authored on IS the hot set worth interrupting it
+      // for. A stdio server is one process per client, so this scope is exactly right.
+      if (!out.isError && tool.name === "avcs.operation.propose" && typeof argsIn.path === "string") {
+        watchers.get(await resolveRepoDir(callCwd, clientRoots))?.trackKeys([`file:${argsIn.path}`]);
+      }
+      return out;
     } finally {
       inFlight--;
     }
   });
+
+  // ── M4.1/4.2: resources (subscribable) and prompts ──
+  server.setRequestHandler(typesMod.ListResourcesRequestSchema, async () => ({ resources: RESOURCES }));
+  server.setRequestHandler(typesMod.ReadResourceRequestSchema, async (req: { params: { uri: string } }) => {
+    const repo = await openRepo(undefined);
+    return { contents: [{ uri: req.params.uri, mimeType: "application/json", text: await readResource(repo, req.params.uri, TOOLS) }] };
+  });
+  server.setRequestHandler(typesMod.ListPromptsRequestSchema, async () => ({ prompts: PROMPTS }));
+  server.setRequestHandler(typesMod.GetPromptRequestSchema, async (req: { params: { name: string; arguments?: Record<string, unknown> } }) => {
+    const repo = await openRepo(undefined);
+    const text = await buildPrompt(repo, req.params.name, req.params.arguments ?? {}, TOOLS);
+    return { messages: [{ role: "user", content: { type: "text", text } }] };
+  });
+
+  // ── M4.3: local watcher → notifications ──
+  // Polling is the correctness path (fs.watch drops events per-platform, and a missed head
+  // advance is the failure this prevents). Set AVCS_MCP_WATCH_MS=0 to disable.
+  const watchers = new Map<string, RepoWatcher>();
+  const watchMs = watchIntervalMs();
+  if (watchMs > 0) {
+    const tick = setInterval(() => {
+      void (async () => {
+        for (const [dir, repo] of repos) {
+          let w = watchers.get(dir);
+          if (!w) {
+            w = new RepoWatcher(repo);
+            watchers.set(dir, w);
+          }
+          for (const ev of await w.poll()) {
+            // Subscribed clients get the resource-updated signal; everyone else still sees
+            // the event as a log message, so a client without subscriptions is not blind.
+            const uri = ev.type === "head-advanced" ? `avcs://view/${ev.view}/head`
+              : ev.type === "conflict-opened" ? `avcs://view/main/conflicts`
+              : null;
+            if (uri) server.notification({ method: "notifications/resources/updated", params: { uri } }).catch(() => {});
+            server.notification({ method: "notifications/message", params: { level: "info", logger: "avcs", data: ev } }).catch(() => {});
+          }
+        }
+      })();
+    }, watchMs);
+    tick.unref?.();
+  }
 
   // Reload-on-update: a long-lived stdio server holds the code it was spawned with, so
   // an `npm i -g @izagood/avcs@latest` (or any update) does not reach a running process.
