@@ -174,7 +174,21 @@
 
 ---
 
-## M5 — 프로필 + 문서
+## M5 — 프로필 + 문서 ✅ *(구현 완료)*
+
+> **구현 결과 — 설계의 핵심 주장이 실측으로 확인됐다.**
+>
+> | | 도구 | description 단어 |
+> |---|---|---|
+> | Phase 16 이전 | 27 | 873 |
+> | full (기본) | 36 | 620 |
+> | **core** | **13** | **230** |
+>
+> 도구를 9종 **늘렸는데도** full이 시작점보다 29% 가볍고, core는 74% 가볍다. M1의 25단어 상한 + 교육 내용의 `avcs.guide` 이관이 프로필 없이도 이미 절감을 만들었고, 프로필이 그 위에 얹혔다.
+>
+> **최종 도구 수는 설계 추정(31–33)보다 많은 36이다.** Phase 14·15가 설계 이후에 착지하며 `integration.submit`/`status`·`contention.check` 3종을 먼저 넣었고, M2가 `sync.pull`/`push`를 별도 도구로 유지했기 때문이다. core 프로필이 있으므로 이 숫자가 에이전트 비용으로 직결되지는 않는다.
+>
+> **프로필은 메뉴를 줄일 뿐 능력을 없애지 않는다** — 광고 목록만 필터되고, 이름을 아는 클라이언트는 여전히 모든 도구를 호출할 수 있다. 알 수 없는 프로필 이름은 **전체로 degrade**한다(오타가 능력이 아니라 토큰만 쓰게). 테스트가 정본 루프 전체가 core 안에 들어감을 못박아, "작다"가 "일을 끝낼 수 없다"를 뜻하지 않게 한다.
 
 - 최종 도구 수 ≈ 31–33. **기본 광고는 전체**(호환). `avcs mcp --profile core` / `AVCS_MCP_PROFILE=core`가 핵심 13개만 광고:
   `guide, intent.read, intent.list, session.start, context.build, lease.request, operation.propose, evidence.attach, validate.run, repair.context, view.materialize, conflict.list, sync.land` (+ 범용 cwd/verbose).

@@ -116,6 +116,44 @@ const verboseSchema = {
   description: "Pretty-print the response for human reading. Default false (compact, fewer tokens).",
 };
 
+/**
+ * The `core` profile (Phase 16 M5, docs/18 §M5): the tools the canonical loop actually
+ * uses. A tool schema is a toll every agent pays every session, and 36 tools is mostly
+ * noise for an agent doing the standard loop.
+ *
+ * What is deliberately ABSENT: checkpoint.create, sync.push and integration.submit, because
+ * `sync.land` performs all three internally. Advertising them in the small profile would
+ * re-teach the checkpoint dance M2 exists to remove. A test asserts the whole canonical
+ * loop fits inside this list, so "small" can never mean "cannot finish the work".
+ */
+export const CORE_PROFILE: string[] = [
+  "avcs.guide",
+  "avcs.intent.read",
+  "avcs.intent.list",
+  "avcs.session.start",
+  "avcs.context.build",
+  "avcs.lease.request",
+  "avcs.operation.propose",
+  "avcs.evidence.attach",
+  "avcs.validate.run",
+  "avcs.repair.context",
+  "avcs.view.materialize",
+  "avcs.conflict.list",
+  "avcs.sync.land",
+];
+
+/**
+ * Tools to advertise for a profile name. The DEFAULT is everything — a profile is opt-in,
+ * because silently hiding tools from an existing client would break it. An unrecognized
+ * name degrades to the full set rather than to an empty one: a typo should cost tokens,
+ * not capability.
+ */
+export function toolsForProfile(profile: string | undefined): ToolDef[] {
+  if (profile !== "core") return TOOLS;
+  const core = new Set(CORE_PROFILE);
+  return TOOLS.filter((t) => core.has(t.name));
+}
+
 /** The schema advertised to clients: the tool's own inputs plus the universal `cwd` and
  *  `verbose`. Returns a fresh object — the ToolDef's own schema is never mutated. */
 export function advertisedSchema(t: ToolDef): Record<string, unknown> {
@@ -965,7 +1003,10 @@ export const TOOLS: ToolDef[] = [
  * `@modelcontextprotocol/sdk` lazily so importing this module (e.g. from tests, to
  * exercise the tool handlers) — and the rest of the CLI — never depends on the SDK.
  */
-export async function startMcpServer(): Promise<void> {
+export async function startMcpServer(opts: { profile?: string } = {}): Promise<void> {
+  // `core` trims the advertised menu to the canonical loop (docs/18 §M5). CLI flag wins
+  // over the env var so a single client can opt in without changing the whole environment.
+  const profile = opts.profile ?? process.env.AVCS_MCP_PROFILE;
   let sdk: typeof import("@modelcontextprotocol/sdk/server/index.js");
   let stdio: typeof import("@modelcontextprotocol/sdk/server/stdio.js");
   let typesMod: typeof import("@modelcontextprotocol/sdk/types.js");
@@ -991,8 +1032,11 @@ export async function startMcpServer(): Promise<void> {
     { capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} } },
   );
 
+  // M5: the advertised SET is profile-controlled, but every registered tool stays callable —
+  // a profile trims the menu, it does not remove capability from a client that knows the name.
+  const advertised = toolsForProfile(profile);
   server.setRequestHandler(typesMod.ListToolsRequestSchema, async () => ({
-    tools: TOOLS.map((t) => ({
+    tools: advertised.map((t) => ({
       name: t.name,
       description: t.description,
       // Advertise the universal optional `cwd` and `verbose` so both are discoverable.
@@ -1140,7 +1184,7 @@ export async function startMcpServer(): Promise<void> {
     ? `repo ${ENV_REPO} (pinned via AVCS_REPO)`
     : "repo per call (cwd arg → client roots → server cwd)";
   console.error(
-    `[avcs-mcp] serving ${target} over stdio (${TOOLS.length} tools)` +
+    `[avcs-mcp] serving ${target} over stdio (${advertised.length}/${TOOLS.length} tools${profile === "core" ? ", profile=core" : ""})` +
       (bootVersion ? `, avcs v${bootVersion}` : ""),
   );
 }
@@ -1148,7 +1192,8 @@ export async function startMcpServer(): Promise<void> {
 // Only start the stdio server when run as the entry point — importing this module
 // (e.g. from tests, or the CLI dispatching `avcs mcp`) must not boot the server.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  startMcpServer().catch((e) => {
+  const profileArg = process.argv.indexOf("--profile");
+  startMcpServer({ profile: profileArg >= 0 ? process.argv[profileArg + 1] : undefined }).catch((e) => {
     console.error(e);
     process.exit(1);
   });

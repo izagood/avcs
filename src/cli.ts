@@ -877,7 +877,8 @@ async function main(): Promise<void> {
         break;
       }
       const { startMcpServer } = await import("./mcp/server.ts");
-      await startMcpServer();
+      // `--profile core` advertises only the canonical loop's 13 tools (docs/18 §M5).
+      await startMcpServer({ profile: flag("--profile") });
       break;
     }
     case "help":
@@ -920,7 +921,7 @@ async function main(): Promise<void> {
           "  checkpoint <view> [-m msg]  freeze a verified state\n" +
           "  release [view] [-m msg]     cut a verified release + SBOM\n" +
           "  show <oid>                  dump an object\n" +
-          "  mcp                         run the agent-facing MCP server over stdio (primary interface)\n" +
+          "  mcp [--profile core]        run the agent-facing MCP server over stdio (primary interface)\n" +
           "  mcp install [-s scope] [--repo d]  register avcs with the Claude Code CLI (`claude mcp add`)\n" +
           "  version | --version | -v    print the avcs version\n" +
           "  help | --help | -h          show this help\n",
