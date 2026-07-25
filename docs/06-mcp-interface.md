@@ -2,11 +2,36 @@
 
 AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전트는 git status/diff/commit을 이해할 필요 없이, MCP tool과 skill로 사용법을 즉시 주입받는다. 구현: [`src/mcp/server.ts`](../src/mcp/server.ts).
 
-> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. AVCS는 이를 전부 활용하도록 설계됐다 — 현재 `tools` 26종 구현. `resources`(ContextPack)·`prompts`(skill 템플릿)·알림은 **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**에 설계됨(구현 전).
+> MCP는 AI 앱이 외부 데이터·도구·워크플로우에 연결되는 표준이다. 서버는 `resources`(읽기 맥락)·`prompts`(작업 템플릿)·`tools`(행위)를 제공한다. **Phase 16(M1–M5)에서 셋 다 구현 완료** — tools 36종 + 구독 가능한 resources 4종 + prompts 4종 + 변경 알림. 설계 근거는 **[18 — MCP 일급 커넥션](18-mcp-first-class.md)**.
 
-## Tool 표면 (현재: 26종)
+## 정본 루프
 
-모든 도구는 공통 선택 인자 `cwd`(대상 저장소 힌트, 아래 repo discovery)를 받는다.
+에이전트가 도는 표준 경로다. `avcs.guide`가 이 루프를 기계가독 형태로 돌려주며, **도구 색인과 에러맵은 live 테이블에서 생성**되므로 서버와 어긋날 수 없다.
+
+```
+intent.read → context.build → lease.request → operation.propose
+  → validate.run / evidence.attach → view.materialize → sync.land
+```
+
+마지막 단계가 핵심이다: `sync.land`가 push·checkpoint·통합을 **내부에서** 수행하므로, 에이전트가 보는 결과는 `landed` 또는 사람이 결정할 충돌 패킷 **둘뿐**이다. "head moved, pull first"는 도달하지 않는다.
+
+## 프로필 — 광고되는 도구 수를 줄인다
+
+도구 스키마는 에이전트가 **매 세션 지불하는 통행료**다. 기본은 전체 광고(호환)이고, `avcs mcp --profile core` 또는 `AVCS_MCP_PROFILE=core`가 정본 루프에 필요한 13종만 광고한다:
+
+`guide · intent.read · intent.list · session.start · context.build · lease.request · operation.propose · evidence.attach · validate.run · repair.context · view.materialize · conflict.list · sync.land`
+
+| 프로필 | 도구 | description 단어 |
+|---|---|---|
+| Phase 16 이전 | 27 | 873 |
+| full (기본) | 36 | 620 |
+| **core** | **13** | **230** |
+
+도구를 9종 **늘렸는데도** full이 시작점보다 가볍다(M1의 25단어 상한 + 교육 내용의 `avcs.guide` 이관). core는 74% 가볍다. `checkpoint.create`·`sync.push`·`integration.submit`이 core에서 빠진 것은 `sync.land`가 셋을 흡수하기 때문이다 — 작은 표면에 남기면 M2가 없앤 checkpoint 춤을 다시 가르치게 된다. **프로필은 메뉴를 줄일 뿐 능력을 없애지 않는다**: 이름을 아는 클라이언트는 여전히 모든 도구를 호출할 수 있다.
+
+## Tool 표면 (현재: 36종)
+
+모든 도구는 공통 선택 인자 `cwd`(대상 저장소 힌트, 아래 repo discovery)와 `verbose`(pretty-print)를 받는다.
 
 **온보딩** *(Phase 16 M1 — [18](18-mcp-first-class.md) §1.3)*
 
