@@ -84,7 +84,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (26 tools); humans use the **CLI**. Since Phase 14 the hub runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the hub re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Next up (designed, not yet implemented): live convergence (long-poll events, sync daemon, contention early-warning) and an MCP-first agent surface (`avcs.sync.land`, ContextPack) — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 247-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (36 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the hub runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the hub re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 360-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -130,6 +130,22 @@ claude mcp add avcs -- avcs mcp
 ```
 
 The MCP SDK ships as an optionalDependency, so a normal install includes it; no extra step needed.
+
+**The loop an agent runs** — five moves, and landing is one call:
+
+```
+avcs.guide                                  # the loop, the rules, error recovery
+avcs.context.build   { intentOid }          # provenance, prior decisions, live risks
+avcs.operation.propose { path, content }    # never write final files directly
+avcs.validate.run + avcs.evidence.attach    # a behaviour change needs passing evidence
+avcs.sync.land       { by }                 # push + checkpoint + integrate → landed | conflict
+```
+
+`sync.land` is the point: a stale head is absorbed for you, so the outcome is either `landed` or a conflict packet for a human — never "pull and redo". Add `--profile core` to advertise only these 13 tools instead of all 36:
+
+```bash
+claude mcp add avcs -- avcs mcp --profile core
+```
 
 To upgrade later, re-run `npm install -g @izagood/avcs@latest`; to remove it, `npm uninstall -g @izagood/avcs` (your repo data is left intact).
 
@@ -224,7 +240,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/release/sbom.ts` | SBOM generation (Phase 6) |
 | `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
-| `src/mcp/server.ts` | Agent-facing MCP interface (26 tools) |
+| `src/mcp/server.ts` | Agent-facing MCP interface (36 tools) |
 | `src/cli.ts` | Human-facing inspection/release CLI |
 | `src/demo.ts` | End-to-end scenario |
 
@@ -248,7 +264,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [15 — Language-neutral core](docs/15-language-neutral-core.md)
 - [16 — Workspace scope](docs/16-workspace-scope.md)
 - [17 — Sync convergence: integration queue & live sync (design)](docs/17-sync-convergence.md)
-- [18 — MCP as the first-class connection (design)](docs/18-mcp-first-class.md)
+- [18 — MCP as the first-class connection](docs/18-mcp-first-class.md)
 
 ## Contributing
 
