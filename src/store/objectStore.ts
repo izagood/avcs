@@ -444,11 +444,32 @@ export class ObjectStore {
   }
 
   // ── refs ────────────────────────────────────────────────────────────────
+  //
+  // A ref name is an opaque string that addresses a FILE. `line:<branch>` derives from a
+  // git branch, and `feature/x` is the convention most teams use, so a name routinely
+  // contains `/`. Joining it straight onto the refs dir puts the write in a directory
+  // nothing created — `git commit` then fails outright (issue #52).
+  //
+  // `mkdir -p` is NOT the fix: listRefs reads a flat directory, so a nested file would be
+  // invisible to it, and listRefs is what feeds hub governance distribution. That trades a
+  // loud failure for a silently missing ref, which is worse. Percent-encoding instead keeps
+  // the name→file mapping total, reversible and flat. `%` is escaped first (and decoded
+  // last) so the encoding stays unambiguous: `a/b` and the literal `a%2Fb` remain distinct.
+  //
+  // Names without these characters encode to themselves, so existing repos need no
+  // migration and keep reading exactly as before.
+  static #encodeRefName(name: string): string {
+    return name.replace(/%/g, "%25").replace(/\//g, "%2F").replace(/\\/g, "%5C");
+  }
+  static #decodeRefName(file: string): string {
+    return file.replace(/%2F/g, "/").replace(/%5C/g, "\\").replace(/%25/g, "%");
+  }
+
   async setRef(name: string, oid: string): Promise<void> {
-    await this.#writeAtomic(join(this.root, "refs", name), oid);
+    await this.#writeAtomic(join(this.root, "refs", ObjectStore.#encodeRefName(name)), oid);
   }
   async getRef(name: string): Promise<string | null> {
-    const p = join(this.root, "refs", name);
+    const p = join(this.root, "refs", ObjectStore.#encodeRefName(name));
     if (!existsSync(p)) return null;
     return (await readFile(p, "utf8")).trim();
   }
@@ -457,8 +478,14 @@ export class ObjectStore {
     const dir = join(this.root, "refs");
     if (!existsSync(dir)) return new Map();
     const out = new Map<string, string>();
-    for (const name of await readdir(dir)) {
-      out.set(name, (await readFile(join(dir, name), "utf8")).trim());
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      // Skip anything that is not a plain file: a directory here can only be debris from
+      // a repo written before encoding existed, and reading it throws EISDIR.
+      if (!entry.isFile()) continue;
+      out.set(
+        ObjectStore.#decodeRefName(entry.name),
+        (await readFile(join(dir, entry.name), "utf8")).trim(),
+      );
     }
     return out;
   }
