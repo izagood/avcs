@@ -215,7 +215,7 @@ function renderSpan(baseLines: string[], start: number, end: number, members: Hu
  * Line-level diff (LCS) → maximal changed segments. Each Hunk replaces base[start:end)
  * with `lines`. Unchanged lines produce no hunk. Deterministic.
  */
-function diffHunks(a: string[], b: string[]): Omit<Hunk, "side">[] {
+export function diffHunks(a: string[], b: string[]): Omit<Hunk, "side">[] {
   const n = a.length;
   const m = b.length;
   // LCS DP table (lengths). O(n*m) — fine for source files.
