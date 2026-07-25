@@ -29,8 +29,10 @@ import type {
  *  Authorization header (read endpoints stay public). v3 (additive) adds the integration
  *  queue: POST /integrate + GET /integrations/:ticketId; `GET /version` advertises
  *  `integrate: true` so a client can capability-detect before falling back to legacy
- *  POST /finalize (which is unchanged). */
-export const HUB_PROTOCOL_VERSION = 3;
+ *  POST /finalize (which is unchanged). v4 (additive) adds live convergence (Phase 15):
+ *  GET /events long-poll sharing the objlog cursor with /sync; `GET /version` advertises
+ *  `events: true` — a client without it falls back to periodic polling. */
+export const HUB_PROTOCOL_VERSION = 4;
 
 export interface HubHandle {
   url: string;
@@ -121,6 +123,82 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+// ── GET /events long-poll (Phase 15.1, docs/17 §15.1) ─────────────────────────
+// Long-poll, not SSE, deliberately: zero-dep, proxy-friendly, the same fetch-loop
+// shape hubClient already uses, and ONE cursor meaning — the objlog index shared
+// with GET /sync?since=N. A parked waiter is woken by every successful mutation.
+
+/** The state a waiter is answered with: new-since-cursor oids plus the FULL governance
+ *  ref map. Refs ride every response because a finalize can move `head:<view>` without
+ *  appending any object (the checkpoint was pushed earlier) — with oids alone a parked
+ *  client would never see the head advance. Clients diff refs against their last copy. */
+async function eventsSnapshot(store: ObjectStore, since: number): Promise<{ cursor: number; oids: string[]; refs: Record<string, string> }> {
+  const all = await store.readObjLog();
+  // Same cursor semantics as /sync: 0 / out-of-range ⇒ the full set (first poll or a
+  // stale cursor); otherwise only what was appended after `since`.
+  const oids = since > 0 && since <= all.length ? all.slice(since) : all;
+  return { cursor: all.length, oids, refs: Object.fromEntries(await store.listRefs()) };
+}
+
+interface EventWaiter {
+  fire(): void;
+  cancel(): void;
+}
+
+/** Parked /events responses + the wake fan-out. Bounded (default 256 waiters, beyond
+ *  which new polls get an immediate 503) so parked sockets can't exhaust the process. */
+class EventHub {
+  #waiters = new Set<EventWaiter>();
+  readonly #store: ObjectStore;
+  readonly #metrics: Metrics;
+  readonly maxWaiters: number;
+
+  constructor(store: ObjectStore, metrics: Metrics, maxWaiters = 256) {
+    this.#store = store;
+    this.#metrics = metrics;
+    this.maxWaiters = maxWaiters;
+  }
+
+  get waiterCount(): number {
+    return this.#waiters.size;
+  }
+
+  /** Park a caught-up poller until a mutation wakes it or `timeoutMs` elapses (then a
+   *  heartbeat `{ cursor, oids: [] }` + refs). Sends 503 when the waiter cap is hit. */
+  park(res: ServerResponse, since: number, timeoutMs: number): void {
+    if (this.#waiters.size >= this.maxWaiters) {
+      this.#metrics.inc("hub.events.rejected");
+      sendJson(res, 503, { error: `too many event waiters (max ${this.maxWaiters}) — retry with backoff` });
+      return;
+    }
+    let done = false;
+    const finish = (respond: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      this.#waiters.delete(waiter);
+      if (!respond || res.writableEnded || res.destroyed) return;
+      eventsSnapshot(this.#store, since)
+        .then((snap) => { if (!res.writableEnded && !res.destroyed) sendJson(res, 200, snap); })
+        .catch(() => { if (!res.writableEnded) res.destroy(); });
+    };
+    const timer = setTimeout(() => { this.#metrics.inc("hub.events.timeout"); finish(true); }, timeoutMs);
+    const waiter: EventWaiter = { fire: () => finish(true), cancel: () => finish(false) };
+    this.#waiters.add(waiter);
+    this.#metrics.inc("hub.events.parked");
+    // The client went away — free the slot without writing to a dead socket.
+    res.on("close", () => waiter.cancel());
+  }
+
+  /** Called after every successful mutation (object put / finalize / integrate): flush
+   *  every parked waiter with a fresh snapshot. Waking on ref-only moves is the point. */
+  wake(): void {
+    if (!this.#waiters.size) return;
+    this.#metrics.inc("hub.events.woken");
+    for (const w of [...this.#waiters]) w.fire();
+  }
+}
+
 /**
  * Start an HTTP hub backed by `new ObjectStore(opts.repoDir)`. The store is init()'d
  * so an empty repo dir works. Pass `port: 0` (or omit) to get an OS-assigned port,
@@ -136,6 +214,9 @@ export async function startHub(opts: {
    *  pluggable hook (D3): an embedder injects its own keyId→publicKey lookup; when omitted
    *  the hub resolves against its own `member:<keyId>` registry. */
   auth?: { required?: boolean; resolvePublicKey?: PublicKeyResolver; windowMs?: number };
+  /** Live-convergence long-poll tuning (Phase 15.1). `maxWaiters` bounds concurrently
+   *  parked GET /events responses (default 256; beyond it new polls get a 503). */
+  events?: { maxWaiters?: number };
 }): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
@@ -175,7 +256,8 @@ export async function startHub(opts: {
     try { await store.appendAux("hub-audit.log", `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`); }
     catch (e) { logger.warn("hub.audit.fail", { error: String((e as Error).message) }); }
   };
-  const ctx: HubOps = { audit, allow };
+  const events = new EventHub(store, metrics, opts.events?.maxWaiters ?? 256);
+  const ctx: HubOps = { audit, allow, events };
 
   const server: Server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
@@ -246,6 +328,8 @@ async function verifyIntegrateSig(store: ObjectStore, by: string, view: string, 
 interface HubOps {
   audit(rec: Record<string, unknown>): Promise<void>;
   allow(key: string): boolean;
+  /** Parked GET /events waiters (Phase 15.1) — woken after every successful mutation. */
+  events: EventHub;
 }
 
 /** Transport-auth context threaded into the request handler (SSH-style write-auth). */
@@ -307,7 +391,29 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // one up front (and an old client gets a clear 401 instead of a silent rejection).
     // `integrate` advertises the Phase 14 integration queue (capability detection: a
     // client without it falls back to legacy POST /finalize).
-    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true });
+    // `events` advertises the Phase 15 live-convergence long-poll (a client without it
+    // falls back to periodic polling).
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true, events: true });
+    return;
+  }
+
+  // GET /events?since=N&timeoutMs=M → live-convergence long-poll (Phase 15.1, docs/17
+  // §15.1). `since` is the SAME objlog cursor /sync uses (one cursor meaning). New oids
+  // since the cursor ⇒ answer immediately; caught up ⇒ park until a mutation wakes us or
+  // the timeout fires a `{ cursor, oids: [] }` heartbeat. Every response carries the full
+  // governance ref map so a head advance is visible even when no object was appended.
+  if (method === "GET" && path === "/events") {
+    const sinceRaw = Number(url.searchParams.get("since") ?? "0");
+    const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+    const toRaw = Number(url.searchParams.get("timeoutMs") ?? "30000");
+    const timeoutMs = Math.min(Math.max(Number.isFinite(toRaw) ? Math.floor(toRaw) : 30_000, 10), 120_000);
+    const snap = await eventsSnapshot(store, since);
+    if (snap.oids.length > 0) {
+      metrics.inc("hub.events.immediate");
+      sendJson(res, 200, snap);
+      return;
+    }
+    ops.events.park(res, since, timeoutMs);
     return;
   }
 
@@ -429,6 +535,7 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       });
     }
     await ops.audit({ action: "put", type: (obj as AnyObject).type, oid, actor }); // E7 provenance
+    ops.events.wake(); // Phase 15.1: a new object (or re-put) is exactly what waiters wait for
     sendJson(res, 200, { oid });
     return;
   }
@@ -459,7 +566,9 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     const repo = await Repo.open(repoDir);
     const result = await repo.finalize({ view, newCheckpoint, parentHead, by });
     await ops.audit({ action: "finalize", view, newCheckpoint, by, finalized: result.finalized, reason: result.finalized ? undefined : result.reason }); // E7
-    if (result.finalized) { sendJson(res, 200, result); return; }
+    // Phase 15.1: a successful finalize moves head:<view> WITHOUT appending an object —
+    // the ref-only mutation the events refs-in-every-response design exists for.
+    if (result.finalized) { ops.events.wake(); sendJson(res, 200, result); return; }
     // A stale parentHead (lost the CAS race) is a 409 conflict; everything else (role,
     // checks, approvals, incomplete history) is a 422 unprocessable.
     sendJson(res, /head moved/.test(result.reason) ? 409 : 422, result);
@@ -500,6 +609,10 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       : result.verdict === "needs_evidence" ? 428
       : result.verdict === "queued" ? 202
       : 422;
+    // Phase 15.1: every judged verdict appended an Integration audit object (and
+    // `advanced` moved the head) — wake waiters on all of them; `queued` wrote nothing
+    // but a spurious wake is harmless (waiters just re-snapshot).
+    ops.events.wake();
     sendJson(res, status, result);
     return;
   }

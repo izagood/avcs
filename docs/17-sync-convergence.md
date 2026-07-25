@@ -161,7 +161,9 @@ head가 움직인 뒤 integrated treeHash ≠ 제출 treeHash라면, 옛 evidenc
 ### 15.2 sync 데몬 + freshness 창 (M)
 
 - `avcs sync --watch [remote]`: 루프 = 롱폴 → 커서 incremental pull → redaction 적용 → 거버넌스 refs 채택 → contention 검사(15.3) → 구조화 로그. 에러 시 backoff. `withLock("syncd")`로 repo당 단일 인스턴스.
+- **락 heartbeat**(`LockOptions.heartbeatMs`): 데몬처럼 오래 잡는 홀더는 대기자의 `staleMs`를 넘겨 **살아있는 락이 회수**되므로, 보유 중 owner 스탬프를 주기적으로 갱신한다. 크래시하면 갱신이 멎으니 기존 stale-reclaim은 그대로 동작. 갱신 쓰기는 **체인으로 직렬화하고 release가 await 한다** — `clearInterval`은 이미 떠 있는 tick을 막지 못해, 그 `rename`이 제거 중인 락 디렉터리에 `owner`를 되살리면 `rmdir`이 `ENOTEMPTY`로 실패하고(=`finally`에서 던져져 **성공한 임계 구역의 반환값을 대체**), 신선한 스탬프를 안은 락이 남아 대기자를 `staleMs` 동안 막는다.
 - **freshness on materialize**: `autoSync: true`인 remote가 있으면 materialize가 `lastSyncAt`(aux 타임스탬프)을 확인, `freshnessMs` 초과 시 **백그라운드** sync 발화 — stale-while-revalidate. **읽기 경로는 절대 차단하지 않는다**(materialize는 처리량 임계 경로). blocking이 필요한 호출자(제출 직전 등)는 `repo.syncIfStale()`.
+- **quiesce 규약**: 백그라운드 revalidate는 fire-and-forget이되 **핸들 없이 던지지 않는다** — `repo.settleBackgroundSync()`가 in-flight 실행을 await한다(유휴면 즉시 resolve, 절대 reject 안 함). 필요한 이유: revalidate는 호출자가 자연스럽게 기다릴 만한 **관측 효과보다 오래 산다**(pull이 객체를 안착시킨 뒤에도 push와 `last-sync.json` 스탬프 쓰기가 남는다). 그래서 repo 디렉터리를 정리하는 쪽(데몬 종료, 테스트 teardown)은 반드시 settle 후에 지운다 — 아니면 `rmdir`이 in-flight `.avcs` 쓰기와 경합해 `ENOTEMPTY`가 난다. 데몬의 `runSyncWatch`가 반환 프로미스로 같은 역할을 하는 것과 대칭.
 
 ### 15.3 충돌 조기 경보 (M)
 
@@ -171,7 +173,7 @@ head가 움직인 뒤 integrated treeHash ≠ 제출 treeHash라면, 옛 evidenc
 
 ### Phase 15 계약 테스트
 
-`test/hub-events.test.ts`(append 시 wake / 타임아웃 하트비트 / head 전진이 refs에 보임 / waiter 상한), `test/sync-watch.test.ts`(단일 인스턴스 락, stale-while-revalidate 비차단), `test/contention-warning.test.ts`(타 actor 동시 op 경보, lease holder 경보, 자기 op 무경보).
+`test/hub-events.test.ts`(append 시 wake / 타임아웃 하트비트 / head 전진이 refs에 보임 / waiter 상한), `test/sync-watch.test.ts`(단일 인스턴스 락, stale-while-revalidate 비차단, **settle이 스탬프 쓰기까지 끝난 뒤에만 resolve**, 유휴 settle은 no-op), `test/contention-warning.test.ts`(타 actor 동시 op 경보, lease holder 경보, 자기 op 무경보).
 
 ---
 

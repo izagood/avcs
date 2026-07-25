@@ -7,7 +7,7 @@
 
 // Repository / materialization
 export { Repo } from "./api/repo.ts";
-export type { GitMode, RemoteConfig } from "./api/repo.ts";
+export type { GitMode, RemoteConfig, ContentionWarning } from "./api/repo.ts";
 
 // Content-addressing — the sacrosanct interop invariant. A consumer (e.g. avcshub)
 // that stores objects MUST address them with THESE functions, not a re-implementation:
@@ -34,6 +34,9 @@ export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
 export type { HubHandle } from "./hub/hubServer.ts";
 export { pushToHub, pullFromHub, finalizeOnHub } from "./hub/hubClient.ts";
 export type { HubSigner } from "./hub/hubClient.ts";
+// Live convergence (Phase 15): the sync-watch daemon behind `avcs sync --watch`.
+export { runSyncWatch } from "./hub/syncWatch.ts";
+export type { SyncWatchEvent, SyncWatchOpts } from "./hub/syncWatch.ts";
 // SSH-style transport auth: embedders (e.g. a hosted hub) inject `resolvePublicKey` into
 // startHub({ auth }); these helpers also let a client build/verify the credential directly.
 export { buildAuthHeader, parseAuthHeader, verifyAuth, canonicalRequest, NonceCache, AUTH_SCHEME, DEFAULT_AUTH_WINDOW_MS } from "./hub/transportAuth.ts";

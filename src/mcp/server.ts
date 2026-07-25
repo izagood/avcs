@@ -201,6 +201,7 @@ export const TOOLS: ToolDef[] = [
         workspace: { type: "string", description: "isolate this op to a build/verify workspace (docs/16); a base view excludes it until the workspace is landed via avcs.workspace.land" },
         baseText: { type: "string", description: "the base content this edit was derived from; its presence routes to a 3-way-mergeable edit_file" },
         baseBlobOid: { type: "string", description: "oid of the base blob (alternative to baseText); fetch it via avcs.object.show" },
+        warnContention: { type: "boolean", description: "also run an early conflict check on the op's keys (Phase 15.3): response becomes { oid, contentionWarnings } listing other actors' live concurrent ops + overlapping lease holders. Omit for the plain oid response." },
         effects: {
           type: "object",
           properties: {
@@ -212,7 +213,7 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["sessionOid", "intentOid", "actor", "path", "content", "declaredPurpose"],
     },
-    handler: (repo, i) => {
+    handler: async (repo, i) => {
       const common = {
         sessionOid: String(i.sessionOid),
         intentOid: String(i.intentOid),
@@ -226,16 +227,42 @@ export const TOOLS: ToolDef[] = [
       };
       // A declared base (baseText or baseBlobOid) authors a base-relative edit_file, which
       // 3-way line-merges with concurrent edits; otherwise a whole-file put_file (issue #20).
-      if (i.baseText !== undefined || i.baseBlobOid !== undefined) {
-        return repo.proposeEdit({
-          ...common,
-          newText: String(i.content),
-          baseText: i.baseText as string | undefined,
-          baseBlobOid: i.baseBlobOid as string | undefined,
-        });
+      const oid = i.baseText !== undefined || i.baseBlobOid !== undefined
+        ? await repo.proposeEdit({
+            ...common,
+            newText: String(i.content),
+            baseText: i.baseText as string | undefined,
+            baseBlobOid: i.baseBlobOid as string | undefined,
+          })
+        : await repo.proposeFileWrite({ ...common, content: String(i.content) });
+      // Phase 15.3 (additive, opt-in): the response shape stays a plain oid unless the
+      // caller asked for the early-warning check.
+      if (i.warnContention === true) {
+        const contentionWarnings = await repo.contention({ keys: [`file:${String(i.path)}`], actorId: common.actor.id, line: common.line });
+        return { oid, contentionWarnings };
       }
-      return repo.proposeFileWrite({ ...common, content: String(i.content) });
+      return oid;
     },
+  },
+  {
+    name: "avcs.contention.check",
+    description: "Early conflict warning (Phase 15.3): for each entity key, other actors' LIVE concurrent operations (outside your causal closure, not rejected, not superseded) and active lease holders whose scope overlaps. Check BEFORE/WHILE editing so overlap is discovered at authoring time, not at finalize. Perspective: pass sessionOid (its actor + ops), or actor (all their keys), or explicit keys.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        keys: { type: "array", items: { type: "string" }, description: "entity keys to check, e.g. [\"file:src/a.ts\"]" },
+        sessionOid: { type: "string", description: "use this session's actor + authored keys as the perspective" },
+        actor: { type: "string", description: "actor id for the perspective (with no keys: every key they authored on)" },
+        line: { type: "string", description: "lineage to check on; default 'main'" },
+      },
+    },
+    handler: (repo, i) =>
+      repo.contention({
+        keys: i.keys as string[] | undefined,
+        sessionOid: i.sessionOid as string | undefined,
+        actorId: i.actor as string | undefined,
+        line: i.line as string | undefined,
+      }),
   },
   {
     name: "avcs.workspace.land",
