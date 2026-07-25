@@ -19,12 +19,11 @@ export type GuideTopic = "workflow" | "tools" | "sync" | "rules" | "errors";
  * tool that does not exist teaches the agent to fail, and unlike prose an agent would skim,
  * a step it is told to run fails for certain. A test pins this against the live table.
  *
- * Phase 16 M3 inserts `avcs.context.build` after intent.read.
  */
 const LOOP: { step: number; tool: string; why: string }[] = [
   { step: 1, tool: "avcs.intent.read", why: "learn the declared goal and the scopes you may touch" },
   { step: 2, tool: "avcs.session.start", why: "bind your work to that intent under your actor identity" },
-  { step: 3, tool: "avcs.contention.check", why: "see other actors' live work on your keys before you edit, not at finalize" },
+  { step: 3, tool: "avcs.context.build", why: "get provenance, prior decisions and live risks for your scope in one bounded call" },
   { step: 4, tool: "avcs.lease.request", why: "claim the scopes you are about to write" },
   { step: 5, tool: "avcs.operation.propose", why: "submit the change as an operation; never write final files yourself" },
   { step: 6, tool: "avcs.validate.run", why: "produce evidence; a behaviour change is not acceptable without it" },

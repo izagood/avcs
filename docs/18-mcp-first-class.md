@@ -95,7 +95,13 @@
 
 ---
 
-## M3 — ContextPack
+## M3 — ContextPack ✅ *(구현 완료)*
+
+> **구현 결과.** `avcs.context.build` + `avcs.decision.recall` 추가(32→34). **결정적 절단**이 계약으로 고정됐다 — 섹션 우선순위(risks > decisions/policies > symbols > evidence > history > suggestedOps), 섹션 내 recency→oid 정렬, 컴팩트 직렬화 바이트 위의 greedy fill. 같은 입력 3회 빌드가 **바이트 동일**함을 테스트가 못박고, 예산에 밀린 섹션은 `budget.truncated`에 기록된다.
+>
+> **스코프 없는 호출은 에러다.** 저장소 전체를 조용히 담는 대신 거부한다 — 무제한 컨텍스트는 이 도구가 없애려는 문제 그 자체다.
+>
+> **정본 루프 완성.** `context.build`가 실재하게 되면서 루프가 설계가 처음부터 그린 모양(`intent.read → context.build → lease → propose → validate/attach → materialize → land`)에 도달했다. 루프 3단계의 `contention.check`는 `context.build`로 대체됐다 — §3.1이 ContextPack의 `risks`에 "겹치는 active lease holder = 작업 시작 시점의 충돌 조기 경보"를 명시하므로 진입점 역할을 흡수한다. `contention.check`는 편집 도중 재확인용으로 도구 목록에 남는다.
 
 ### 3.1 `avcs.context.build` (신규, `src/mcp/context.ts`) — M/L
 

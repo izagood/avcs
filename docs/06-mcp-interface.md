@@ -14,6 +14,15 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 |------|------|
 | `avcs.guide` | 정본 루프·에이전트 규칙·도구 색인·에러 복구. **먼저 호출한다.** 도구 색인과 에러맵은 live 테이블에서 생성되므로 서버와 어긋날 수 없다. `topic`: workflow(기본)·tools·sync·rules·errors |
 
+**컨텍스트 / 결정 메모리** *(Phase 16 M3 — [18](18-mcp-first-class.md) §M3)*
+
+| tool | 역할 |
+|------|------|
+| `avcs.context.build` | 스코프(`intentOid` \| `entityKeys` \| `paths`, **하나는 필수**)의 작업 맥락을 예산 안에 한 번에: provenance·이전 결정·정책·리스크(conflict/quarantine/lease)·최근 history. **파일 내용은 담지 않는다** — `blobOid`만 주고 텍스트는 `object.show`의 lines/maxBytes 슬라이스에 위임 |
+| `avcs.decision.recall` | 키의 이전 인간 결정 + 그로부터 학습된 정책. 재결정 전에 선례를 읽는다 |
+
+> **결정적 절단.** 섹션 우선순위는 고정이다 — `risks` > `decisions`/`policies` > `symbols` > `evidence` > `history` > `suggestedOps`. 섹션 내부는 recency→oid 정렬, 예산은 **컴팩트 직렬화 바이트** 기준 greedy fill. 따라서 **같은 입력은 바이트 동일한 출력**을 내고(reduce에 요구하는 결정론을 컨텍스트에도 적용), 예산에 밀린 섹션은 `budget.truncated`에 기록된다 — 빈약한 저장소와 잘린 팩을 구분하지 못하면 에이전트가 부분 정보로 확신에 찬 결정을 한다. 스코프 없는 호출은 **거부**한다.
+
 **동기화 / 랜딩** *(Phase 16 M2 — [18](18-mcp-first-class.md) §M2)*
 
 | tool | 역할 |

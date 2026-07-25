@@ -24,6 +24,7 @@ import { serializeResult, errorEnvelope, boundedLimit } from "./respond.ts";
 import { unifiedDiff } from "../query/diff.ts";
 import { buildGuide } from "./guide.ts";
 import { land } from "./land.ts";
+import { buildContextPack } from "./context.ts";
 
 /** The hub's governance refs (`head:<view>`, policy, …). Empty when unreachable — a head
  *  comparison is informational, so a dead hub degrades the answer instead of failing it. */
@@ -214,6 +215,41 @@ export const TOOLS: ToolDef[] = [
       },
     },
     handler: async (_repo, i) => buildGuide(TOOLS, typeof i.topic === "string" ? i.topic : undefined),
+  },
+  {
+    // ── M3 ContextPack (docs/18 §M3) ──
+    name: "avcs.context.build",
+    description: "Assemble working context for a scope under a byte budget: provenance, decisions, risks, history. Deterministic truncation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intentOid: { type: "string", description: "scope = the intent's allowed scopes plus what its sessions actually touched" },
+        entityKeys: { type: "array", items: { type: "string" }, description: "explicit keys, e.g. ['file:src/a.ts']" },
+        paths: { type: "array", items: { type: "string" }, description: "file paths, resolved to file: keys" },
+        view: { type: "string", description: "default 'main'" },
+        maxBytes: { type: "number", description: "budget for the compact response; default 8192. Dropped sections are listed in budget.truncated." },
+      },
+    },
+    handler: (repo, i) =>
+      buildContextPack(repo, {
+        intentOid: i.intentOid as string | undefined,
+        entityKeys: i.entityKeys as string[] | undefined,
+        paths: i.paths as string[] | undefined,
+        view: i.view as string | undefined,
+        maxBytes: i.maxBytes as number | undefined,
+      }),
+  },
+  {
+    name: "avcs.decision.recall",
+    description: "Prior human decisions for a conflict key plus the policies they taught. Read precedent before re-deciding.",
+    inputSchema: {
+      type: "object",
+      properties: { conflictKey: { type: "string", description: "entity key, e.g. 'file:src/a.ts'" } },
+    },
+    handler: async (repo, i) => ({
+      decisions: typeof i.conflictKey === "string" ? await repo.recallDecisions(i.conflictKey) : [],
+      policies: await repo.learnedPolicies(),
+    }),
   },
   {
     // ── M2 sync surface (docs/18 §M2): an agent never pulls by hand ──
