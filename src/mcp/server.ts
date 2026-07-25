@@ -20,6 +20,9 @@ import { dirname, join } from "node:path";
 import { Repo } from "../api/repo.ts";
 import { isBinary } from "../core/bytes.ts";
 import { ObjectStore } from "../store/objectStore.ts";
+import { serializeResult, errorEnvelope, boundedLimit } from "./respond.ts";
+import { unifiedDiff } from "../query/diff.ts";
+import { buildGuide } from "./guide.ts";
 import type { Actor, OperationStatus } from "../objects/types.ts";
 
 /**
@@ -88,6 +91,51 @@ const cwdSchema = {
     "server's own cwd. Ignored when the server is pinned via AVCS_REPO.",
 };
 
+/** Universal formatting switch (Phase 16 M1.1). Responses are compact by default because
+ *  indentation is whitespace the agent pays for on every call; this restores pretty-print
+ *  for the times a human is reading. Consumed by the dispatch layer, never by a handler. */
+const verboseSchema = {
+  type: "boolean",
+  description: "Pretty-print the response for human reading. Default false (compact, fewer tokens).",
+};
+
+/** The schema advertised to clients: the tool's own inputs plus the universal `cwd` and
+ *  `verbose`. Returns a fresh object — the ToolDef's own schema is never mutated. */
+export function advertisedSchema(t: ToolDef): Record<string, unknown> {
+  return {
+    ...t.inputSchema,
+    properties: {
+      ...((t.inputSchema.properties as Record<string, unknown>) ?? {}),
+      cwd: cwdSchema,
+      verbose: verboseSchema,
+    },
+  };
+}
+
+/**
+ * Run one tool call and render it for the transport (Phase 16 M1.1, docs/18 §1.1).
+ * Exported so the layer is testable without booting the SDK, the same way the handlers are.
+ *
+ * Success keeps its raw shape — only the serialization changes (§2 principle 1). Failure
+ * becomes `{ error, hint?, nextActions? }` so the agent recovers from a list instead of
+ * parsing prose; it is returned with `isError`, not thrown, because a thrown error reaches
+ * the agent as an opaque transport failure and loses the recovery hints entirely.
+ */
+export async function runTool(
+  tool: ToolDef,
+  repo: Repo,
+  args: Record<string, unknown>,
+  ctx?: ToolCtx,
+): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+  const verbose = args.verbose === true;
+  try {
+    const result = await tool.handler(repo, args, ctx);
+    return { content: [{ type: "text", text: serializeResult(result, { verbose }) }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: serializeResult(errorEnvelope(e), { verbose }) }], isError: true };
+  }
+}
+
 /**
  * Resolve which AVCS repo a tool call targets, returning its `.avcs` root dir.
  *
@@ -139,6 +187,22 @@ export async function resolveRepoDir(
 
 export const TOOLS: ToolDef[] = [
   {
+    // First in the list on purpose: it is the tool that explains the rest.
+    name: "avcs.guide",
+    description: "How to use AVCS: the canonical loop, agent rules, tool index, error recovery. Call this first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: ["workflow", "tools", "sync", "rules", "errors"],
+          description: "omit for the canonical loop",
+        },
+      },
+    },
+    handler: async (_repo, i) => buildGuide(TOOLS, typeof i.topic === "string" ? i.topic : undefined),
+  },
+  {
     name: "avcs.intent.create",
     description: "Open an intent: the goal + constraints + allowed scopes for a unit of work. Agents must work within an intent.",
     inputSchema: {
@@ -164,9 +228,12 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.intent.list",
-    description: "List all intents in the repo.",
-    inputSchema: { type: "object", properties: {} },
-    handler: (repo) => repo.listIntents(),
+    description: "List intents in the repo. Bounded: limit (default 50).",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number", description: "max intents to return; default 50" } },
+    },
+    handler: async (repo, i) => (await repo.listIntents()).slice(0, boundedLimit(i.limit, 50)),
   },
   {
     name: "avcs.session.start",
@@ -186,7 +253,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.operation.propose",
-    description: "Propose a semantic change. MVP supports file writes. DECLARE EFFECTS honestly (changesBehavior, breaksPublicApi) — policy gates on them. Pass baseText or baseBlobOid to author a base-relative edit_file (3-way-mergeable with concurrent edits); omit both for a whole-file put_file.",
+    description: "Propose a semantic change (MVP: file writes). Declare effects honestly — policy gates on them. baseText/baseBlobOid authors a 3-way-mergeable edit_file.",
     inputSchema: {
       type: "object",
       properties: {
@@ -246,7 +313,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.contention.check",
-    description: "Early conflict warning (Phase 15.3): for each entity key, other actors' LIVE concurrent operations (outside your causal closure, not rejected, not superseded) and active lease holders whose scope overlaps. Check BEFORE/WHILE editing so overlap is discovered at authoring time, not at finalize. Perspective: pass sessionOid (its actor + ops), or actor (all their keys), or explicit keys.",
+    description: "Other actors' live concurrent ops and overlapping lease holders for given keys. Run while editing, so overlap surfaces before finalize.",
     inputSchema: {
       type: "object",
       properties: {
@@ -266,7 +333,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.workspace.land",
-    description: "Land a workspace onto its base line (docs/16): its isolated ops join the base view and merge there via the normal 3-way reduce — disjoint edits auto-merge, overlaps surface as conflicts. Idempotent. Returns the current landed set.",
+    description: "Land a workspace onto its base line: its isolated ops join the base view and merge there. Idempotent.",
     inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
     handler: async (repo, i) => {
       await repo.landWorkspace(String(i.name));
@@ -281,7 +348,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.line.create",
-    description: "Fork a long-lived line (e.g. 'v1.x') from another line at its current state. The new line inherits history up to the fork and then diverges — same entity can hold different content per line with no conflict (Phase 8).",
+    description: "Fork a long-lived line (e.g. 'v1.x') from another at its current state. It inherits history to the fork, then diverges.",
     inputSchema: {
       type: "object",
       properties: { name: { type: "string" }, fromLine: { type: "string" }, atCheckpointOid: { type: "string" } },
@@ -297,7 +364,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.operation.backport",
-    description: "Port (cherry-pick / backport) an operation onto another line: mints a new op on the target line carrying the source's change, with derivedFrom provenance. Does not affect the source line.",
+    description: "Cherry-pick an operation onto another line: mints a new op carrying the change, with derivedFrom provenance. Source line untouched.",
     inputSchema: {
       type: "object",
       properties: { sourceOpOid: { type: "string" }, targetLine: { type: "string" }, actor: actorSchema },
@@ -337,7 +404,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.view.materialize",
-    description: "Reduce the operation graph for a view into a code tree + per-op status + open conflicts. This is how an agent checks whether its work merges. Pass includeStatuses (e.g. ['accepted','needs_decision']) to ALSO project gated/pending ops so their computed 3-way merge can be inspected before acceptance; `dropped` lists ops NOT in the tree (status outside includeStatuses) so omissions are never silent (issue #13).",
+    description: "Reduce a view's operation graph into a tree, per-op status and open conflicts — how an agent checks that its work merges.",
     inputSchema: {
       type: "object",
       properties: {
@@ -347,6 +414,8 @@ export const TOOLS: ToolDef[] = [
           items: { type: "string", enum: ["proposed", "validating", "accepted", "rejected", "superseded", "needs_decision", "quarantined"] },
           description: "op statuses to project into the tree; default ['accepted']",
         },
+        filesLimit: { type: "number", description: "max paths to list; default 500. treeHash/status/conflicts/dropped are never bounded." },
+        pathsOnlyUnder: { type: "string", description: "list only paths under this prefix (e.g. 'src/')" },
       },
     },
     handler: async (repo, i) => {
@@ -360,9 +429,16 @@ export const TOOLS: ToolDef[] = [
       const dropped = Object.entries(status)
         .filter(([, s]) => !projected.has(s))
         .map(([oid, s]) => ({ oid, status: s }));
+      // Only the FILE LISTING is bounded (Phase 16 M1.2). treeHash, status, conflicts and
+      // dropped are correctness data — bounding them would make a wrong answer look right.
+      const under = typeof i.pathsOnlyUnder === "string" ? i.pathsOnlyUnder : undefined;
+      const all = [...res.tree.keys()].sort().filter((p) => (under ? p.startsWith(under) : true));
+      const filesLimit = boundedLimit(i.filesLimit, 500);
       return {
         treeHash: res.treeHash,
-        files: [...res.tree.keys()].sort(),
+        files: all.slice(0, filesLimit),
+        filesTotal: all.length,
+        filesTruncated: all.length > filesLimit,
         status,
         conflicts: res.conflicts,
         dropped,
@@ -377,7 +453,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.decision.record",
-    description: "Record a HUMAN/owner resolution of a conflict. Chosen ops are accepted, rejected ops dropped — and the rationale becomes reusable history. The agent CANNOT forge this: the owner is asked to confirm via MCP elicitation, and the decision is then signed with the owner's LOCAL private key (which the agent never holds). Unsigned/forged decisions are dropped by the reducer's trust gate (issue #15). Requires actor.kind 'human', an elicitation-capable client, and a provisioned local owner key.",
+    description: "Record a human owner's conflict resolution. Owner-confirmed and signed with their local key; an agent cannot forge it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -437,7 +513,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "avcs.integration.submit",
     description:
-      "Submit a draft checkpoint to a remote hub's integration queue (Phase 14, docs/17). NEVER pull-and-redo: the result is always a verdict to act on — `advanced` (done: the hub re-reduced the frontier union and moved the head), `conflict` (a minimal repair packet with counterpart ops + prior decisions: decide via avcs.decision.record, then resubmit), `needs_evidence` (run avcs.validate.run ONCE against the returned integrated tree — the needed delta objects were already pulled — attach evidence, resubmit the SAME ticketId), `queued` (retry after retryAfterMs), or `rejected` (hard gate). Omit `checkpoint` to checkpoint the view automatically.",
+      "Submit a checkpoint to the integration queue. Verdict is advanced, conflict, needs_evidence or queued — never 'pull and redo'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -501,7 +577,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.validate.run",
-    description: "Run validation commands against a view and attach treeHash-bound Evidence (docs/16 §8). By default materializes into a fresh temp dir. Pass `dir` (e.g. your working tree, which already has the build env like node_modules) to run there without avcs owning install — the fix for Node/pnpm (issue #11); with `dir` it runs in place unless `project:true`. Use `workspace` to validate a workspace view. Evidence trusts author≠signer, so pass a ciActor distinct from the op authors.",
+    description: "Run validation commands against a view and attach treeHash-bound evidence. Pass dir to reuse an existing build environment.",
     inputSchema: {
       type: "object",
       properties: {
@@ -548,7 +624,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.repair.context",
-    description: "Get a MINIMAL repair packet for ops whose validation failed (the failing output + related prior decisions + a fix instruction). Use instead of re-reading the whole repo.",
+    description: "Minimal repair packet for ops whose validation failed: failing output, related decisions, a fix instruction. Cheaper than re-reading the repo.",
     inputSchema: { type: "object", properties: { ops: { type: "array", items: { type: "string" } } }, required: ["ops"] },
     handler: (repo, i) => repo.repairContext(i.ops as string[]),
   },
@@ -566,20 +642,56 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.history",
-    description: "History of one entity in causal order (the ops that touched a file/symbol, each with actor/intent/purpose). O(ops-on-entity) via the entity index.",
-    inputSchema: { type: "object", properties: { entityKey: { type: "string" } }, required: ["entityKey"] },
-    handler: async (repo, i) =>
-      (await repo.historyOf(String(i.entityKey))).map((o) => ({ op: o.oid, actor: o.actor.id, purpose: o.declaredPurpose, at: o.createdAt, line: o.line ?? "main" })),
+    description: "History of one entity in causal order. Paged: limit (default 20) + cursor.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entityKey: { type: "string" },
+        limit: { type: "number", description: "max ops to return; default 20. A full page means there may be more." },
+        cursor: { type: "string", description: "opaque: the last op oid of the previous page; returns what follows it." },
+      },
+      required: ["entityKey"],
+    },
+    // Stays an ARRAY: success shapes are never wrapped (docs/18 §2 principle 1, §5), so the
+    // page-size signal is the standard "short page = end" rather than an added total field.
+    handler: async (repo, i) => {
+      const all = await repo.historyOf(String(i.entityKey));
+      const from = i.cursor ? all.findIndex((o) => o.oid === i.cursor) + 1 : 0;
+      const limit = boundedLimit(i.limit, 20);
+      return all.slice(from, from + limit).map((o) => ({ op: o.oid, actor: o.actor.id, purpose: o.declaredPurpose, at: o.createdAt, line: o.line ?? "main" }));
+    },
   },
   {
     name: "avcs.diff",
-    description: "Diff two views/lines: added/removed/modified paths.",
-    inputSchema: { type: "object", properties: { viewA: { type: "string" }, viewB: { type: "string" } }, required: ["viewA", "viewB"] },
-    handler: (repo, i) => repo.diff(String(i.viewA), String(i.viewB)),
+    description: "Diff two views/lines. format 'paths' (default) or 'patch' (unified diff).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        viewA: { type: "string" },
+        viewB: { type: "string" },
+        format: { type: "string", enum: ["paths", "patch"], description: "'paths' (default, unchanged shape) or 'patch' for unified diffs" },
+        path: { type: "string", description: "restrict a patch to this single path" },
+      },
+      required: ["viewA", "viewB"],
+    },
+    handler: async (repo, i) => {
+      const paths = await repo.diff(String(i.viewA), String(i.viewB));
+      if (i.format !== "patch") return paths; // default shape is unchanged (compatibility)
+      const [a, b] = await Promise.all([repo.materialize(String(i.viewA)), repo.materialize(String(i.viewB))]);
+      const only = typeof i.path === "string" ? i.path : undefined;
+      const changed = [...paths.added, ...paths.removed, ...paths.modified].sort().filter((p) => (only ? p === only : true));
+      // Go through materializedFiles, NOT readBlob: a merged path's tree entry can be a
+      // synth oid derived from the merge result, which was never stored as a blob.
+      const [fa, fb] = await Promise.all([repo.materializedFiles(a), repo.materializedFiles(b)]);
+      const textOf = (files: { path: string; content: string }[], p: string): string =>
+        files.find((f) => f.path === p)?.content ?? "";
+      const patches = changed.map((p) => ({ path: p, patch: unifiedDiff(textOf(fa, p), textOf(fb, p)) }));
+      return { ...paths, patches };
+    },
   },
   {
     name: "avcs.release.cut",
-    description: "Cut a Release: a verified (conflict-free) checkpoint + its evidence + an SBOM of what shipped + artifact references. Refuses if the view has open or semantic conflicts.",
+    description: "Cut a release: a conflict-free checkpoint plus evidence, SBOM and artifact references. Refuses if the view has open conflicts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -605,16 +717,51 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.object.show",
-    description: "Read an object by oid — the MCP equivalent of CLI `show`. For a blob, returns the decoded content (utf8 `text`, or `base64` if binary); for an operation/intent/etc., the structured object. Lets a pure-MCP agent inspect another agent's authored content, or fetch a base blob to declare as baseBlobOid on an edit_file propose (issue #12).",
-    inputSchema: { type: "object", properties: { oid: { type: "string" } }, required: ["oid"] },
+    description: "Read an object by oid. Blobs return decoded content (utf8 text or base64); other types return the structured object.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        oid: { type: "string" },
+        maxBytes: { type: "number", description: "cap on returned blob content; default 65536. `bytes` always reports the FULL size." },
+        lines: {
+          type: "object",
+          properties: { start: { type: "number" }, end: { type: "number" } },
+          description: "1-based inclusive line range of a text blob to return instead of the whole thing",
+        },
+      },
+      required: ["oid"],
+    },
     handler: async (repo, i) => {
       const oid = String(i.oid);
       const obj = await repo.store.get(oid);
       if ((obj as { type?: string }).type === "blob") {
         const buf = await repo.readBlob(oid);
-        return isBinary(buf)
-          ? { oid, kind: "blob", encoding: "base64", binary: true, bytes: buf.length, data: buf.toString("base64") }
-          : { oid, kind: "blob", encoding: "utf8", binary: false, bytes: buf.length, text: buf.toString("utf8") };
+        const bytes = buf.length; // ALWAYS the full size, even when the payload is a slice
+        if (isBinary(buf)) {
+          const maxBytes = boundedLimit(i.maxBytes, 65_536);
+          const slice = buf.subarray(0, maxBytes);
+          return { oid, kind: "blob", encoding: "base64", binary: true, bytes, truncated: bytes > maxBytes, data: slice.toString("base64") };
+        }
+        let text = buf.toString("utf8");
+        let truncated = false;
+        // A line range is the cheaper ask: slice first, then still honour maxBytes.
+        const range = i.lines as { start?: number; end?: number } | undefined;
+        if (range && (range.start !== undefined || range.end !== undefined)) {
+          const all = text.split("\n");
+          const trailing = text.endsWith("\n");
+          const body = trailing ? all.slice(0, -1) : all;
+          const start = Math.max(1, Math.floor(range.start ?? 1));
+          const end = Math.min(body.length, Math.floor(range.end ?? body.length));
+          const picked = body.slice(start - 1, end);
+          truncated = picked.length < body.length;
+          text = picked.length ? picked.join("\n") + "\n" : "";
+        }
+        const maxBytes = boundedLimit(i.maxBytes, 65_536);
+        if (Buffer.byteLength(text, "utf8") > maxBytes) {
+          text = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+          truncated = true;
+        }
+        return { oid, kind: "blob", encoding: "utf8", binary: false, bytes, truncated, text };
       }
       return { oid, kind: (obj as { type?: string }).type ?? "object", object: obj };
     },
@@ -652,11 +799,8 @@ export async function startMcpServer(): Promise<void> {
     tools: TOOLS.map((t) => ({
       name: t.name,
       description: t.description,
-      // Advertise the universal optional `cwd` so per-call repo targeting is discoverable.
-      inputSchema: {
-        ...t.inputSchema,
-        properties: { ...((t.inputSchema.properties as Record<string, unknown>) ?? {}), cwd: cwdSchema },
-      },
+      // Advertise the universal optional `cwd` and `verbose` so both are discoverable.
+      inputSchema: advertisedSchema(t),
     })),
   }));
 
@@ -719,8 +863,7 @@ export async function startMcpServer(): Promise<void> {
       },
     };
     try {
-      const result = await tool.handler(repo, argsIn, ctx);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return await runTool(tool, repo, argsIn, ctx);
     } finally {
       inFlight--;
     }

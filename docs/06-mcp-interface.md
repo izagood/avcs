@@ -8,13 +8,21 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 
 모든 도구는 공통 선택 인자 `cwd`(대상 저장소 힌트, 아래 repo discovery)를 받는다.
 
+**온보딩** *(Phase 16 M1 — [18](18-mcp-first-class.md) §1.3)*
+
+| tool | 역할 |
+|------|------|
+| `avcs.guide` | 정본 루프·에이전트 규칙·도구 색인·에러 복구. **먼저 호출한다.** 도구 색인과 에러맵은 live 테이블에서 생성되므로 서버와 어긋날 수 없다. `topic`: workflow(기본)·tools·sync·rules·errors |
+
+> **응답 관례 (M1).** 모든 응답은 **컴팩트 직렬화**가 기본이다(들여쓰기는 에이전트가 매 호출 지불하는 토큰). 사람이 읽을 때만 범용 입력 `verbose: true`. 실패는 산문이 아니라 `{ error, hint?, nextActions? }` 봉투로 오므로, **에러 문자열을 파싱하지 말고 `nextActions`를 따른다.** 목록형 읽기는 유계다 — `history`(limit 20 + cursor), `intent.list`(limit 50), `view.materialize`(filesLimit 500 + `filesTotal`/`filesTruncated`), `object.show`(lines/maxBytes + `bytes`/`truncated`). `treeHash`·status·conflicts는 정확성 데이터라 **절대 잘리지 않는다.**
+
 **intent / session**
 
 | tool | 역할 |
 |------|------|
 | `avcs.intent.create` | 목적·제약·허용 범위 개시. 모든 작업의 출발점 |
 | `avcs.intent.read` | intent와 제약 읽기 — propose 전에 반드시 |
-| `avcs.intent.list` | intent 목록 |
+| `avcs.intent.list` | intent 목록 (limit, 기본 50) |
 | `avcs.session.start` | intent에 대한 작업 세션 시작 → sessionOid |
 
 **변경 제안**
@@ -62,7 +70,7 @@ AVCS에서 **1급 인터페이스는 CLI가 아니라 MCP 서버**다. 에이전
 | tool | 역할 |
 |------|------|
 | `avcs.blame` | 엔티티의 현재 소유 op — 누가/왜 |
-| `avcs.history` | 엔티티 인과 순서 히스토리 (entity index, O(ops-on-entity)) |
+| `avcs.history` | 엔티티 인과 순서 히스토리 (entity index, O(ops-on-entity)). 페이지: `limit`(20) + `cursor`, 짧은 페이지 = 끝 |
 | `avcs.diff` | 두 view의 added/removed/modified 경로 |
 | `avcs.object.show` | oid로 임의 객체/blob 읽기 (타 에이전트 내용·base blob 조회) |
 | `avcs.metrics` | reduce 캐시 hit/miss 등 인프로세스 메트릭 |
