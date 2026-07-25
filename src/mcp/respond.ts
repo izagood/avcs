@@ -42,9 +42,15 @@ export const RECOVERY: RecoveryRule[] = [
     nextActions: ["avcs.sync.land", "avcs.integration.status"],
   },
   {
+    // There is no `avcs key` command — key provisioning exists only as
+    // `Repo.provisionOwnerKey`, reachable from neither the CLI nor MCP. Say so plainly
+    // rather than naming a command that does not exist: a nextAction is followed, not
+    // skimmed, so a wrong one fails for certain. Tracked as issue #51.
     re: /no local signing key|signing key|keystore/i,
-    hint: "this action must be signed by an actor key held locally",
-    nextActions: ["avcs key provision <actor-id>", "avcs key ls"],
+    hint:
+      "this action must be signed by an actor key held locally, and there is no command to " +
+      "mint one yet — call Repo.provisionOwnerKey(actor) from a script against this repo",
+    nextActions: ["avcs status (confirm which repo you are in)"],
   },
   {
     re: /not an AVCS repo|no \.avcs/i,
