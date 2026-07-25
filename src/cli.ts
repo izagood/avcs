@@ -186,6 +186,21 @@ async function main(): Promise<void> {
       for (const a of res.autoDecisions)
         console.log(`  ✓ auto @ ${a.key}: chose ${a.chosenOp.slice(0, 16)} (policy ${a.policyVersion})`);
       if (res.conflicts.length) console.log(`\nrun \`avcs conflicts ${view}\` to review`);
+      // Phase 15.3: early conflict warning — other actors' live concurrent work (and
+      // lease holders) on the keys this replica's actor has authored on. Needs a local
+      // identity for perspective; without one the section is simply omitted.
+      const me = await repo.localActorId(flag("--as"));
+      if (me) {
+        const warnings = await repo.contention({ actorId: me });
+        if (warnings.length) {
+          console.log(`\ncontention (${warnings.length} key(s), from ${me}'s perspective):`);
+          for (const w of warnings) {
+            console.log(`  ⚠ ${w.key}`);
+            for (const t of w.theirs) console.log(`     ~ ${t.op.slice(0, 16)}… ${t.actor} :: ${t.purpose}`);
+            for (const l of w.leaseHolders) console.log(`     ⛔ lease held by ${l.actor} on ${l.scope} until ${l.expiresAt}`);
+          }
+        }
+      }
       break;
     }
     case "conflicts": {
@@ -309,6 +324,29 @@ async function main(): Promise<void> {
       const remote = args[1] && !args[1].startsWith("--") ? args[1] : "origin";
       const asIdx = args.indexOf("--as");
       const as = asIdx >= 0 ? args[asIdx + 1] : undefined;
+      // Phase 15.2: `--watch` turns sync into the live-convergence daemon — long-poll
+      // GET /events, incremental pull on wake, contention early warning on arrivals.
+      if (args.includes("--watch")) {
+        const { runSyncWatch } = await import("./hub/syncWatch.ts");
+        const { consoleLogger } = await import("./observe/logger.ts");
+        repo.logger = consoleLogger("info");
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        process.on("SIGINT", stop);
+        process.on("SIGTERM", stop);
+        console.log(`watching ${remote} — live convergence via long-poll (Ctrl-C to stop)`);
+        await runSyncWatch(repo, {
+          remote,
+          as,
+          signal: ac.signal,
+          onEvent: (ev) => {
+            if (ev.type === "contention")
+              console.log(`⚠ contention @ ${ev.key}: ${ev.incomingActor}'s op ${ev.incomingOp.slice(0, 16)}… arrived on a key with local work by ${[...new Set(ev.localOps.map((o) => o.actor))].join(", ")}`);
+            else if (ev.type === "head") console.log(`↑ head:${ev.view} → ${ev.checkpoint.slice(0, 24)}…`);
+          },
+        });
+        break;
+      }
       const r = await repo.sync(remote, { as });
       console.log(`synced with ${remote}: pulled ${r.pulled}, pushed ${r.pushed}${r.rejected ? `, rejected ${r.rejected} (gated)` : ""}`);
       break;
@@ -842,6 +880,7 @@ async function main(): Promise<void> {
           "  remote add <name> <url>     register a named hub ([--auto-sync] [--freshness-ms N])\n" +
           "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
           "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +
+          "  sync --watch [remote]       live-convergence daemon: /events long-poll + contention early warning\n" +
           "  submit [--view v] [--remote r] [-m msg] [--as <id>]  checkpoint + integration-queue submit (never pull-and-redo)\n" +
           "  push <hub-url> [--as <id>] push objects to a hub (signs writes with the actor's key)\n" +
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +

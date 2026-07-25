@@ -25,7 +25,7 @@ import {
   type KeyRecord,
   type Signature,
 } from "../core/identity.ts";
-import { checkLease, isActive, type LeaseConflict } from "../concurrency/lease.ts";
+import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import type {
@@ -128,6 +128,21 @@ export interface RemoteConfig {
   url: string;
   autoSync?: boolean;
   freshnessMs?: number;
+}
+
+/**
+ * Early conflict warning for one contended entity key (Phase 15.3, docs/17 §15.3).
+ * `theirs` are operations by OTHER actors that (a) are outside the caller's causal
+ * closure — concurrent work the caller has not built on, (b) have not been rejected by
+ * a decision, and (c) have not been built upon by any later op on the same key (i.e.
+ * not superseded). `leaseHolders` are other actors holding an active lease whose scope
+ * overlaps the key. Leases gossip as ordinary objects, so combined with the sync-watch
+ * daemon this warning works ACROSS machines, not just across local processes.
+ */
+export interface ContentionWarning {
+  key: string;
+  theirs: { op: string; actor: string; lamport: number; purpose: string; createdAt: string }[];
+  leaseHolders: { actor: string; leaseOid: string; scope: string; expiresAt: string }[];
 }
 
 // Sidecar: ignore EVERYTHING under .avcs/ (the `*` also ignores this file itself), so the
@@ -319,6 +334,17 @@ export class Repo {
    * a no-auth/read-public hub, so signing is opt-in by having a key, not mandatory.
    */
   async #resolveHubSigner(explicitActorId?: string): Promise<{ keyId: string; privateKey: string } | undefined> {
+    const actorId = await this.localActorId(explicitActorId);
+    if (!actorId) return undefined;
+    const privateKey = await this.loadLocalKey(actorId);
+    return privateKey ? { keyId: actorId, privateKey } : undefined;
+  }
+
+  /** The replica's local actor identity, resolved by the same order #resolveHubSigner
+   *  uses (explicit → AVCS_ACTOR → config.json → sole private key) but WITHOUT requiring
+   *  a private key to exist — a contention check (Phase 15.3) needs a perspective, not a
+   *  credential. Returns undefined when nothing resolves. */
+  async localActorId(explicitActorId?: string): Promise<string | undefined> {
     let actorId = explicitActorId ?? process.env.AVCS_ACTOR;
     if (!actorId) {
       const cfg = await this.#readConfig();
@@ -330,9 +356,7 @@ export class Repo {
         if (files.length === 1) actorId = files[0]!.replace(/\.json$/, "");
       } catch { /* no private keystore yet */ }
     }
-    if (!actorId) return undefined;
-    const privateKey = await this.loadLocalKey(actorId);
-    return privateKey ? { keyId: actorId, privateKey } : undefined;
+    return actorId;
   }
   /**
    * Provision an owner key: mint a keypair, register the public half as trusted, and
@@ -495,6 +519,10 @@ export class Repo {
     coAuthors?: Actor[];
     private?: boolean;
     signWith?: { keyId: string; privateKey: string };
+    /** Phase 15.3: after authoring, run a contention check on the op's keys and emit
+     *  structured-log warnings + a metric. Additive only — the return type is unchanged
+     *  (surfaces that want the warnings themselves call {@link contention} directly). */
+    warnContention?: boolean;
   }): Promise<string> {
     // Multi-process reseed (Phase 13.2): two processes sharing one .avcs (e.g. CLI + MCP)
     // each hold their own in-memory clock, so both could issue the same lamport. Before
@@ -530,6 +558,18 @@ export class Repo {
     const oid = await this.store.put(op);
     // Maintain the entity index (Phase 9): key → op oids for fast history/blame.
     for (const key of keysOf({ ...op, oid })) await this.store.appendEntityIndex(key, oid);
+    if (args.warnContention) {
+      const warnings = await this.contention({ keys: [...keysOf({ ...op, oid })], actorId: op.actor.id, line: args.line });
+      for (const w of warnings) {
+        this.metrics.inc("contention.warnings");
+        this.logger.warn("contention.warn", {
+          key: w.key,
+          op: oid,
+          theirs: w.theirs.map((t) => `${t.actor}:${t.op.slice(0, 16)}`),
+          leaseHolders: w.leaseHolders.map((l) => l.actor),
+        });
+      }
+    }
     return oid;
   }
 
@@ -546,6 +586,7 @@ export class Repo {
     line?: string;
     workspace?: string;
     signWith?: { keyId: string; privateKey: string };
+    warnContention?: boolean;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.content);
     return this.proposeOperation({
@@ -560,6 +601,7 @@ export class Repo {
       line: args.line,
       workspace: args.workspace,
       signWith: args.signWith,
+      warnContention: args.warnContention,
     });
   }
 
@@ -586,6 +628,7 @@ export class Repo {
     line?: string;
     workspace?: string;
     signWith?: { keyId: string; privateKey: string };
+    warnContention?: boolean;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
     const baseBlobOid =
@@ -602,6 +645,7 @@ export class Repo {
       line: args.line,
       workspace: args.workspace,
       signWith: args.signWith,
+      warnContention: args.warnContention,
     });
   }
 
@@ -698,6 +742,82 @@ export class Repo {
       };
       return { granted: true, leaseOid: await this.store.put(lease) };
     });
+  }
+
+  // ── contention: early conflict warning (Phase 15.3, docs/17 §15.3) ──────────
+
+  /**
+   * Report contention on entity keys BEFORE finalize would discover it: for each key,
+   * the operations by other actors that the caller has not built on (outside the
+   * caller's causal closure) and are still live (neither decision-rejected nor built
+   * upon by a later op on the key), plus other actors' active leases overlapping the
+   * key. Discovery is via the entity index — O(ops-on-key), no reduce.
+   *
+   * Perspective resolution ("mine"), first hit wins:
+   *  - `sessionOid`: that session's actor; its ops seed both the key set and the closure.
+   *  - `actorId` (+ optional `keys`): that actor's ops on the resolved keys seed the
+   *    closure; with no `keys` given, every key the actor has authored on is checked.
+   *  - `keys` alone: no closure filter — everything live by anyone on the key reports.
+   */
+  async contention(args: { keys?: string[]; sessionOid?: string; actorId?: string; line?: string }): Promise<ContentionWarning[]> {
+    const line = args.line ?? "main";
+    let mine = args.actorId;
+    const keys = new Set(args.keys ?? []);
+    const myOpOids: string[] = [];
+
+    if (args.sessionOid) {
+      const sess = await this.store.get<Session>(args.sessionOid);
+      mine ??= sess.actor.id;
+      for (const op of await this.#allOpsTailed()) {
+        if (op.sessionOid !== args.sessionOid) continue;
+        myOpOids.push(op.oid as string);
+        for (const k of keysOf(op)) keys.add(k);
+      }
+    } else if (mine) {
+      for (const op of await this.#allOpsTailed()) {
+        if (op.actor.id !== mine) continue;
+        if (keys.size && ![...keysOf(op)].some((k) => keys.has(k))) continue;
+        myOpOids.push(op.oid as string);
+        if (!args.keys?.length) for (const k of keysOf(op)) keys.add(k);
+      }
+    }
+    if (!keys.size) return [];
+
+    // Ops I've already seen/built on are not surprises — they're my history.
+    const myClosure = myOpOids.length ? await this.#closureOf(myOpOids) : new Set<string>();
+    const rejected = new Set((await this.store.collect<Decision>("decision")).flatMap((d) => d.rejectedOps));
+    const leases = await this.activeLeases();
+
+    const out: ContentionWarning[] = [];
+    for (const key of [...keys].sort()) {
+      const ops: Operation[] = [];
+      for (const oid of await this.store.readEntityIndex(key)) {
+        if (!(await this.store.has(oid))) continue; // GC'd since indexed
+        const op = await this.store.get<Operation>(oid);
+        if ((op.line ?? "main") !== line || op.private) continue;
+        ops.push({ ...op, oid } as Operation);
+      }
+      // An op some later op (on any key) causally builds on is superseded work, not
+      // contention — one ancestry walk over the union of the key ops' deps finds them.
+      const builtUpon = await this.#closureOf(ops.flatMap((o) => o.causalDeps));
+      const theirs = ops
+        .filter((o) => {
+          const oid = o.oid as string;
+          return o.actor.id !== mine && !myClosure.has(oid) && !rejected.has(oid) && !builtUpon.has(oid);
+        })
+        .sort((a, b) => a.lamport - b.lamport || String(a.oid).localeCompare(String(b.oid)))
+        .map((o) => ({ op: o.oid as string, actor: o.actor.id, lamport: o.lamport, purpose: o.declaredPurpose, createdAt: o.createdAt }));
+      const leaseHolders = leases
+        .filter((l) => l.actor.id !== mine && l.writeScopes.some((s) => scopesOverlap(key as ScopeRef, s)))
+        .map((l) => ({
+          actor: l.actor.id,
+          leaseOid: l.oid as string,
+          scope: l.writeScopes.find((s) => scopesOverlap(key as ScopeRef, s))!,
+          expiresAt: l.expiresAt,
+        }));
+      if (theirs.length || leaseHolders.length) out.push({ key, theirs, leaseHolders });
+    }
+    return out;
   }
 
   /** Build a minimal repair packet for ops whose validation failed. */
@@ -1617,8 +1737,113 @@ export class Repo {
     const url = await this.#resolveRemote(remote);
     const { pulled } = await this.pullHub(url);
     const { pushed, rejected } = await this.pushHub(url, opts);
+    await this.#recordSyncAt(remote); // Phase 15.2: the freshness window keys off this stamp
     this.logger.info("sync.completed", { remote, url, pulled, pushed, rejected });
     return { pulled, pushed, rejected };
+  }
+
+  // ── live convergence: freshness window (Phase 15.2, docs/17 §15.2) ─────────
+  // `.avcs/last-sync.json` — remote name → ISO timestamp of the last successful sync.
+  // An aux file like remotes.json: per-replica state, never an object, never gossiped.
+
+  /** Freshness window applied to an `autoSync` remote that doesn't set `freshnessMs`. */
+  static readonly DEFAULT_FRESHNESS_MS = 30_000;
+
+  async #readLastSync(): Promise<Record<string, string>> {
+    const raw = await this.store.readAux("last-sync.json");
+    if (!raw) return {};
+    try { return JSON.parse(raw.toString("utf8")) as Record<string, string>; } catch { return {}; }
+  }
+
+  async #recordSyncAt(remote: string): Promise<void> {
+    const last = await this.#readLastSync();
+    last[remote] = new Date().toISOString();
+    await this.store.writeAux("last-sync.json", JSON.stringify(last, null, 2) + "\n");
+  }
+
+  /** Milliseconds since the last successful sync with `remote` (Infinity when never). */
+  async syncAgeMs(remote = "origin"): Promise<number> {
+    const at = Date.parse((await this.#readLastSync())[remote] ?? "");
+    return Number.isFinite(at) ? Date.now() - at : Infinity;
+  }
+
+  /**
+   * BLOCKING freshness sync (Phase 15.2): sync each named remote (default: every
+   * `autoSync` remote) whose last successful sync is older than its freshness window.
+   * For callers that must not read stale state (e.g. just before a submit). The read
+   * path itself never calls this — materialize only ever fires a BACKGROUND revalidate.
+   */
+  async syncIfStale(remote?: string, opts?: { as?: string }): Promise<{ synced: string[] }> {
+    const remotes = await this.#readRemotes();
+    const names = remote !== undefined ? [remote] : Object.keys(remotes).filter((n) => remotes[n]!.autoSync);
+    const synced: string[] = [];
+    for (const name of names) {
+      const cfg = remotes[name];
+      if (!cfg && !/^https?:\/\//.test(name)) throw new Error(`unknown remote: ${name}`);
+      const freshnessMs = cfg?.freshnessMs ?? Repo.DEFAULT_FRESHNESS_MS;
+      if ((await this.syncAgeMs(name)) < freshnessMs) continue;
+      await this.sync(name, opts);
+      synced.push(name);
+    }
+    return { synced };
+  }
+
+  // Stale-while-revalidate on materialize: when an autoSync remote's window has lapsed,
+  // fire a background sync and return immediately — the read path is the throughput-
+  // critical path and is NEVER blocked on the network. In-flight + a 1s re-check
+  // throttle keep the hot loop to at most one aux read per second.
+  //
+  // The in-flight run is KEPT as a promise rather than a boolean: "fire and forget" with
+  // no handle is unobservable from outside, and a revalidate outlives the observable
+  // effect that a caller would naturally wait on (pull lands the objects, but push and
+  // the last-sync stamp write still follow). Whoever tears the repo down next — a test's
+  // rm, a daemon shutdown — would otherwise race those writes. See settleBackgroundSync.
+  #bgSync: Promise<void> | null = null;
+  #lastFreshnessCheck = 0;
+
+  /**
+   * Await any in-flight background revalidation, resolving immediately when idle. The
+   * quiesce handle for the fire-and-forget path, mirroring the promise `runSyncWatch`
+   * returns for the daemon: call it before tearing a repo down (shutdown, teardown) so
+   * no `.avcs` write is still outstanding. Never rejects — a failed revalidate is logged
+   * and swallowed, exactly as it is on the read path.
+   */
+  async settleBackgroundSync(): Promise<void> {
+    // Loop rather than a single await: a materialize concurrent with the settle can start
+    // the next run while we're waiting on this one.
+    for (let inFlight = this.#bgSync; inFlight; inFlight = this.#bgSync) await inFlight;
+  }
+
+  #maybeBackgroundSync(): void {
+    const now = Date.now();
+    if (this.#bgSync || now - this.#lastFreshnessCheck < 1_000) return;
+    this.#lastFreshnessCheck = now;
+    // Publish the handle BEFORE arranging its clear, and clear by identity: a body that
+    // ever settles without suspending would otherwise null the field first and be
+    // resurrected by this assignment, wedging the guard above at "always in flight".
+    const run = this.#revalidateStaleRemotes();
+    this.#bgSync = run;
+    void run.finally(() => { if (this.#bgSync === run) this.#bgSync = null; });
+  }
+
+  /** One revalidation pass: sync every autoSync remote past its freshness window.
+   *  Never rejects — see the catch. */
+  async #revalidateStaleRemotes(): Promise<void> {
+    try {
+      const remotes = await this.#readRemotes();
+      for (const [name, cfg] of Object.entries(remotes)) {
+        if (!cfg.autoSync) continue;
+        const freshnessMs = cfg.freshnessMs ?? Repo.DEFAULT_FRESHNESS_MS;
+        const age = await this.syncAgeMs(name);
+        if (age < freshnessMs) continue;
+        this.logger.info("sync.freshness.revalidate", { remote: name, ageMs: age === Infinity ? null : Math.round(age) });
+        await this.sync(name);
+      }
+    } catch (e) {
+      // Background revalidation failing (hub down, network) must never surface into
+      // the read path — log and try again after the next materialize + throttle.
+      this.logger.warn("sync.freshness.fail", { error: String((e as Error).message) });
+    }
   }
 
   /** Resolve a view's query into the candidate operation set, then reduce. */
@@ -1659,6 +1884,9 @@ export class Repo {
 
   async materialize(viewName = "main", opts?: { includeStatuses?: ViewQuery["includeStatuses"]; workspace?: string }): Promise<ReductionResult> {
     this.metrics.inc("materialize.calls");
+    // Phase 15.2 stale-while-revalidate: an autoSync remote past its freshness window
+    // triggers a BACKGROUND sync. Fire-and-forget — this read never waits on the network.
+    this.#maybeBackgroundSync();
     // Compaction (B3, default since 13.3): on a cold instance, seed the incremental base
     // from the persisted snapshot so this materialize re-reduces only ops added since it,
     // not all history. A corrupt/stale/version-mismatched snapshot is discarded (→ full

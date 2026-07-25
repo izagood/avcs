@@ -18,6 +18,14 @@ export interface LockOptions {
   maxWaitMs?: number;
   /** Treat a held lock older than this as abandoned and reclaim it. */
   staleMs?: number;
+  /**
+   * Re-stamp the owner file on this interval while the lock is held (Phase 15.2).
+   * A long-lived holder (the sync-watch daemon) would otherwise exceed any waiter's
+   * `staleMs` and get its LIVE lock reclaimed. With a heartbeat the stamp stays fresh
+   * while the holder is alive, and a crashed holder stops stamping — so the normal
+   * stale-reclaim path still frees the lock. Omit for ordinary short critical sections.
+   */
+  heartbeatMs?: number;
 }
 
 /**
@@ -75,9 +83,41 @@ export async function withLock<T>(
     }
   }
 
+  // Keep the owner stamp fresh while `fn` runs (write-then-rename, same torn-read
+  // discipline as acquisition). Errors are swallowed: if the lock dir vanished the
+  // holder is about to find out via its own release, and a failed heartbeat must
+  // never crash the critical section it protects.
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  // Chain the stamp writes rather than firing each into the void. Two reasons, both
+  // about a write OUTLIVING the thing it belongs to:
+  //  - release: clearInterval stops future ticks but not one already in flight. If its
+  //    rename lands between the release rm's readdir and its rmdir, `owner` is
+  //    resurrected and rmdir fails ENOTEMPTY — thrown from a `finally`, so it REPLACES
+  //    fn()'s successful result, and leaves a freshly-stamped lock dir that blocks every
+  //    waiter for a full staleMs. So release awaits this chain before removing anything.
+  //  - overlap: a stamp write slower than the interval would otherwise interleave with
+  //    the next tick; chaining serializes them.
+  let stampWrites: Promise<void> = Promise.resolve();
+  if (opts.heartbeatMs !== undefined && opts.heartbeatMs > 0) {
+    heartbeat = setInterval(() => {
+      stampWrites = stampWrites.then(async () => {
+        try {
+          const tmp = join(lockPath, `owner.${process.pid}.hb.tmp`);
+          await writeFile(tmp, `${process.pid}:${Date.now()}`, "utf8");
+          await rename(tmp, ownerFile);
+        } catch {
+          /* lock released/reclaimed underneath — nothing useful to do here */
+        }
+      });
+    }, opts.heartbeatMs);
+    heartbeat.unref?.();
+  }
+
   try {
     return await fn();
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    await stampWrites; // no stamp write may survive into (or past) the removal below
     await rm(lockPath, { recursive: true, force: true });
   }
 }

@@ -36,6 +36,37 @@ test("withLock serializes a racy read-modify-write", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("a heartbeated lock releases cleanly: no in-flight stamp write survives the release", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-lock-hb-"));
+  const locks = join(dir, "locks");
+  await mkdir(locks, { recursive: true });
+
+  // The heartbeat (Phase 15.2) re-stamps `owner` on an interval so a long-lived holder
+  // — the sync-watch daemon — isn't reclaimed as stale. clearInterval stops future ticks
+  // but says nothing about a tick already in flight: if its rename lands between the
+  // release rm's readdir and its rmdir, the owner file is resurrected and rmdir fails
+  // ENOTEMPTY. That throw comes out of a `finally`, so it REPLACES fn()'s successful
+  // result — and leaves a freshly-stamped lock dir that blocks waiters for a full staleMs.
+  //
+  // HONESTY NOTE: this is a probabilistic stress guard, not a proof. The unpatched race
+  // was measured at ~0.25% per round, so 300 rounds catch a REINTRODUCTION only about
+  // half the time — a green run here does NOT establish that release is race-free.
+  // Making it deterministic would need a scheduling seam in withLock, which is not worth
+  // putting into production code; the fix itself (release awaits the stamp-write chain)
+  // is what guarantees the invariant. Post-fix this test is exactly 0% flaky.
+  const rounds = 300;
+  for (let i = 0; i < rounds; i++) {
+    const name = `hb${i}`;
+    await withLock(locks, name, async () => { await delay(12); }, { heartbeatMs: 1 });
+    assert.deepEqual(
+      await readdir(join(locks)).then((es) => es.filter((e) => e === `${name}.lock`)),
+      [],
+      `release left the lock dir behind on round ${i}`,
+    );
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("H-6: concurrent requests for the same scope grant exactly one", async () => {
   const dir = await mkdtemp(join(tmpdir(), "avcs-"));
   const repo = await Repo.init(dir);
