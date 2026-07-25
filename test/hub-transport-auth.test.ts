@@ -12,7 +12,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/api/repo.ts";
-import { startHub } from "../src/hub/hubServer.ts";
+import { startHub, HUB_PROTOCOL_VERSION } from "../src/hub/hubServer.ts";
 import { generateKeypair } from "../src/core/identity.ts";
 import {
   buildAuthHeader, parseAuthHeader, verifyAuth, canonicalRequest, NonceCache,
@@ -128,7 +128,10 @@ test("write-auth hub: writes require a valid member signature, reads stay public
     // /version advertises the requirement so clients/old peers learn it up front.
     const ver = await (await fetch(`${hub.url}/version`)).json() as { auth: string; protocol: number };
     assert.equal(ver.auth, "required");
-    assert.equal(ver.protocol, 3); // v3 = +integration queue (additive; v2 = transport auth)
+    // Assert against the constant, not a literal: every additive protocol bump (v2 = transport
+    // auth, v3 = +integration queue, v4 = +events long-poll) would otherwise break this auth
+    // test for no reason. That /version reports the right number is hardening-hub-operability's job.
+    assert.equal(ver.protocol, HUB_PROTOCOL_VERSION);
   } finally {
     await hub.close();
     await rm(dir, { recursive: true, force: true });
