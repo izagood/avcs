@@ -79,11 +79,15 @@ test("every tool named by a recovery hint is actually registered — hints canno
   }
 });
 
-test("a missing signing key explains provisioning in the hint, since no command does it", () => {
-  // There is deliberately no `avcs key …` nextAction: that command does not exist, and a
-  // hint the agent can read beats an instruction it would follow into a failure.
+test("a missing signing key points at the tool that mints one", () => {
+  // This hint named a nonexistent `avcs key provision` for two releases (#51). Now that
+  // both the tool and the command are real, it names them — and the drift guards below
+  // keep that honest by pinning every referenced tool and CLI command to what exists.
   const env = errorEnvelope(new Error("no local signing key for ai:claude"));
-  assert.match(String(env.hint), /provisionOwnerKey/);
+  assert.ok(
+    env.nextActions?.some((a) => a.includes("avcs.key.provision")),
+    `got ${JSON.stringify(env.nextActions)}`,
+  );
 });
 
 test("being outside a repo points at cwd and init, the two things that actually fix it", () => {
