@@ -314,6 +314,53 @@ export class Repo {
     await writeFile(join(this.#privateKeysDir(), `${actorId}.json`), JSON.stringify({ actorId, privateKey }), { encoding: "utf8", mode: 0o600 });
   }
   /**
+   * Adopt an existing private key into THIS repo's keystore (issue #58).
+   *
+   * `clone` is the command that creates a repo, so a freshly init'd directory holds no key
+   * and cannot sign the first read — which makes a private repository unreachable on a hub
+   * that gates reads. The credential therefore has to come from outside, and be left behind
+   * afterwards: a clone that worked once and whose later `sync` then 401s just moves the
+   * problem somewhere less obvious.
+   *
+   * `source` is either a key file (the shape `saveLocalKey` writes) or a repo directory to
+   * take one from. An ambiguous directory names the choice rather than picking silently —
+   * signing as the wrong actor is worse than a stop, because the wrong identity ends up in
+   * history where it cannot be quietly corrected.
+   */
+  async importLocalKey(source: string, actorId?: string): Promise<string> {
+    const { readdir: rd } = await import("node:fs/promises");
+    let file = source;
+    const asRepoRoot = existsSync(join(source, ".avcs", "private"))
+      ? join(source, ".avcs", "private")
+      : existsSync(join(source, "private")) && existsSync(join(source, "objects"))
+        ? join(source, "private")
+        : null;
+    if (asRepoRoot) {
+      const held = (await rd(asRepoRoot)).filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, ""));
+      if (held.length === 0) throw new Error(`no private key found in ${source}`);
+      if (!actorId && held.length > 1) {
+        throw new Error(`${source} holds ${held.length} keys (${held.join(", ")}) — say which one to import`);
+      }
+      const pick = actorId ?? held[0]!;
+      if (!held.includes(pick)) throw new Error(`no private key for ${pick} in ${source}`);
+      file = join(asRepoRoot, `${pick}.json`);
+    }
+    if (!existsSync(file)) throw new Error(`no such key file: ${file}`);
+    let parsed: { actorId?: unknown; privateKey?: unknown };
+    try {
+      parsed = JSON.parse(await readFile(file, "utf8")) as typeof parsed;
+    } catch {
+      throw new Error(`key file is not valid JSON: ${file}`);
+    }
+    const id = typeof parsed.actorId === "string" ? parsed.actorId : actorId;
+    if (!id || typeof parsed.privateKey !== "string") {
+      throw new Error(`not an avcs key file (expected { actorId, privateKey }): ${file}`);
+    }
+    await this.saveLocalKey(id, parsed.privateKey);
+    return id;
+  }
+
+  /**
    * Actor ids this machine holds a PRIVATE key for — i.e. who it can sign as. Returns ids
    * only: the key material must never travel with a listing, or `key ls` becomes the
    * disclosure it is meant to help avoid.
