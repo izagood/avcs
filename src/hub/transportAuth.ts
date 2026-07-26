@@ -33,15 +33,32 @@ export interface AuthCredential {
   ts: string;
   nonce: string;
   sig: string;
+  /** The repository the client believes it is addressing (issue #49). Absent on an
+   *  unscoped credential — which is every credential written before this existed. */
+  scope?: string;
+  /** Signature over the scope-bearing material. Present iff `scope` is. Separate from
+   *  `sig` so a scope-unaware verifier can still check `sig` and accept the request. */
+  bsig?: string;
 }
 
 /**
  * The exact byte string both sides sign/verify. Binds the signature to the method, the
  * request target, a timestamp (freshness) and a nonce (replay), plus a hash of the body
  * so a captured signature cannot be replayed against different content.
+ *
+ * `scope` (issue #49) additionally binds it to a REPOSITORY. The path a client signs is
+ * the endpoint suffix ("/objects"), because the reference hub sits at the root — so
+ * without a scope nothing in the signed material says which repository the write was for,
+ * and on a multi-tenant hub a credential captured for one repo is structurally valid for
+ * another. Signing the full path instead would couple the signature to the server's mount
+ * layout and break under ordinary path-rewriting proxies.
+ *
+ * Appended rather than inserted, and empty when absent, so an unscoped credential produces
+ * byte-identical material to what this function produced before scope existed.
  */
-export function canonicalRequest(method: string, path: string, ts: string, nonce: string, body: string): string {
-  return `${method.toUpperCase()}\n${path}\n${ts}\n${nonce}\n${sha256hex(body)}`;
+export function canonicalRequest(method: string, path: string, ts: string, nonce: string, body: string, scope = ""): string {
+  const core = `${method.toUpperCase()}\n${path}\n${ts}\n${nonce}\n${sha256hex(body)}`;
+  return scope ? `${core}\n${scope}` : core;
 }
 
 /** Build an `Authorization: AVCS-Sig …` header value, signing the request with the local
@@ -54,11 +71,24 @@ export function buildAuthHeader(args: {
   body?: string;
   ts?: string;
   nonce?: string;
+  /** Repository this credential is for (issue #49). Omit, or pass "", to sign unscoped. */
+  scope?: string;
 }): string {
   const ts = args.ts ?? new Date().toISOString();
   const nonce = args.nonce ?? randomBytes(12).toString("base64url");
-  const sig = signMessage(args.privateKey, canonicalRequest(args.method, args.path, ts, nonce, args.body ?? ""));
-  return `${AUTH_SCHEME} keyId="${args.keyId}", ts="${ts}", nonce="${nonce}", sig="${sig}"`;
+  const scope = args.scope ?? "";
+  const body = args.body ?? "";
+  // TWO signatures, deliberately. `sig` covers the original material so a hub running an
+  // older avcs — which reconstructs canonicalRequest without any scope — still verifies it
+  // and keeps working. `bsig` additionally covers the scope, and is what a hub that
+  // REQUIRES binding checks. One signature cannot do both jobs: folding scope into `sig`
+  // makes every deployed verifier reject every request, which is exactly what happened the
+  // first time this was attempted against a live hub.
+  const sig = signMessage(args.privateKey, canonicalRequest(args.method, args.path, ts, nonce, body));
+  const head = `${AUTH_SCHEME} keyId="${args.keyId}", ts="${ts}", nonce="${nonce}"`;
+  if (!scope) return `${head}, sig="${sig}"`;
+  const bsig = signMessage(args.privateKey, canonicalRequest(args.method, args.path, ts, nonce, body, scope));
+  return `${head}, scope="${scope}", sig="${sig}", bsig="${bsig}"`;
 }
 
 /** Parse an AVCS-Sig Authorization header. Returns null on any scheme/field mismatch. */
@@ -72,9 +102,11 @@ export function parseAuthHeader(header: string | undefined | null): AuthCredenti
   const re = /(\w+)="([^"]*)"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(rest)) !== null) fields[m[1]!] = m[2]!;
-  const { keyId, ts, nonce, sig } = fields;
+  const { keyId, ts, nonce, sig, scope, bsig } = fields;
   if (!keyId || !ts || !nonce || !sig) return null;
-  return { keyId, ts, nonce, sig };
+  // An empty scope is reported as absent: a rootless remote derives "" and must not turn
+  // that into an expectation nobody can satisfy.
+  return scope && bsig ? { keyId, ts, nonce, sig, scope, bsig } : { keyId, ts, nonce, sig };
 }
 
 /**
@@ -138,6 +170,15 @@ export async function verifyAuth(args: {
   now: number;
   windowMs?: number;
   nonceCache?: NonceCache;
+  /**
+   * The repository this request is actually for (issue #49). When set, the credential must
+   * name the same one — so a signature captured for another repo on a multi-tenant hub is
+   * refused even though key, method, path, body and freshness all still check out.
+   *
+   * Leave unset on a single-repo hub: there is nothing to compare against, and every
+   * existing credential keeps verifying exactly as before.
+   */
+  expectedScope?: string;
 }): Promise<AuthResult> {
   const cred = parseAuthHeader(args.header);
   if (!cred) return { ok: false, reason: "missing or malformed AVCS-Sig Authorization header" };
@@ -151,11 +192,30 @@ export async function verifyAuth(args: {
     return { ok: false, reason: "nonce already used (replay)" };
   }
 
+  if (args.expectedScope) {
+    if (!cred.scope) {
+      return { ok: false, reason: `credential carries no scope; this hub requires scope "${args.expectedScope}"` };
+    }
+    if (cred.scope !== args.expectedScope) {
+      return { ok: false, reason: `credential scope "${cred.scope}" does not match "${args.expectedScope}"` };
+    }
+  }
+
   const publicKey = await args.resolvePublicKey(cred.keyId);
   if (!publicKey) return { ok: false, reason: `unknown signing key ${cred.keyId}` };
 
   const msg = canonicalRequest(args.method, args.path, cred.ts, cred.nonce, args.body);
   if (!verifyMessage(publicKey, msg, cred.sig)) return { ok: false, reason: "request signature does not verify" };
+
+  // When binding is required, the scope must ALSO be signed — otherwise it is decoration a
+  // replayer could rewrite. Checked after `sig` so a tampered scope fails as a signature
+  // problem rather than a mismatch, and only when this hub asked for binding.
+  if (args.expectedScope) {
+    const bound = canonicalRequest(args.method, args.path, cred.ts, cred.nonce, args.body, cred.scope!);
+    if (!cred.bsig || !verifyMessage(publicKey, bound, cred.bsig)) {
+      return { ok: false, reason: "scope binding does not verify" };
+    }
+  }
 
   return { ok: true, keyId: cred.keyId };
 }
