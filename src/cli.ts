@@ -481,7 +481,14 @@ async function main(): Promise<void> {
       if (!src) throw new Error("usage: avcs import <source-dir> [-m message] [--author id]");
       const message = flag("-m") ?? flag("--message") ?? `import ${src}`;
       const author = flag("--author") ?? "human:cli";
-      const r = await repo.commitWorkingTree(src, { message, actor: { kind: "human", id: author } });
+      // Apply the repo's ignore rules, as `git-sync` already does (issue #48). Without this
+      // the same tree captured very differently depending on which command you reached for —
+      // `import` pulled node_modules/ and dist/ into history.
+      const r = await repo.commitWorkingTree(src, {
+        message,
+        actor: { kind: "human", id: author },
+        ignorePredicate: gitIgnorePredicate(src),
+      });
       console.log(`imported ${r.ops.length} file(s) from ${src} (${r.added.length} new)`);
       break;
     }
