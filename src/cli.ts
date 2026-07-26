@@ -305,12 +305,22 @@ async function main(): Promise<void> {
     case "clone": {
       const url = args[1];
       const dir = args[2] ?? cwd;
-      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir]");
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir] [--key <repo-dir|key-file>] [--as <actor-id>]");
       const repo = await Repo.init(dir);
-      const r = await repo.pullHub(url);
+      // A hub that gates reads refuses an unsigned GET /have, and a just-created repo holds
+      // no key to sign it with (issue #58). `--key` brings one in from an existing repo dir
+      // or a key file; it is adopted into the new repo first, so later syncs work too.
+      const keySrc = flag("--key") ?? process.env.AVCS_KEY;
+      const as = flag("--as");
+      let signer: string | undefined = as;
+      if (keySrc) signer = await repo.importLocalKey(keySrc, as);
+      const r = await repo.pullHub(url, signer ? { as: signer } : undefined);
       // Phase 13.1: remember where we came from — `avcs sync` now works with no URL.
       await repo.addRemote("origin", url);
-      console.log(`cloned ${r.pulled} object(s) from ${url} into ${dir}  [remote origin recorded]`);
+      console.log(
+        `cloned ${r.pulled} object(s) from ${url} into ${dir}  [remote origin recorded]` +
+          (signer ? `  [signing as ${signer}]` : ""),
+      );
       break;
     }
     case "remote": {
@@ -928,7 +938,7 @@ async function main(): Promise<void> {
           "  install-hooks [--force]     install git hooks so `git commit`/`pull` auto-sync AVCS\n" +
           "  reindex                     rebuild the entity index (after a git pull of .avcs objects)\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
-          "  clone <hub-url> [dir]       create a repo from a hub (records remote `origin`)\n" +
+          "  clone <hub-url> [dir] [--key <repo-dir|key-file>] [--as <id>]  create a repo from a hub\n" +
           "  remote add <name> <url>     register a named hub ([--auto-sync] [--freshness-ms N])\n" +
           "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
           "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +
