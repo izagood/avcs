@@ -7,7 +7,7 @@
 
 import { mkdir, writeFile, rm, readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve, relative } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
@@ -2346,21 +2346,32 @@ export class Repo {
   async #readWorkTree(workDir: string, ignorePredicate?: (rel: string) => boolean): Promise<Map<string, Buffer>> {
     const out = new Map<string, Buffer>();
     if (!existsSync(workDir)) return out;
-    const avcsIgnore = await this.#loadAvcsIgnore(workDir);
+    // Resolve the root and derive each path RELATIVE to it, rather than slicing a fixed
+    // prefix length off a joined path (issue #48). `join` normalises — `join(".", "src")`
+    // is "src", not "./src" — so with workDir "." a length-based slice removed two real
+    // characters and stored `src/a.ts` as `c/a.ts`. A trailing slash shifted them by one.
+    //
+    // Nothing errored: the op count looked right and the damage only surfaced later, when
+    // `file:src/a.ts` had no history. It also defeated the exclusion guards below, since
+    // `.git/HEAD` shifted to `it/HEAD` and stopped matching — which is how avcs came to
+    // capture git's directory, and its own store, into the history it was writing.
+    const root = resolve(workDir);
+    const out2 = out; // keep the closure below reading naturally
+    const avcsIgnore = await this.#loadAvcsIgnore(root);
     const ignored = (rel: string): boolean => avcsIgnore(rel) || (ignorePredicate?.(rel) ?? false);
     const walk = async (dir: string): Promise<void> => {
       for (const ent of await readdir(dir, { withFileTypes: true })) {
-        const rel = join(dir, ent.name).slice(workDir.length + 1).split("\\").join("/");
+        const rel = relative(root, join(dir, ent.name)).split("\\").join("/");
         // Skip AVCS's own state and git's OWN directory — but not `.github/`/`.gitignore`/
         // `.gitattributes`: those are code (CI workflows, ignore rules) and must be captured,
         // or verify-git can never match a real repo's committed tree (they'd be "+git only").
         if (rel.startsWith(".avcs") || rel === ".avcs-workspace" || rel === ".git" || rel.startsWith(".git/")) continue;
         if (ignored(rel)) continue; // prune: skip an ignored file, and never descend an ignored dir
         if (ent.isDirectory()) await walk(join(dir, ent.name));
-        else if (ent.isFile()) out.set(rel, await readFile(join(dir, ent.name)));
+        else if (ent.isFile()) out2.set(rel, await readFile(join(dir, ent.name)));
       }
     };
-    await walk(workDir);
+    await walk(root);
     return out;
   }
 
