@@ -20,11 +20,29 @@ export interface HubSigner {
   privateKey: string;
 }
 
+/**
+ * The repository this remote addresses, as the signed `scope` (issue #49).
+ *
+ * The pathname of the remote base: `https://host/acme/web` → "/acme/web", and a rootless
+ * `https://host` → "" (unscoped, exactly as before). A multi-tenant hub mounts per
+ * repository, so this is the same prefix it strips to recover the endpoint the client
+ * signed — which is why both sides can agree on it without the client knowing the
+ * server's routing.
+ */
+function scopeOf(hubUrl: string): string {
+  try {
+    const p = new URL(hubUrl).pathname.replace(/\/$/, "");
+    return p === "/" ? "" : p;
+  } catch {
+    return "";
+  }
+}
+
 /** Build fetch headers for a hub write, attaching an AVCS-Sig Authorization header when a
  *  signer is supplied. `path` must equal the server's pathname or the signature won't verify. */
-function writeHeaders(signer: HubSigner | undefined, method: string, path: string, body: string): Record<string, string> {
+function writeHeaders(signer: HubSigner | undefined, method: string, path: string, body: string, scope = ""): Record<string, string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (signer) headers["authorization"] = buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method, path, body });
+  if (signer) headers["authorization"] = buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method, path, body, scope });
   return headers;
 }
 
@@ -39,14 +57,14 @@ function writeHeaders(signer: HubSigner | undefined, method: string, path: strin
  * Best-effort by design: no signer, no header, and a read-public hub is unaffected. The
  * signature covers the method, so a captured GET credential cannot be replayed as a write.
  */
-function readHeaders(signer: HubSigner | undefined, path: string): Record<string, string> {
+function readHeaders(signer: HubSigner | undefined, path: string, scope = ""): Record<string, string> {
   if (!signer) return {};
-  return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "" }) };
+  return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "", scope }) };
 }
 
 /** GET /have → the set of oids the hub holds. */
 async function hubHave(hubUrl: string, signer?: HubSigner): Promise<Set<string>> {
-  const res = await fetch(`${hubUrl.replace(/\/$/, "")}/have`, { headers: readHeaders(signer, "/have") });
+  const res = await fetch(`${hubUrl.replace(/\/$/, "")}/have`, { headers: readHeaders(signer, "/have", scopeOf(hubUrl)) });
   if (!res.ok) throw new Error(`GET /have failed: ${res.status} ${res.statusText}`);
   const oids = (await res.json()) as string[];
   return new Set(oids);
@@ -67,7 +85,7 @@ async function readCursors(root: string): Promise<Record<string, number>> {
  */
 async function discover(base: string, since: number, signer?: HubSigner): Promise<{ oids: string[]; cursor: number | null }> {
   try {
-    const res = await fetch(`${base}/sync?since=${since}`, { headers: readHeaders(signer, "/sync") });
+    const res = await fetch(`${base}/sync?since=${since}`, { headers: readHeaders(signer, "/sync", scopeOf(base)) });
     if (res.ok) {
       const j = (await res.json()) as { oids: string[]; cursor: number };
       return { oids: j.oids, cursor: j.cursor };
@@ -103,7 +121,7 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
     const body = JSON.stringify(obj);
     const res = await fetch(`${base}/objects`, {
       method: "POST",
-      headers: writeHeaders(signWith, "POST", "/objects", body),
+      headers: writeHeaders(signWith, "POST", "/objects", body, scopeOf(base)),
       body,
     });
     if (res.status === 401) {
@@ -141,7 +159,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string, signWith
   let maxLamport = 0;
   for (const oid of oids) {
     if (await store.has(oid)) continue;
-    const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`, { headers: readHeaders(signWith, `/objects/${encodeURIComponent(oid)}`) });
+    const res = await fetch(`${base}/objects/${encodeURIComponent(oid)}`, { headers: readHeaders(signWith, `/objects/${encodeURIComponent(oid)}`, scopeOf(base)) });
     if (res.status === 404) continue; // raced eviction; skip
     if (!res.ok) throw new Error(`GET /objects/${oid} failed: ${res.status} ${res.statusText}`);
     const obj = (await res.json()) as AnyObject;
@@ -157,7 +175,7 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string, signWith
   // Governance distribution: adopt the hub's authoritative governance refs (policy,
   // membership, protection, protected heads). The objects they point to were just
   // pulled above, so the refs resolve. Working refs (view:*/checkpoint:*) stay local.
-  const refsRes = await fetch(`${base}/refs`, { headers: readHeaders(signWith, "/refs") });
+  const refsRes = await fetch(`${base}/refs`, { headers: readHeaders(signWith, "/refs", scopeOf(base)) });
   if (refsRes.ok) {
     const { refs } = (await refsRes.json()) as { refs: Record<string, string> };
     for (const [name, refOid] of Object.entries(refs)) {
@@ -196,7 +214,7 @@ export async function integrateWithHub(
     body.sig = { keyId: args.signWith.keyId, alg: "ed25519", sig: signMessage(args.signWith.privateKey, msg) };
   }
   const raw = JSON.stringify(body);
-  const res = await fetch(`${base}/integrate`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/integrate", raw), body: raw });
+  const res = await fetch(`${base}/integrate`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/integrate", raw, scopeOf(base)), body: raw });
   const j = (await res.json().catch(() => ({}))) as { verdict?: string; missingLocally?: string[] } & Record<string, unknown>;
   // 3. needs_evidence: fetch exactly the head-side delta so `materializeAt` can reproduce
   // the integrated tree locally (determinism guarantees the same treeHash).
@@ -235,7 +253,7 @@ export async function finalizeOnHub(
   // Two distinct signatures: body.sig authenticates the finalize INTENT (object layer), the
   // Authorization header authenticates the REQUEST (transport layer). Both use one keypair.
   const raw = JSON.stringify(body);
-  const res = await fetch(`${base}/finalize`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/finalize", raw), body: raw });
+  const res = await fetch(`${base}/finalize`, { method: "POST", headers: writeHeaders(args.signWith, "POST", "/finalize", raw, scopeOf(base)), body: raw });
   const j = (await res.json().catch(() => ({}))) as { finalized?: boolean; head?: string; reason?: string };
   return { status: res.status, finalized: j.finalized ?? false, head: j.head, reason: j.reason };
 }
