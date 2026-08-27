@@ -1085,6 +1085,45 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "shared": {
+      // Build-environment sharing (docs/21): the path rules whose content the core keeps out
+      // of the op graph but still puts in the directory. This command only EDITS the rules —
+      // the linking happens at projection time, and nothing here ever runs an install.
+      const repo = await Repo.open(cwd);
+      const sub = args[1];
+      if (!sub || sub === "ls") {
+        const entries = await repo.readSharedPaths();
+        if (!entries.length) { console.log("(no shared paths — `avcs shared add <path> --key-from <file>`)"); break; }
+        for (const e of entries) {
+          const keyFrom = e.keyFrom?.length ? e.keyFrom.join(",") : "(unkeyed — one cache for every workspace)";
+          console.log(`${e.path}  mode=${e.mode ?? "symlink"}  key-from=${keyFrom}`);
+        }
+      } else if (sub === "add") {
+        const path = args[2];
+        if (!path || path.startsWith("--")) throw new Error("usage: avcs shared add <path> [--key-from <file>[,<file>...]] [--mode symlink|copy]");
+        const keyFrom = (flag("--key-from") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+        const mode = flag("--mode");
+        if (mode && mode !== "symlink" && mode !== "copy") throw new Error(`--mode must be symlink or copy: ${mode}`);
+        await repo.addSharedPath({ path, keyFrom, ...(mode ? { mode: mode as "symlink" | "copy" } : {}) });
+        console.log(`shared: ${path} (mode=${mode ?? "symlink"}, key-from=${keyFrom.length ? keyFrom.join(",") : "(unkeyed)"})`);
+        if (!keyFrom.length) console.log("  warning: no --key-from, so EVERY workspace shares one cache regardless of its lockfiles (docs/21 §3.2)");
+      } else if (sub === "rm") {
+        // `--cache <key>` throws away a cache directory (docs/21 R2: the core only reports
+        // "non-empty", so a half-finished install is the caller's to discard).
+        const key = flag("--cache");
+        if (key) {
+          const dropped = await repo.dropSharedCache(key);
+          console.log(dropped ? `dropped shared cache ${key}` : `no shared cache ${key}`);
+          break;
+        }
+        const path = args[2];
+        if (!path) throw new Error("usage: avcs shared rm <path> | avcs shared rm --cache <key>");
+        console.log(await repo.removeSharedPath(path) ? `removed shared path ${path} (its cache is kept — use \`avcs gc --shared\`)` : `no shared path ${path}`);
+      } else {
+        throw new Error("usage: avcs shared <ls|add|rm> ...");
+      }
+      break;
+    }
     case "workspace": {
       // Native build/verify isolation (docs/16): project a workspace's view to a dir,
       // land it onto its base, or list landed workspaces. `project` is the physical
