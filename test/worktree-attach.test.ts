@@ -4,8 +4,9 @@
 // drive the real CLI through a real git repo.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile } from "node:fs/promises";
+import { execFileSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync, statSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -19,6 +20,12 @@ function avcs(cwd: string, args: string[]): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+const execFileAsync = promisify(execFile);
+/** Same call as `avcs`, but actually concurrent — the child runs while the caller awaits. */
+async function avcsAsync(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync(process.execPath, ["--experimental-strip-types", CLI, ...args], { cwd });
+  return stdout;
 }
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
@@ -172,4 +179,39 @@ test("init in a plain directory is unaffected", async () => {
 test("init in the main checkout of a repo with worktrees is unaffected", async () => {
   const { main } = await fixture();
   assert.match(avcs(main, ["init", "--no-hooks"]), /initialized|already/i);
+});
+
+test("two working trees committing at once share the store without corrupting it", async () => {
+  // The point of attaching is that N working trees write ONE store. That is also the thing
+  // most likely to go wrong: two `git commit`s racing on the same objects/refs/locks. Drive
+  // it through real CLI processes (separate PIDs, real file locks), not in-process calls.
+  const { main, linked } = await fixture();
+  avcs(linked, ["worktree", "attach"]);
+
+  const second = join(main, "..", "second");
+  execFileSync("git", ["-C", main, "worktree", "add", "-q", "-b", "topic-2", second], { stdio: "ignore" });
+  avcs(second, ["worktree", "attach"]);
+
+  await writeFile(join(linked, "from-topic.txt"), "topic\n");
+  await writeFile(join(second, "from-topic-2.txt"), "topic-2\n");
+
+  // Genuinely in flight together: execFile is async, so both children run at once. (Wrapping
+  // the sync variant in a promise would only interleave the awaits, never the processes.)
+  const both = await Promise.allSettled([
+    avcsAsync(linked, ["git-sync", "-m", "from topic"]),
+    avcsAsync(second, ["git-sync", "-m", "from topic-2"]),
+  ]);
+  for (const r of both) {
+    assert.equal(
+      r.status,
+      "fulfilled",
+      `both syncs must succeed, got: ${r.status === "rejected" ? String(r.reason) : ""}`,
+    );
+  }
+
+  // Each tree's branch became its own line, and the store survives its own integrity check.
+  const lines = avcs(main, ["lines"]);
+  assert.match(lines, /topic\b/);
+  assert.match(lines, /topic-2/);
+  assert.doesNotMatch(avcs(main, ["fsck"]), /corrupt|missing|broken/i);
 });
