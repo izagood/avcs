@@ -390,16 +390,6 @@ function resolvedPath(op: Operation, declared: string, alias: AliasCtx | undefin
   return resolvePath(alias.aliases, declared, op.oid as string, alias.descendsFromRename);
 }
 
-/** Every path an op may touch AFTER alias resolution — the incremental replay filter's
- *  view of "does this op read or write anything dirty?". A content op whose declared path
- *  was renamed away writes somewhere its `pathsOf` never mentions. */
-function effectivePathsOf(op: Operation, alias: AliasCtx | undefined): string[] {
-  const declared = pathsOf(op);
-  if (!alias) return declared;
-  const out = new Set(declared);
-  if (op.body.kind !== "rename_file") for (const p of declared) out.add(resolvedPath(op, p, alias));
-  return [...out];
-}
 
 /** Keep only the synth-blob entries the final tree actually references (drops the
  *  intermediate splices that get overwritten). Makes synthBlobs a pure function of the
@@ -465,13 +455,16 @@ function materializeIncremental(
   // The alias map is a function of the WHOLE projected rename set, never of the dirty
   // subset — otherwise the warm path would route ops differently from a cold reduce.
   const alias = aliasCtxFor(projected, anc);
-  // Replay only dirty-touching ops, in the SAME global order, into a fresh tree. "Touches"
-  // is measured on the RESOLVED paths as well as the declared ones: an op whose path was
-  // renamed away writes to a path its own body never names.
+  // Replay only dirty-touching ops, in the SAME global order, into a fresh tree. `pathsOf`
+  // is the DECLARED path, while `applyOp` writes at the alias-RESOLVED one; the two agree
+  // only because `dirtyPaths` marks both ends of every projected rename (see the caller's
+  // cross-path rule). If that ever narrows, an op could be replayed while the path it
+  // actually writes keeps a stale base entry, or be skipped while its resolved path was
+  // dropped as dirty. `AVCS_VERIFY_INCREMENTAL=1` and the C22 cases gate it.
   const replayTree = new Map<string, string>();
   const replaySynth = new Map<string, Buffer>();
   for (const op of ordered) {
-    if (effectivePathsOf(op, alias).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth, alias);
+    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth, alias);
   }
   // Final tree = clean base paths (not dirty) + replayed dirty paths.
   const tree = new Map<string, string>();
@@ -740,6 +733,16 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     // or the order its ops apply in (ancestry extension guards against lamport that is
     // not consistent with causality — real repo ops always are, but reduce() is pure).
     if (projectedNow(oid) !== projectedBase(oid) || ancestryExtended(oid)) for (const p of pathsOf(o)) dirtyPaths.add(p);
+    // Every projected rename dirties BOTH its ends, unconditionally — even when nothing
+    // about the rename itself changed. This is what makes path aliases safe on the warm
+    // path (docs/19 §3.2, §6 R2): the alias map is a function of the whole op set, so an
+    // arriving rename changes where PRE-EXISTING content ops write, and it can invalidate
+    // a cached entry at a path NOTHING in the delta mentions — e.g. a second move of an
+    // already-moved source has to vacate the first destination. Since every aliased path
+    // is by construction one end of some projected rename, dirtying both ends covers every
+    // path whose value the alias closure can shift. Narrowing this rule breaks warm/cold
+    // agreement; `AVCS_VERIFY_INCREMENTAL=1`, incremental-equivalence and the C22 cases in
+    // test/rename-incremental.test.ts are what catch it.
     else if (projectedNow(oid) && isCrossPath(o)) for (const p of pathsOf(o)) dirtyPaths.add(p);
   }
 
