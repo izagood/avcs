@@ -11,7 +11,13 @@
 // replica. The algorithm version is pinned into MATERIALIZER_VERSION so a different
 // merge implementation cannot silently diverge a replica's tree.
 
-export const MERGE3_VERSION = "text3/0.1.0";
+// 0.2.0 — file identity (docs/19). The merge of a single file's TEXT is unchanged; what
+// changed is which file a content op applies to: the reducer now resolves paths through the
+// rename closure, so an op set containing `rename_file` can reduce to a different (and
+// correct) tree than it did at 0.1.0. A rename-free op set is byte-identical either way.
+// The stamp moves so a replica still on the older substrate cannot silently disagree about
+// a rename-bearing one — `Checkpoint.materializerVersion` makes the mismatch explicit.
+export const MERGE3_VERSION = "text3/0.2.0";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
