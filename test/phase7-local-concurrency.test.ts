@@ -124,3 +124,67 @@ test("H-5: concurrent large writes/reads are atomic (no torn reads, no temp left
   assert.ok(blobs.length >= 25);
   await rm(dir, { recursive: true, force: true });
 });
+// A lock NAME is an identifier, not a path. Callers build names by interpolation —
+// `snapshot:${viewName}` — and a view named after a git branch carries a slash, so the
+// name reaches the filesystem as a nested path whose parent does not exist. `mkdir` then
+// fails ENOENT, which the acquire loop reads as "the locks dir isn't there yet", recreates
+// it, and retries — forever, at 100% CPU, never consulting maxWaitMs. Every first commit
+// in a `feature/x` working tree hung on this.
+test("a lock name containing a path separator acquires instead of spinning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-lock-sep-"));
+  const locks = join(dir, "locks");
+  await mkdir(locks, { recursive: true });
+
+  for (const name of ["snapshot:team/feature-x", "back\\slash", "a/b/c/deep"]) {
+    const got = await withLock(locks, name, async () => "ok", { maxWaitMs: 2000 });
+    assert.equal(got, "ok", `${name} should acquire`);
+  }
+});
+
+test("names that differ only by a separator do not share one lock", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-lock-collide-"));
+  const locks = join(dir, "locks");
+  await mkdir(locks, { recursive: true });
+
+  // Encoding must be injective: "a/b" and the literal text "a%2Fb" are different names and
+  // must not collide into the same lock file, or two unrelated critical sections serialize
+  // (or worse, one reclaims the other's lock as stale).
+  let inner = "not-run";
+  await withLock(locks, "a/b", async () => {
+    inner = await withLock(locks, "a%2Fb", async () => "independent", { maxWaitMs: 2000 });
+  }, { maxWaitMs: 2000 });
+  assert.equal(inner, "independent");
+});
+
+test("a separator-bearing name still serializes concurrent holders", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-lock-ser-"));
+  const locks = join(dir, "locks");
+  await mkdir(locks, { recursive: true });
+
+  let live = 0;
+  let maxLive = 0;
+  await Promise.all(
+    Array.from({ length: 8 }, () =>
+      withLock(locks, "snapshot:team/feature-x", async () => {
+        live++;
+        maxLive = Math.max(maxLive, live);
+        await delay(5);
+        live--;
+      }, { maxWaitMs: 5000 }),
+    ),
+  );
+  assert.equal(maxLive, 1, "the lock must admit one holder at a time");
+});
+
+test("finalize on a branch-derived view name does not spin", async () => {
+  // `finalize` and `integrationSubmit` both take `withLock("finalize:" + view)`. Views are
+  // routinely named after git branches, so `land`/submit on a `team/x` line walked into the
+  // same unbounded ENOENT retry as snapshot compaction did.
+  const dir = await mkdtemp(join(tmpdir(), "avcs-fin-slash-"));
+  const repo = await Repo.init(dir);
+  await repo.createLine("team/feature-x");
+  const cp = await repo.createCheckpoint("team/feature-x", "cp");
+
+  const res = await repo.finalize({ view: "team/feature-x", newCheckpoint: cp, parentHead: null, by: human.id });
+  assert.equal(res.finalized, true, `finalize should complete, got ${JSON.stringify(res)}`);
+});
