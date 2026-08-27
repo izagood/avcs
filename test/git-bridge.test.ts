@@ -204,7 +204,11 @@ test("gitSync decouples the single store from the projected working tree (workDi
   assert.deepEqual(files, ["app.ts"]);
 });
 
-test("git-sync from a linked git worktree shares one store and maps branch → line", { skip: !hasGit }, async () => {
+// docs/20 (#75): a topic branch maps to a converging WORKSPACE, not to a permanently
+// diverging line. This test previously asserted the line mapping — that expectation encoded
+// the mis-wiring #75 describes, so it is restated here, not weakened: everything about the
+// single shared store and the untouched base view is asserted exactly as before.
+test("git-sync from a linked git worktree shares one store and maps branch → workspace", { skip: !hasGit }, async () => {
   const main = await mkrepo();
   git(main, "init", "-b", "main");
   git(main, "config", "user.email", "t@t");
@@ -228,14 +232,21 @@ test("git-sync from a linked git worktree shares one store and maps branch → l
   // Single store: the worktree never grew its own .avcs (sidecar) — it used main's store.
   assert.ok(!existsSync(join(wt, ".avcs")), "worktree shares the one store, no divergent copy");
 
-  // Branch → line: the work landed on a `feature` line, isolated from main.
+  // Branch → workspace: the work is isolated in a `feature` workspace, not in a line.
   const reopened = await Repo.open(main);
-  const lines = (await reopened.listLines()).map((l) => l.name);
-  assert.ok(lines.includes("feature"), "the feature branch auto-created a matching avcs line");
-  const featFiles = (await reopened.materializedFiles(await reopened.materialize("feature"))).map((f) => f.path).sort();
-  assert.deepEqual(featFiles, ["base.ts", "feat.ts"], "feature line = main's base + the worktree edit");
+  assert.deepEqual((await reopened.listLines()).map((l) => l.name), [], "a topic branch does not mint a line");
+  assert.deepEqual(await reopened.workspaceNames(), ["feature"], "it mints a workspace of the branch's name");
+  const featFiles = (await reopened.materializedFiles(await reopened.materialize("main", { workspace: "feature" }))).map((f) => f.path).sort();
+  assert.deepEqual(featFiles, ["base.ts", "feat.ts"], "the feature workspace = base + the worktree edit");
   const mainFiles = (await reopened.materializedFiles(await reopened.materialize("main"))).map((f) => f.path);
-  assert.deepEqual(mainFiles, ["base.ts"], "main line is unaffected by the worktree's edit");
+  assert.deepEqual(mainFiles, ["base.ts"], "the base view is unaffected by the worktree's edit");
+  // Unlike a line, this work can converge: landing it merges the ops onto base.
+  await reopened.landWorkspace("feature");
+  assert.deepEqual(
+    (await reopened.materializedFiles(await reopened.materialize("main"))).map((f) => f.path).sort(),
+    ["base.ts", "feat.ts"],
+    "land joins the workspace's ops to the base view (docs/20 §3.4)",
+  );
 
   await rm(wt, { recursive: true, force: true });
 });

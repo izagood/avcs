@@ -120,6 +120,15 @@ interface IntegrationReservation {
  */
 export type GitMode = "sidecar" | "committed";
 
+/** The trunk branch assumed when `.avcs/config.json` records none (docs/20 §3.1). */
+export const DEFAULT_TRUNK = "main";
+/**
+ * The branch names that count as trunk when none is configured. The pre-trunk bridge
+ * special-cased exactly this pair, so keeping both is what makes an unconfigured repository
+ * — including a `master`-default one — behave as it always did (docs/20 W7).
+ */
+export const LEGACY_TRUNK_BRANCHES = ["main", "master"] as const;
+
 /**
  * A named hub URL persisted in `.avcs/remotes.json` (Phase 13.1). Per-replica
  * configuration — an aux file, never an object, never gossiped. `autoSync` +
@@ -1196,6 +1205,12 @@ export class Repo {
       }
       // required checks — unless an active break-glass Override waives them (Phase 12)
       const cp = await this.store.get<Checkpoint>(args.newCheckpoint);
+      // A workspace-scoped checkpoint (docs/20 §3.3) froze a tree containing ops that have
+      // not landed on the base line. Advancing a protected head to it would publish
+      // unlanded work under a verified head, so it is refused outright.
+      if (cp.workspace) {
+        return { finalized: false as const, reason: `checkpoint ${args.newCheckpoint.slice(0, 16)} is scoped to workspace ${cp.workspace} — land it first (\`avcs workspace land ${cp.workspace}\`)` };
+      }
       const waived = await this.#activeWaivers(args.view);
       for (const k of prot?.requiredChecks ?? []) {
         if (waived.has(k)) continue;
@@ -2013,6 +2028,18 @@ export class Repo {
   }
 
   /**
+   * Every workspace that actually carries operations. A workspace is not a stored object —
+   * it exists exactly as a tag on ops — so this is the only way to ask whether a NAME names
+   * anything. The `post-merge` land seam uses it as a guard: landing is append-only and
+   * irreversible, so a name it cannot corroborate is not landed (docs/20 §3.4, R1).
+   */
+  async workspaceNames(): Promise<string[]> {
+    const names = new Set<string>();
+    for (const op of await this.#allOpsTailed()) if (op.workspace) names.add(op.workspace);
+    return [...names].sort();
+  }
+
+  /**
    * Land a workspace onto its base line (docs/16): its ops join the base view and merge
    * there. There is no "rebase" — reduce always 3-way-merges the full op set, and any
    * overlap surfaces as a Conflict via the normal materialize path. Idempotent.
@@ -2049,16 +2076,21 @@ export class Repo {
     const inherited = await this.#inheritedOps(lineName, allOps);
 
     const wsName = opts?.workspace;
-    // A base view also includes ops from workspaces that have LANDED (promoted onto base).
-    const landed = wsName ? null : await this.#landedWorkspaces();
+    // Landing makes a workspace's ops BASE-ACCEPTED (docs/16 §4.3), so the landed set is
+    // read for EVERY view, not only base ones. A workspace view that ignored it would keep
+    // a sibling's already-landed work invisible and rediscover the conflict at land time
+    // (docs/20 §1.3).
+    const landed = await this.#landedWorkspaces();
     const ops: Operation[] = [];
     for (const op of allOps) {
       const onLine = (op.line ?? "main") === lineName || inherited.has(op.oid as string);
       if (!onLine) continue;
-      // Workspace isolation (docs/16): a base view excludes workspace-tagged ops UNLESS
-      // that workspace has landed; a workspace view (wsName=W) sees base ops + W's own.
+      // Workspace isolation (docs/16): a view excludes a workspace-tagged op unless that
+      // workspace has landed, or it is this view's OWN workspace. With `wsName` undefined
+      // the middle clause is vacuously true, so a BASE view's op set is exactly what it was
+      // — exclude tagged-and-unlanded, keep everything else.
       const opWs = op.workspace;
-      if (wsName ? (!!opWs && opWs !== wsName) : (!!opWs && !landed!.has(opWs))) continue;
+      if (opWs && opWs !== wsName && !landed.has(opWs)) continue;
       if (exclude.has(op.oid as string)) continue;
       if (intentFilter && !intentFilter.has(op.intentOid)) continue;
       if (sessionFilter && !sessionFilter.has(op.sessionOid)) continue;
@@ -2589,14 +2621,21 @@ export class Repo {
    * move into a delete racing an edit and a create with nothing to merge against. Recovered
    * moves are reported in `renamed` and are NOT double-counted in `added`/`removed`.
    *
-   * Capture also runs the early conflict warning with CROSS-LINE visibility: the git bridge
-   * maps each branch to its own line, so a competing session is on a *different* line and a
-   * line-scoped check would never see it. The warnings are returned (`contention`) so the CLI
-   * can put them in front of the human running `git commit`.
+   * `workspace` scopes the capture to a converging workspace (docs/20 §3.3) — the git bridge
+   * maps a topic branch to one. It has to reach BOTH ends: the authored ops carry the tag, and
+   * the projection this diffs against is the WORKSPACE's view. Diffing disk against the base
+   * view instead would re-capture the workspace's own earlier edits as brand-new changes on
+   * every commit, and — since a move is recovered from a removal paired with an addition —
+   * those stale removals could pair into renames that never happened.
+   *
+   * Capture also runs the early conflict warning with CROSS-LINE visibility: a competing
+   * session may be on a different line, and a line-scoped check would never see it. The
+   * warnings are returned (`contention`) so the CLI can put them in front of the human
+   * running `git commit`.
    */
   async commitWorkingTree(
     workDir: string,
-    opts: { message: string; actor: Actor; line?: string; ignorePredicate?: (rel: string) => boolean },
+    opts: { message: string; actor: Actor; line?: string; workspace?: string; ignorePredicate?: (rel: string) => boolean },
   ): Promise<{
     ops: string[];
     added: string[];
@@ -2609,7 +2648,9 @@ export class Repo {
     contention: ContentionWarning[];
   }> {
     const view = opts.line ?? "main";
-    const res = await this.materialize(view);
+    const ws = opts.workspace ? { workspace: opts.workspace } : {};
+    // The base to diff disk against is THIS scope's projection, workspace included.
+    const res = await this.materialize(view, ws);
     const current = new Map((await this.materializedBytes(res)).map((f) => [f.path, f.bytes]));
     const disk = await this.#readWorkTree(workDir, opts.ignorePredicate);
     let added: string[] = [];
@@ -2659,7 +2700,7 @@ export class Repo {
         sessionOid: sess, intentOid: intent, actor: opts.actor,
         target: { entityKind: "file", entityId: from },
         body: { kind: "rename_file", fromPath: from, path: to },
-        declaredPurpose: `move ${from} → ${to}`, causalDeps: deps, line: opts.line, ...warn,
+        declaredPurpose: `move ${from} → ${to}`, causalDeps: deps, line: opts.line, ...ws, ...warn,
       });
       ops.push(rn);
       const base = current.get(from)!;
@@ -2667,7 +2708,7 @@ export class Repo {
       if (base.equals(content)) continue; // a pure move needs no second op
       // Content changed on the way. Only mergeable text can say so as an edit; otherwise the
       // move stands and the new bytes go in byte-exact as a `put_file` at the new path.
-      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path: to, declaredPurpose: opts.message, causalDeps: [...deps, rn], line: opts.line, ...warn };
+      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path: to, declaredPurpose: opts.message, causalDeps: [...deps, rn], line: opts.line, ...ws, ...warn };
       ops.push(
         this.#isMergeableText(base) && this.#isMergeableText(content)
           ? await this.proposeEdit({ ...common, newText: content.toString("utf8"), baseBlobOid: await this.putBlob(base) })
@@ -2680,7 +2721,7 @@ export class Repo {
     for (const path of [...added, ...modified].sort()) {
       const content = disk.get(path)!;
       const base = isModified.has(path) ? current.get(path)! : undefined;
-      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path, declaredPurpose: opts.message, causalDeps: deps, line: opts.line, ...warn };
+      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path, declaredPurpose: opts.message, causalDeps: deps, line: opts.line, ...ws, ...warn };
       ops.push(
         base !== undefined && this.#isMergeableText(base) && this.#isMergeableText(content)
           ? await this.proposeEdit({ ...common, newText: content.toString("utf8"), baseBlobOid: await this.putBlob(base) })
@@ -2688,7 +2729,7 @@ export class Repo {
       );
     }
     for (const path of removed.sort()) {
-      ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...warn }));
+      ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...ws, ...warn }));
     }
     return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), renamed, intent, contention };
   }
@@ -2718,6 +2759,35 @@ export class Repo {
     await this.store.writeAux("config.json", JSON.stringify(cfg, null, 2) + "\n");
     await this.#writeGitignore(mode);
     this.logger.info("git.mode", { mode });
+  }
+
+  /**
+   * The git branch that carries the base view (docs/20 §3.1). The core stays git-agnostic:
+   * this is a recorded NAME, and only the bridge ever compares it against a real branch.
+   * Unset ⇒ `main`, which is what the bridge assumed before trunk existed.
+   */
+  async getTrunk(): Promise<string> {
+    const t = (await this.#readConfig()).trunk;
+    return typeof t === "string" && t.length ? t : DEFAULT_TRUNK;
+  }
+
+  /**
+   * Every branch name that counts as trunk. With `trunk` configured it is the single
+   * answer; with nothing configured BOTH `main` and `master` are trunk — exactly the pair
+   * the pre-trunk bridge special-cased, so an unconfigured repository (a `master`-default
+   * one included) keeps behaving as it always did (docs/20 W7).
+   */
+  async trunkBranches(): Promise<string[]> {
+    const t = (await this.#readConfig()).trunk;
+    return typeof t === "string" && t.length ? [t] : [...LEGACY_TRUNK_BRANCHES];
+  }
+
+  /** Record the trunk branch. Shares `config.json` with the git mode, so read-modify-write. */
+  async setTrunk(branch: string): Promise<void> {
+    const cfg = await this.#readConfig();
+    cfg.trunk = branch;
+    await this.store.writeAux("config.json", JSON.stringify(cfg, null, 2) + "\n");
+    this.logger.info("git.trunk", { trunk: branch });
   }
 
   /**
@@ -2838,7 +2908,7 @@ export class Repo {
    * Git invocation (`git add`) is intentionally left to the caller/CLI so this core stays
    * git-agnostic; `.avcs/.gitignore` (ensured here) makes a plain `git add -A` mode-correct.
    */
-  async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
+  async gitSync(opts: { message: string; actor: Actor; line?: string; workspace?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; renamed: { from: string; to: string }[]; intent: string };
     /** Cross-line early warnings the capture raised (docs/17 §15.3): another branch/session
@@ -2854,19 +2924,24 @@ export class Repo {
     const workDir = opts.workDir ?? this.dir;
     const view = opts.line ?? "main";
     const lineOpt = opts.line ? { line: opts.line } : {};
+    // A workspace scope (docs/20 §3.3) has to travel the WHOLE round trip: the capture tags
+    // its ops and diffs against the workspace's projection, the conflict gate reads the same
+    // view, and the re-projection writes it back. Any one of them left on base would make
+    // this working tree oscillate between two different trees.
+    const wsOpt = opts.workspace ? { workspace: opts.workspace } : undefined;
     // 1. Capture direct working-tree edits as ops before anything else.
-    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}) });
+    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(wsOpt ?? {}), ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}) });
     const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, renamed: cap.renamed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
     await this.#writeGitignore(mode);
     // 2. Conflict gate.
-    const res = await this.materialize(view);
+    const res = await this.materialize(view, wsOpt);
     if (res.conflicts.length > 0) return { mode, captured, contention: cap.contention, conflicts: res.conflicts };
     // 3. Checkpoint the verified state. 4. Re-project the working tree.
-    const checkpoint = await this.createCheckpoint(view, opts.message);
-    const written = await this.checkoutInto(workDir, view);
-    this.logger.info("git.sync", { view, mode, capturedOps: captured.ops.length, checkpoint, treeHash: res.treeHash });
+    const checkpoint = await this.createCheckpoint(view, opts.message, wsOpt);
+    const written = await this.checkoutInto(workDir, view, wsOpt);
+    this.logger.info("git.sync", { view, mode, workspace: opts.workspace, capturedOps: captured.ops.length, checkpoint, treeHash: res.treeHash });
     return { mode, captured, contention: cap.contention, conflicts: [], checkpoint, treeHash: res.treeHash, reprojected: written.length };
   }
 
@@ -3296,9 +3371,16 @@ export class Repo {
     }
   }
 
-  async createCheckpoint(viewName: string, summary: string): Promise<string> {
+  /**
+   * Freeze a view's verified state. `workspace` freezes that WORKSPACE's projection instead
+   * of the bare base view (docs/20 §3.3): a commit on a topic branch contains the workspace's
+   * tree, so a checkpoint of the base view would describe a tree git does not hold and
+   * `avcs verify-git` would report every such commit as a mismatch. The scope is recorded on
+   * the checkpoint so it can never be mistaken for a base-view one (`finalize` refuses it).
+   */
+  async createCheckpoint(viewName: string, summary: string, opts?: { workspace?: string }): Promise<string> {
     const view = await this.getView(viewName);
-    const result = await this.materialize(viewName);
+    const result = await this.materialize(viewName, opts?.workspace ? { workspace: opts.workspace } : undefined);
     const evidence: Checkpoint["evidence"] = {};
     const evidenceBinding: NonNullable<Checkpoint["evidenceBinding"]> = {};
     // Deterministic aggregation: process evidence in canonical (createdAt, oid) order
@@ -3334,12 +3416,15 @@ export class Repo {
       // Only present when some evidence aggregated — an evidence-less checkpoint's
       // bytes (and oid) are identical to pre-13.4.
       ...(Object.keys(evidenceBinding).length ? { evidenceBinding } : {}),
+      ...(opts?.workspace ? { workspace: opts.workspace } : {}),
       status: result.conflicts.length === 0 ? "verified" : "draft",
       summary,
       createdAt: new Date().toISOString(),
     };
     const oid = await this.store.put(cp);
-    await this.store.setRef(`checkpoint:${viewName}:latest`, oid);
+    // `checkpoint:<view>:latest` names the view's own latest state; a workspace checkpoint is
+    // a different tree, so it gets its own ref rather than displacing the base view's.
+    await this.store.setRef(opts?.workspace ? `checkpoint:${viewName}:workspace:${opts.workspace}:latest` : `checkpoint:${viewName}:latest`, oid);
     return oid;
   }
 
