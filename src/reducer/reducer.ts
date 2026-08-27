@@ -20,6 +20,7 @@ import type {
   Policy,
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
+import { buildAliasMap, resolvePath, type AliasMap } from "./aliases.ts";
 import { merge3, type ConflictRegion } from "../merge/merge3.ts";
 import { ownersFor } from "../policy/owners.ts";
 import { isBinary } from "../core/bytes.ts";
@@ -214,6 +215,13 @@ export interface FileConflict {
  *
  * No language knowledge — merge3 compares lines. Ancestor relations (an edit built on a
  * prior edit) are not concurrent and never flagged. Deterministic over canonical order.
+ *
+ * "The same file" means the same ALIAS-RESOLVED path, not the same declared one (docs/19
+ * §3.2). Two concurrent edits can reach one file by two names — one naming the path from
+ * before a move, the other naming it after — and bucketing them by whichever name each op
+ * happened to use would put them in separate buckets, never compare them, and let the
+ * loser's overlapping change disappear without a word. With no renames in the op set,
+ * resolution is the identity and the buckets are exactly the declared paths, as before.
  */
 export function detectFileConflicts(
   ops: Operation[],
@@ -221,12 +229,15 @@ export function detectFileConflicts(
   blobContent: Map<string, Buffer>,
 ): FileConflict[] {
   const anc = ancestry(ops);
+  // Built from the same status filter the bucket loop below uses, so the aliases describe
+  // exactly the ops being bucketed.
+  const alias = aliasCtxFor(ops.filter((o) => result.statuses.get(o.oid as string) === "accepted"), anc);
   const resolve = (oid: string | undefined): Buffer => (oid ? blobContent.get(oid) ?? Buffer.alloc(0) : Buffer.alloc(0));
   const byFile = new Map<string, Operation[]>();
   for (const o of ops) {
     if (o.body.kind !== "edit_file") continue;
     if (result.statuses.get(o.oid as string) !== "accepted") continue;
-    const f = o.body.path ?? o.target.entityId;
+    const f = resolvedPath(o, o.body.path ?? o.target.entityId, alias);
     (byFile.get(f) ?? byFile.set(f, []).get(f)!).push(o);
   }
   const out: FileConflict[] = [];
@@ -351,6 +362,35 @@ function isCrossPath(op: Operation): boolean {
   return op.body.kind === "rename_file";
 }
 
+/** Ops that carry the file's WHOLE content (or its absence) for one path. */
+const CONTENT_KINDS = new Set<string>(["put_file", "edit_file", "delete_file"]);
+
+/**
+ * Everything the alias layer needs to route an op: the map, plus the causal test that
+ * decides whether an op is speaking about the pre-move or the post-move world.
+ */
+interface AliasCtx {
+  aliases: AliasMap;
+  descendsFromRename: (opOid: string, renameOid: string) => boolean;
+}
+
+/** Build the alias context for a set of PROJECTED ops (docs/19 §3.2 Pass A). Only the
+ *  renames that actually reach the tree may move anything, so the map is derived from
+ *  the projected set — exactly the set `applyOp` will replay. */
+function aliasCtxFor(projected: Operation[], anc: Map<string, Set<string>>): AliasCtx {
+  const renames = projected.filter((o) => o.body.kind === "rename_file");
+  const descendsFromRename = (opOid: string, renameOid: string): boolean => anc.get(opOid)?.has(renameOid) ?? false;
+  const isConcurrent = (a: string, b: string): boolean => !descendsFromRename(a, b) && !descendsFromRename(b, a);
+  return { aliases: buildAliasMap(renames, isConcurrent), descendsFromRename };
+}
+
+/** The path an op actually writes, after the rename closure. */
+function resolvedPath(op: Operation, declared: string, alias: AliasCtx | undefined): string {
+  if (!alias) return declared;
+  return resolvePath(alias.aliases, declared, op.oid as string, alias.descendsFromRename);
+}
+
+
 /** Keep only the synth-blob entries the final tree actually references (drops the
  *  intermediate splices that get overwritten). Makes synthBlobs a pure function of the
  *  final tree — which is what lets the incremental path reuse base entries exactly. */
@@ -384,9 +424,10 @@ function materializeProjection(
 ): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
+  const alias = aliasCtxFor(projected, anc);
   const tree = new Map<string, string>();
   const synthBlobs = new Map<string, Buffer>();
-  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs);
+  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs, alias);
   return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthBlobs) };
 }
 
@@ -411,11 +452,19 @@ function materializeIncremental(
 ): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
-  // Replay only dirty-touching ops, in the SAME global order, into a fresh tree.
+  // The alias map is a function of the WHOLE projected rename set, never of the dirty
+  // subset — otherwise the warm path would route ops differently from a cold reduce.
+  const alias = aliasCtxFor(projected, anc);
+  // Replay only dirty-touching ops, in the SAME global order, into a fresh tree. `pathsOf`
+  // is the DECLARED path, while `applyOp` writes at the alias-RESOLVED one; the two agree
+  // only because `dirtyPaths` marks both ends of every projected rename (see the caller's
+  // cross-path rule). If that ever narrows, an op could be replayed while the path it
+  // actually writes keeps a stale base entry, or be skipped while its resolved path was
+  // dropped as dirty. `AVCS_VERIFY_INCREMENTAL=1` and the C22 cases gate it.
   const replayTree = new Map<string, string>();
   const replaySynth = new Map<string, Buffer>();
   for (const op of ordered) {
-    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth);
+    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth, alias);
   }
   // Final tree = clean base paths (not dirty) + replayed dirty paths.
   const tree = new Map<string, string>();
@@ -684,6 +733,16 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     // or the order its ops apply in (ancestry extension guards against lamport that is
     // not consistent with causality — real repo ops always are, but reduce() is pure).
     if (projectedNow(oid) !== projectedBase(oid) || ancestryExtended(oid)) for (const p of pathsOf(o)) dirtyPaths.add(p);
+    // Every projected rename dirties BOTH its ends, unconditionally — even when nothing
+    // about the rename itself changed. This is what makes path aliases safe on the warm
+    // path (docs/19 §3.2, §6 R2): the alias map is a function of the whole op set, so an
+    // arriving rename changes where PRE-EXISTING content ops write, and it can invalidate
+    // a cached entry at a path NOTHING in the delta mentions — e.g. a second move of an
+    // already-moved source has to vacate the first destination. Since every aliased path
+    // is by construction one end of some projected rename, dirtying both ends covers every
+    // path whose value the alias closure can shift. Narrowing this rule breaks warm/cold
+    // agreement; `AVCS_VERIFY_INCREMENTAL=1`, incremental-equivalence and the C22 cases in
+    // test/rename-incremental.test.ts are what catch it.
     else if (projectedNow(oid) && isCrossPath(o)) for (const p of pathsOf(o)) dirtyPaths.add(p);
   }
 
@@ -775,6 +834,63 @@ export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
   return { input, result, perKey, groupOrder: s.groupOrder as string[], groupMembers: entriesToMap(s.groupMembers as Entries<string[]>), stats };
 }
 
+/**
+ * Is `o`'s tree effect fully carried by some later op in the same group, so that dropping
+ * `o` from the projection loses nothing?
+ *
+ * A content op (`put_file`/`edit_file`/`delete_file`) states the file's whole content for
+ * one path, so a causally later content op on the same key does subsume an earlier one.
+ * Two things do NOT:
+ *
+ *   - A `rename_file` carries no content. It neither subsumes a content op nor is
+ *     subsumed by one; a move followed by anything still has to be replayed or the file
+ *     it moved never reaches the destination.
+ *   - A content op on a path a rename VACATED in between. `put_file(P)` after
+ *     `rename(P→Q)` is a different file that happens to reuse the name, so it cannot
+ *     stand in for the `put_file(P)` whose content went to Q.
+ *
+ * Before path aliases existed this distinction was invisible, because a group's covered
+ * ops were dropped wholesale and a rename found nothing to move — which is why a plain
+ * create-then-move materialized an empty tree.
+ */
+function subsumedInGroup(o: Operation, groupOps: Operation[], anc: Map<string, Set<string>>): boolean {
+  if (!CONTENT_KINDS.has(o.body.kind)) return false;
+  const oid = o.oid as string;
+  const descendsFrom = (x: Operation, id: string): boolean => anc.get(x.oid as string)?.has(id) ?? false;
+  for (const later of groupOps) {
+    if (later === o || !descendsFrom(later, oid)) continue;
+    if (!CONTENT_KINDS.has(later.body.kind)) continue;
+    const separated = groupOps.some(
+      (z) => z.body.kind === "rename_file" && descendsFrom(z, oid) && descendsFrom(later, z.oid as string),
+    );
+    if (!separated) return true;
+  }
+  return false;
+}
+
+/**
+ * Does this contended group's frontier consist of a move plus concurrent edits of the
+ * file being moved — the combination Pass B composes rather than contests?
+ *
+ * Requires the group key to be the rename's SOURCE. When the key is the DESTINATION the
+ * ops are genuinely fighting over who occupies that path (`rename(A→C)` ∥ `edit(C)`),
+ * which the alias map cannot compose and a human must settle. Renames present must all
+ * agree on the destination, so concurrent multi-destination moves (docs/19 C13) stay a
+ * conflict. And only `edit_file` composes: a concurrent `put_file` has no merge base
+ * (docs/15 §3), while `delete_file` ∥ rename keeps whatever it meant before (docs/19 R5).
+ */
+function composesWithRename(key: string, viable: Operation[]): boolean {
+  const path = key.startsWith("file:") ? key.slice("file:".length) : undefined;
+  if (path === undefined) return false;
+  const renames = viable.filter((o) => o.body.kind === "rename_file");
+  if (renames.length === 0) return false;
+  if (!renames.every((r) => (r.body.fromPath ?? r.target.entityId) === path)) return false;
+  if (new Set(renames.map((r) => r.body.path)).size !== 1) return false;
+  return viable.every(
+    (o) => o.body.kind === "rename_file" || (o.body.kind === "edit_file" && (o.body.path ?? o.target.entityId) === path),
+  );
+}
+
 function decideGroup(
   key: string,
   groupOps: Operation[],
@@ -786,12 +902,17 @@ function decideGroup(
   autoDecisions: AutoDecision[],
 ): Map<string, OperationStatus> {
   const out = new Map<string, OperationStatus>();
-  // Frontier of this group: ops not an ancestor of another group member.
+  // Frontier of this group: ops not an ancestor of another group member. Only the frontier
+  // can contend — an op some later op was built on top of is history, not a competitor.
   const heads = groupOps.filter((o) => {
     for (const other of groupOps) if (other !== o && anc.get(other.oid as string)?.has(o.oid as string)) return false;
     return true;
   });
-  for (const o of groupOps) if (!heads.includes(o)) out.set(o.oid as string, "superseded");
+  // Being off the frontier is not the same as being redundant. A covered op is dropped
+  // from the projection ("superseded") only when a later op actually SUBSUMES its effect;
+  // otherwise it still has to be replayed or its contribution to the tree is destroyed.
+  for (const o of groupOps)
+    if (!heads.includes(o)) out.set(o.oid as string, subsumedInGroup(o, groupOps, anc) ? "superseded" : "accepted");
 
   // 1) Honor explicit human decisions first (H1) — globally, regardless of grouping.
   const forcedAccept = heads.filter((o) => verdicts.get(o.oid as string) === "accept");
@@ -833,6 +954,15 @@ function decideGroup(
   // (A winner-pick would silently lose the loser's non-overlapping changes.) When a
   // human is required (e.g. declared API break) we still fall through to escalation.
   if (viable.length > 1 && !needsHuman && viable.every((o) => o.body.kind === "edit_file")) {
+    for (const o of viable) out.set(o.oid as string, "accepted");
+    return out;
+  }
+
+  // A move and a concurrent edit of the file being moved also compose (docs/19 §3.2):
+  // Pass B routes the edit to the rename's destination, so there is nothing to choose
+  // between — the two changes are independent and both survive. See `composesWithRename`
+  // for which combinations this deliberately does NOT cover.
+  if (viable.length > 1 && !needsHuman && composesWithRename(key, viable)) {
     for (const o of viable) out.set(o.oid as string, "accepted");
     return out;
   }
@@ -944,23 +1074,35 @@ function kahnOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[]
   return order;
 }
 
+/**
+ * Apply one projected op to the tree.
+ *
+ * Every content op is applied at its ALIAS-RESOLVED path, not at the path its body names
+ * (docs/19 §3.2 Pass B). That is what makes `rename_file` and `edit_file` commute: the
+ * edit lands where the file actually lives regardless of which of the two the canonical
+ * order put first. With no renames in the op set the alias map is empty, resolution is
+ * the identity, and this function behaves exactly as it did before.
+ */
 function applyOp(
   tree: Map<string, string>,
   op: Operation,
   blobContent: Map<string, Buffer>,
   synthBlobs: Map<string, Buffer>,
+  alias?: AliasCtx,
 ): void {
   const b = op.body;
   const resolve = (oid: string): Buffer => synthBlobs.get(oid) ?? blobContent.get(oid) ?? Buffer.alloc(0);
+  const at = (declared: string): string => resolvedPath(op, declared, alias);
   switch (b.kind) {
     case "put_file":
-      if (b.path && b.blobOid) tree.set(b.path, b.blobOid);
+      if (b.path && b.blobOid) tree.set(at(b.path), b.blobOid);
       break;
     case "edit_file": {
       if (!b.path || !b.blobOid) break;
+      const path = at(b.path);
       const opNew = resolve(b.blobOid);
       const opBase = b.baseBlobOid ? resolve(b.baseBlobOid) : Buffer.alloc(0);
-      const currentOid = tree.get(b.path);
+      const currentOid = tree.get(path);
       const current = currentOid !== undefined ? resolve(currentOid) : opBase;
       // Binary route: a NUL byte means line-merge is meaningless. Skip merge3 and keep a
       // deterministic incumbent — leave the existing tree entry (currentOid) untouched if
@@ -969,7 +1111,7 @@ function applyOp(
         if (currentOid !== undefined) break; // incumbent stays; tree unchanged
         const synthOid = `blob_${sha256hex(opNew).slice(0, 32)}`;
         synthBlobs.set(synthOid, opNew);
-        tree.set(b.path, synthOid);
+        tree.set(path, synthOid);
         break;
       }
       // Apply this op's patch (opBase→opNew) onto the accumulated content. Disjoint
@@ -980,21 +1122,31 @@ function applyOp(
       const mergedBuf = Buffer.from(m.merged, "utf8");
       const synthOid = `blob_${sha256hex(mergedBuf).slice(0, 32)}`;
       synthBlobs.set(synthOid, mergedBuf);
-      tree.set(b.path, synthOid);
+      tree.set(path, synthOid);
       break;
     }
     case "delete_file":
-      tree.delete(b.path ?? op.target.entityId);
+      tree.delete(at(b.path ?? op.target.entityId));
       break;
-    case "rename_file":
-      if (b.fromPath && b.path) {
-        const blob = tree.get(b.fromPath);
-        if (blob !== undefined) {
-          tree.delete(b.fromPath);
-          tree.set(b.path, blob);
-        }
+    case "rename_file": {
+      if (!b.fromPath || !b.path) break;
+      // A rename the alias map resolved has nothing left to move: every content op that
+      // predates or is concurrent with it was already routed to the destination, so the
+      // source path was never written. This replaces the old "move whatever happens to be
+      // at fromPath right now", which is precisely where the order dependence lived — the
+      // answer depended on how many content ops the canonical order had applied by then.
+      //
+      // A rename the map could NOT resolve (a contested source: concurrent moves to
+      // different destinations, or a cycle) keeps the original behaviour, so a contest
+      // that a human resolves down to one rename still moves the file.
+      if (alias?.aliases.final.has(b.fromPath)) break;
+      const blob = tree.get(b.fromPath);
+      if (blob !== undefined) {
+        tree.delete(b.fromPath);
+        tree.set(b.path, blob);
       }
       break;
+    }
     case "note":
       break;
   }

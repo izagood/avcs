@@ -637,6 +637,7 @@ async function main(): Promise<void> {
       for (const p of r.added) console.log(`  A ${p}`);
       for (const p of r.modified) console.log(`  M ${p}`);
       for (const p of r.removed) console.log(`  D ${p}`);
+      for (const m of r.renamed) console.log(`  R ${m.from} -> ${m.to}`);
       reportContention(r.contention);
       console.log(`committed ${r.ops.length} change(s) as "${message}"`);
       break;
@@ -684,6 +685,7 @@ async function main(): Promise<void> {
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
+      for (const m of r.captured.renamed) console.log(`  R ${m.from} -> ${m.to}`);
       reportContention(r.contention);
       if (r.conflicts.length) {
         console.error(`\n✗ ${r.conflicts.length} open conflict(s) need a human — refusing to stage a conflicted tree.`);
