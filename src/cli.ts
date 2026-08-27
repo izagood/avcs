@@ -20,6 +20,7 @@ import { dirname, join, isAbsolute, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
 import { Repo, type GitMode } from "./api/repo.ts";
+import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import type { Operation, Actor } from "./objects/types.ts";
 import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
@@ -124,14 +125,56 @@ function gitModeOfStore(storeRoot: string): GitMode {
   }
 }
 
-/** The AVCS line a working dir maps to: an explicit `--line` wins; otherwise the current
- *  git branch (so each worktree/branch commits to its own line), with main/master → the
- *  default `main` line. Detached HEAD or non-git → the default line. */
-function lineFor(dir: string, explicit?: string): string | undefined {
-  if (explicit) return explicit;
+/**
+ * The AVCS scope a working dir writes into (docs/20 §3.2): the current git branch, mapped
+ * through this repo's trunk setting. A topic branch is work that intends to CONVERGE, so it
+ * maps to a workspace, not to a line — a line is permanent divergence and stays opt-in via
+ * `--line`. This replaces the earlier `lineFor`, which made every topic branch a line and so
+ * gave each one a history the others could never see (docs/20 §1.1).
+ *
+ * The `line:<branch>` lookup is what protects work started before this mapping existed: such
+ * a branch keeps writing to the line it has been accumulating in (case W9).
+ */
+async function scopeFor(repo: Repo, dir: string, explicitLine?: string): Promise<BranchScope> {
+  if (explicitLine) return { line: explicitLine };
   const branch = gitCmd(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (!branch || branch === "HEAD" || branch === "main" || branch === "master") return undefined;
-  return branch;
+  const hasExistingLine = !!branch && !!(await repo.store.getRef(`line:${branch}`));
+  return scopeForBranch(branch, await repo.trunkBranches(), { hasExistingLine });
+}
+
+/** How to name a scope in output meant for a human. */
+function scopeLabel(scope: BranchScope): string {
+  return scope.workspace ? `workspace ${scope.workspace}` : scope.line ? `line ${scope.line}` : "base view";
+}
+
+/**
+ * Turn a completed git merge into an AVCS workspace land (docs/20 §3.4) — the point of the
+ * whole track: convergence recorded inside the graph rather than only in git.
+ *
+ * Every branch of this function that is not an unmistakable workspace land DECLINES, with the
+ * reason, because `landWorkspace` is append-only and irreversible: landing the wrong
+ * workspace publishes someone's unfinished work onto base and cannot be undone, which is
+ * strictly worse than landing nothing (docs/20 R1). `post-merge` runs after `MERGE_HEAD` is
+ * gone, so git's reflog is the only record of what was merged.
+ */
+async function landMergedWorkspace(
+  repo: Repo,
+  dir: string,
+): Promise<{ landed: string } | { declined: string; needsHuman: boolean }> {
+  const subject = gitCmd(dir, ["reflog", "-1", "--format=%gs"]);
+  const branch = mergedBranchFromReflog(subject);
+  // Could not tell WHAT was merged — the one case where a land may well be owed and only a
+  // human can say so (a squash merge lands here, docs/20 R2).
+  if (!branch) return { declined: `git's reflog names no single merged branch (\`${subject ?? "?"}\`)`, needsHuman: true };
+  // Nothing to land: pulling trunk into trunk, or merging a line (divergence ported on
+  // purpose, never landed). Both are ordinary and need no human.
+  if ((await repo.trunkBranches()).includes(branch)) return { declined: `\`${branch}\` is trunk — nothing to land`, needsHuman: false };
+  if (await repo.store.getRef(`line:${branch}`)) return { declined: `\`${branch}\` is an avcs line, not a workspace — lines are ported, not landed`, needsHuman: false };
+  // The name is a plausible workspace but nothing was ever captured under it, so landing it
+  // would record a land of an empty set. Say so: the real tag may simply be named differently.
+  if (!(await repo.workspaceNames()).includes(branch)) return { declined: `no operation is tagged workspace \`${branch}\``, needsHuman: true };
+  await repo.landWorkspace(branch);
+  return { landed: branch };
 }
 
 /** An ignore predicate backed by `git check-ignore`, so `git-sync` respects `.gitignore`
@@ -246,6 +289,20 @@ async function main(): Promise<void> {
       await repo.setGitMode(mode);
       console.log(`initialized AVCS repo at ${dir}/.avcs  [git mode: ${mode}]`);
       if (mode === "sidecar") console.log(`  .avcs/ is git-ignored — git tracks only the projection (run \`avcs git-mode committed\` to share history via git)`);
+      // Record the trunk branch when — and only when — git can name it without guessing
+      // (docs/20 §3.1, Q2). `refs/remotes/origin/HEAD` is the REMOTE's default branch, so
+      // this cannot misfire from `avcs init` being run on a topic branch, the way reading
+      // the current branch would. A repo whose trunk is main/master needs no field at all:
+      // unset already means exactly that pair, so nothing is written and the pre-trunk
+      // behaviour is preserved byte-for-byte (W7). No git, no origin, no field either.
+      if ((await repo.trunkBranches()).length > 1) {
+        const head = gitCmd(dir, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+        const remoteDefault = head?.startsWith("origin/") ? head.slice("origin/".length) : null;
+        if (remoteDefault && !(await repo.trunkBranches()).includes(remoteDefault)) {
+          await repo.setTrunk(remoteDefault);
+          console.log(`  detected trunk: ${remoteDefault} (origin's default branch) — \`avcs trunk <branch>\` to change`);
+        }
+      }
       // If this is a git repo, offer to install the bridge hooks so `git commit` just works.
       if (!args.includes("--no-hooks")) {
         const { execFileSync } = await import("node:child_process");
@@ -316,8 +373,14 @@ async function main(): Promise<void> {
     }
     case "conflicts": {
       const repo = await Repo.open(cwd);
-      const view = args[1] ?? "main";
-      const res = await repo.materialize(view);
+      // Default to the scope this working tree is actually writing into: on a topic branch the
+      // conflicts that matter are the WORKSPACE's, and a base-view listing would report "none"
+      // while `git-sync` refuses to stage the very tree they are in.
+      const scope = await scopeFor(repo, cwd);
+      const view = (args[1] && !args[1].startsWith("--") ? args[1] : undefined) ?? scope.line ?? "main";
+      const workspace = flag("--workspace") ?? scope.workspace;
+      const res = await repo.materialize(view, workspace ? { workspace } : undefined);
+      if (workspace) console.log(`(workspace ${workspace} over ${view})`);
       if (!res.conflicts.length) {
         console.log("no open conflicts — nothing needs a human.");
         break;
@@ -631,15 +694,18 @@ async function main(): Promise<void> {
       const message = flag("-m") ?? flag("--message");
       if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>]");
       const author = flag("--author") ?? "human:cli";
-      const line = flag("--line");
-      const r = await repo.commitWorkingTree(cwd, { message, actor: { kind: "human", id: author }, ...(line ? { line } : {}) });
+      // Same branch → scope mapping as the git bridge, so a capture is in the same place
+      // whichever command made it. Outside git this resolves to the base view, as before.
+      const scope = await scopeFor(repo, cwd, flag("--line"));
+      await ensureLine(repo, scope.line);
+      const r = await repo.commitWorkingTree(cwd, { message, actor: { kind: "human", id: author }, ...scope });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
       for (const p of r.added) console.log(`  A ${p}`);
       for (const p of r.modified) console.log(`  M ${p}`);
       for (const p of r.removed) console.log(`  D ${p}`);
       for (const m of r.renamed) console.log(`  R ${m.from} -> ${m.to}`);
       reportContention(r.contention);
-      console.log(`committed ${r.ops.length} change(s) as "${message}"`);
+      console.log(`committed ${r.ops.length} change(s) into ${scopeLabel(scope)} as "${message}"`);
       break;
     }
     case "worktree": {
@@ -679,9 +745,9 @@ async function main(): Promise<void> {
       const message = flag("-m") ?? flag("--message");
       if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--no-add]");
       const author = flag("--author") ?? "human:cli";
-      const line = lineFor(cwd, flag("--line"));
-      await ensureLine(repo, line);
-      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
+      const scope = await scopeFor(repo, cwd, flag("--line"));
+      await ensureLine(repo, scope.line);
+      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
@@ -689,11 +755,11 @@ async function main(): Promise<void> {
       reportContention(r.contention);
       if (r.conflicts.length) {
         console.error(`\n✗ ${r.conflicts.length} open conflict(s) need a human — refusing to stage a conflicted tree.`);
-        console.error(`  run \`avcs conflicts ${line ?? "main"}\` to review; resolve, then re-run git-sync.`);
+        console.error(`  run \`avcs conflicts\` to review (it inspects ${scopeLabel(scope)}); resolve, then re-run git-sync.`);
         process.exitCode = 1;
         break;
       }
-      console.log(`captured ${r.captured.ops.length} op(s) · checkpoint ${r.checkpoint!.slice(0, 16)}… · treeHash ${r.treeHash!.slice(0, 12)}…`);
+      console.log(`captured ${r.captured.ops.length} op(s) into ${scopeLabel(scope)} · checkpoint ${r.checkpoint!.slice(0, 16)}… · treeHash ${r.treeHash!.slice(0, 12)}…`);
       console.log(`reprojected ${r.reprojected} file(s)  [git mode: ${r.mode}]`);
       const wantCommit = args.includes("--commit");
       if (!args.includes("--no-add") || wantCommit) {
@@ -773,6 +839,22 @@ async function main(): Promise<void> {
       else console.log(`  .avcs/ is now git-ignored; \`git rm -r --cached .avcs\` to stop tracking already-committed history`);
       break;
     }
+    case "trunk": {
+      // The branch that carries the base view (docs/20 §3.1). Everything else on this repo's
+      // branches is a converging workspace, so this one setting decides the whole mapping.
+      const repo = await Repo.open(cwd);
+      const want = args[1];
+      if (!want || want.startsWith("--")) {
+        console.log(`trunk: ${await repo.getTrunk()}`);
+        const branches = await repo.trunkBranches();
+        if (branches.length > 1) console.log(`  (not configured — ${branches.join(" and ")} both count as trunk, as before \`avcs trunk\` existed)`);
+        console.log(`  every other branch maps to a workspace of the same name; \`git merge\` into trunk lands it`);
+        break;
+      }
+      await repo.setTrunk(want);
+      console.log(`trunk set to: ${want}`);
+      break;
+    }
     case "reindex": {
       const repo = await Repo.open(cwd);
       const r = await repo.reindex();
@@ -823,7 +905,6 @@ async function main(): Promise<void> {
         }
         break; // never blocks the checkout
       }
-      const line = lineFor(cwd);
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
       // cwd is the working tree (possibly a linked git worktree); the store may live in
       // the main checkout. Opening the store can itself block under contention, so bound it.
@@ -839,8 +920,11 @@ async function main(): Promise<void> {
           // re-stage the canonical projection, and stash the provenance for the next hooks.
           const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
           const res = await withDeadline(async () => {
-            await ensureLine(repo, line);
-            return repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
+            // docs/20 §3.3: on trunk this captures to the base view; on a topic branch it
+            // captures into that branch's workspace, where it stays isolated until it lands.
+            const scope = await scopeFor(repo, cwd);
+            await ensureLine(repo, scope.line);
+            return repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
           if (!res.ok) {
             console.error(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
@@ -899,13 +983,28 @@ async function main(): Promise<void> {
           // old behavior plus a checkpoint.
           const res = await withDeadline(async () => {
             await repo.reindex();
-            await ensureLine(repo, line);
-            return repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
+            // docs/20 §3.4 — the seam this track exists for: a merge into trunk IS the land
+            // of the merged branch's workspace. It runs BEFORE the capture on purpose. Once
+            // landed, those ops are in the base view, so the merged content already projects
+            // and the capture below has nothing to re-author; land afterwards and the same
+            // content would be captured a second time as untagged base ops.
+            const outcome = await landMergedWorkspace(repo, cwd);
+            const scope = await scopeFor(repo, cwd);
+            await ensureLine(repo, scope.line);
+            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+            return { outcome, scope, sync };
           }, hookMs);
           if (!res.ok) console.error(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
           else {
-            reportContention(res.value.contention);
-            if (res.value.conflicts.length) console.error(`avcs: ${res.value.conflicts.length} open conflict(s) after merge — run \`avcs conflicts ${line ?? "main"}\`.`);
+            const { outcome, scope, sync } = res.value;
+            if ("landed" in outcome) console.log(`avcs: landed workspace ${outcome.landed} — its ops are now part of the base view`);
+            else if (outcome.needsHuman) {
+              // Never silent: a hook that says nothing lets someone believe the land happened.
+              console.error(`avcs: landed NOTHING — ${outcome.declined}.`);
+              console.error(`  a squash merge leaves no merge commit to read, so this can be normal; confirm it by hand with \`avcs workspace land <workspace>\` (\`avcs workspace list\` shows what has landed).`);
+            } else console.log(`avcs: nothing to land — ${outcome.declined}`);
+            reportContention(sync.contention);
+            if (sync.conflicts.length) console.error(`avcs: ${sync.conflicts.length} open conflict(s) after merge — run \`avcs conflicts ${scope.line ?? "main"}\`.`);
           }
           break;
         }
@@ -958,16 +1057,32 @@ async function main(): Promise<void> {
         const name = args[2];
         if (!name || name.startsWith("--")) throw new Error("usage: avcs workspace project <name> [--out <dir>]");
         const out = flag("--out") ?? cwd;
-        const written = await repo.checkoutInto(out, "main", { workspace: name });
-        console.log(`projected workspace ${name}: ${written.length} file(s) to ${out}`);
+        // The base a workspace sits on is its TRUNK's view, which the view name `main` only
+        // happened to spell in repos whose trunk is called main. Resolve it through the very
+        // same mapping the capture path uses, so `project` and `git-sync` can never disagree
+        // about what "base" means: a trunk that is (still) an avcs line projects that line,
+        // otherwise the default view.
+        const trunk = await repo.getTrunk();
+        const trunkScope = scopeForBranch(trunk, await repo.trunkBranches(), {
+          hasExistingLine: !!(await repo.store.getRef(`line:${trunk}`)),
+        });
+        const view = flag("--view") ?? trunkScope.line ?? "main";
+        const written = await repo.checkoutInto(out, view, { workspace: name });
+        console.log(`projected workspace ${name} over ${view}: ${written.length} file(s) to ${out}`);
       } else if (sub === "land") {
         const name = args[2];
         if (!name) throw new Error("usage: avcs workspace land <name>");
         await repo.landWorkspace(name);
         console.log(`landed workspace ${name}`);
       } else if (sub === "list") {
-        const landed = await repo.landedWorkspaces();
-        console.log(landed.length ? landed.join("\n") : "(no landed workspaces)");
+        // Since a topic branch maps to a workspace (docs/20), being UN-landed is the normal
+        // state of live work — a listing that showed only landed ones would hide everything
+        // currently in flight. Both are shown, each marked for what it is.
+        const landed = new Set(await repo.landedWorkspaces());
+        const all = await repo.workspaceNames();
+        for (const n of landed) if (!all.includes(n)) all.push(n); // landed but ops gone (redacted/gc)
+        if (!all.length) { console.log("(no workspaces)"); break; }
+        for (const n of all.sort()) console.log(`${landed.has(n) ? "landed   " : "in flight"}  ${n}`);
       } else {
         throw new Error("usage: avcs workspace <project|land|list> ...");
       }
@@ -1072,7 +1187,7 @@ async function main(): Promise<void> {
           "  init [dir] [--mode m]       create a repo (--mode sidecar|committed, default sidecar)\n" +
           "  status [view]               operation/conflict summary\n" +
           "  key provision <actor-id> | key ls   local signing keys (decisions, hub writes)\n" +
-          "  conflicts [view]            list decisions a human owes\n" +
+          "  conflicts [view] [--workspace w]  list decisions a human owes (defaults to this branch's scope)\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
@@ -1100,6 +1215,8 @@ async function main(): Promise<void> {
           "  pull <hub-url | dir>        sync objects from a hub or local repo\n" +
           "  head [view]                 show the protected head\n" +
           "  lines                       list lineage lines (Phase 8)\n" +
+          "  trunk [<branch>]            show/set the branch that carries the base view (docs/20)\n" +
+          "  workspace project <n> [--out d] | land <n> | list   converging work scopes (docs/16, 20)\n" +
           "  blame <entityKey> [--line l] who owns an entity and why\n" +
           "  diff <viewA> <viewB>        added/removed/modified paths\n" +
           "  log                         operation history\n" +

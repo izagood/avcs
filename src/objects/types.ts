@@ -299,6 +299,14 @@ export interface Checkpoint extends BaseObject {
    * AND on the Integration verdict). Optional so pre-13.4 checkpoint oids are unchanged.
    */
   evidenceBinding?: Partial<Record<EvidenceKind, "bound" | "legacy" | "carried">>;
+  /**
+   * The workspace whose projection this checkpoint froze (docs/20 §3.3). Present only for a
+   * workspace-scoped checkpoint — the git bridge takes one per commit on a topic branch, so
+   * the provenance trailer describes the tree git actually holds. Such a checkpoint is NOT a
+   * candidate for finalizing a protected head: its tree contains ops that have not landed on
+   * the base line. Optional, so a base-view checkpoint's bytes (and oid) are unchanged.
+   */
+  workspace?: string;
   status: "draft" | "verified" | "released";
   summary: string;
   createdAt: string;

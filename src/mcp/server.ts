@@ -635,9 +635,9 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "avcs.workspace.list",
-    description: "List the workspaces that have landed onto their base line (docs/16). Un-landed workspaces stay isolated and are not reported here.",
+    description: "List this repo's workspaces: `workspaces` names them all, `landed` the subset joined onto the base view. The rest stay isolated.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (repo) => ({ landed: await repo.landedWorkspaces() }),
+    handler: async (repo) => ({ landed: await repo.landedWorkspaces(), workspaces: await repo.workspaceNames() }),
   },
   {
     name: "avcs.line.create",

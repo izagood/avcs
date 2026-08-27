@@ -58,6 +58,69 @@ avcs git-sync -m "feat: ..." --commit   # 위 + 트레일러 달아 git commit +
 git push
 ```
 
+## 브랜치 → 스코프 매핑
+
+토픽 브랜치는 **수렴할 작업**이다. 그래서 avcs **workspace**로 매핑된다 — 영구 발산 스코프인
+line이 아니다([16](16-workspace-scope.md) §4.1, [20](20-workspace-bridge.md)).
+
+| 현재 브랜치 | 스코프 | 뜻 |
+|---|---|---|
+| trunk | (없음) | base view에 바로 캡처. 태그 없는 op |
+| 그 외 브랜치 | `workspace: <브랜치>` | 격리 캡처. base view에서 **안 보임**, land 시 합류 |
+| detached HEAD / git 없음 | (없음) | base view |
+| `--line <name>` 명시 | `line: <name>` | 사람이 의도한 발산(릴리스 분기 등) |
+| 이미 `line:<브랜치>` ref가 있는 브랜치 | `line: <브랜치>` | 이 매핑 이전에 시작한 작업 보호 |
+
+마지막 행이 하위호환의 핵심이다. 브랜치 이름과 같은 line이 **이미 있으면** 그 브랜치는 계속
+line으로 캡처된다 — 진행 중인 작업이 축적해 온 view를 잃지 않는다. 마이그레이션은 없다.
+
+### trunk
+
+base view를 나르는 브랜치는 `.avcs/config.json`의 `trunk` 필드로 정한다.
+
+```bash
+avcs trunk            # 현재 trunk 표시
+avcs trunk dev        # trunk 설정
+```
+
+**미설정이면 `main`과 `master` 둘 다 trunk로 본다** — `trunk`가 생기기 전 브리지가 특수 처리했던
+정확히 그 쌍이다. 그래서 설정하지 않은 저장소(그리고 `master` 기본 저장소)의 동작은 종전과
+완전히 같다. 설정하면 그 이름 하나만 trunk이고, `main`이라도 trunk가 아니면 그냥 토픽
+workspace로 취급된다.
+
+### `git merge` = `avcs workspace land`
+
+trunk에서의 머지가 **병합된 브랜치의 workspace를 land**한다. `post-merge` 훅이 그 접합점이다:
+
+```
+git merge topic-a        →  post-merge: reindex
+                                      → landWorkspace("topic-a")   ← 여기서 수렴이 기록된다
+                                      → 캡처 + 재투영
+```
+
+land는 캡처 **앞에** 일어난다. land 후에는 그 op들이 base view에 있으므로 머지된 내용이 이미
+투영되고 캡처는 다시 만들 것이 없다. 순서를 뒤집으면 같은 내용이 태그 없는 base op으로 한 번 더
+기록된다.
+
+병합 브랜치는 git 자신의 reflog(`merge <branch>: …`)로 판정한다. `post-merge`는 인자를 받지
+못하고 `MERGE_HEAD`는 그 시점에 이미 사라졌기 때문이다. 다음 중 하나라도 걸리면 **아무것도
+land하지 않고** 그 사실을 말한다:
+
+- reflog에 단일 병합 브랜치가 없다(octopus 머지, squash 머지, rebase …)
+- 그 이름이 trunk다
+- 그 이름이 avcs line이다 (line 머지는 land가 아니라 port다)
+- 그 이름으로 태그된 op이 하나도 없다
+
+`landWorkspace`는 추가 전용이라 되돌릴 수 없다. 틀린 workspace를 land하면 남의 미완성 op이
+base에 들어가고 취소할 방법이 없으므로, **land하지 않는 것이 언제나 덜 나쁘다.** 훅은 조용히
+넘어가지 않고 `avcs workspace land <workspace>` 수동 경로를 안내한다.
+
+```bash
+avcs workspace list                  # 이 저장소의 workspace 전부 (landed / in flight)
+avcs workspace land topic-a          # 수동 확정
+avcs workspace project topic-a --out ../build-a   # 격리 물리 투영 (trunk view + 그 workspace)
+```
+
 ## Provenance (왜 이 git 커밋을 믿는가)
 
 양방향 링크로 "이 git 커밋의 코드가 정말 그 AVCS 상태의 투영인가"를 검증한다.
@@ -70,6 +133,11 @@ git push
   ```
   (`config.json`의 `trailer: false`로 끌 수 있음. AVCS 모르는 팀원에겐 무해한 주석.)
 - **avcs → git**: `git:<sha>` ref가 checkpoint를 가리킴 (post-commit / `--commit`이 기록).
+
+토픽 브랜치에서의 커밋은 그 **workspace의 투영**을 담으므로, checkpoint도 workspace 스코프로
+찍힌다(`checkpoint.workspace`). 그래야 트레일러의 treeHash가 git이 실제로 들고 있는 트리를
+가리키고 `verify-git`이 의미를 갖는다. 그런 checkpoint로는 보호된 head를 finalize할 수 없다 —
+land되지 않은 op을 담고 있으므로 `finalize`가 거부한다.
 
 ```bash
 avcs verify-git              # HEAD가 링크된 checkpoint의 충실한 투영인지 검사
@@ -102,9 +170,9 @@ avcs worktree detach            # 포인터 제거 (실제 스토어는 절대 �
 
 훅이 설치돼 있으면 **수동 단계는 필요 없다**. `git worktree add`가 새 tree 안에서 `post-checkout`을 실행하고, 그 자리에서 포인터가 생긴다. 평범한 브랜치 전환은 아무것도 바꾸지 않는다.
 
-### 하나의 스토어, working tree마다 다른 line
+### 하나의 스토어, working tree마다 다른 workspace
 
-`lineFor`는 현재 git 브랜치를 AVCS line으로 매핑한다(`main`/`master`는 기본 line). working tree마다 브랜치가 다르므로 **스토어는 공유하되 line은 분리**된다 — git의 "하나의 object store + 여러 worktree"와 동형이다.
+`scopeFor`는 현재 git 브랜치를 AVCS 스코프로 매핑한다([브랜치 → 스코프](#브랜치--스코프-매핑) 참조). working tree마다 브랜치가 다르므로 **스토어는 공유하되 스코프는 분리**된다 — git의 "하나의 object store + 여러 worktree"와 동형이다.
 
 투영 위치는 헷갈리지 않는다: 포인터를 따라가도 **repo root는 그 working tree 자신**이고 스토어만 메인에 있다. `materialize`/`checkout`은 해당 tree에 쓰고, 워킹트리 캡처도 그 tree를 읽는다.
 
@@ -120,6 +188,12 @@ avcs worktree detach            # 포인터 제거 (실제 스토어는 절대 �
 - 훅은 **전체 워킹트리 커밋**을 가정한다(`git commit <부분파일>`은 미지원). `--no-verify`는 캡처를 건너뛴다.
 - committed 모드의 refs 텍스트 충돌은 수동 해결.
 - sidecar 모드의 히스토리는 git으로 이동하지 않는다(로컬/hub 전용) — 팀 도입 시 `avcs git-mode committed`.
+- **squash 머지는 자동 land 판정이 불가능하다.** GitHub의 squash-and-merge는 머지 커밋을 남기지
+  않으므로 reflog에 `merge <branch>`가 없다. 그 워크플로에서는 `avcs workspace land <ws>`가
+  1급 경로다(훅은 아무것도 land하지 않았음을 명시적으로 알린다). CI가 land를 수행하는 것이
+  최종형이다([17](17-sync-convergence.md)).
+- **`workspaces.landed`는 전역 집합이다.** 여러 line이 같은 workspace 이름을 쓰면 의미가
+  뒤섞인다([20](20-workspace-bridge.md) R3).
 - **committed 모드 + linked working tree는 아직 지원하지 않는다.** git이 working tree마다 `.avcs` 사본을 배달하므로 스토어가 tree 수만큼 갈라진다. 그래서 그 조합에서는 attach가 거부된다.
 
 ## 관련 명령 요약
@@ -128,6 +202,9 @@ avcs worktree detach            # 포인터 제거 (실제 스토어는 절대 �
 |---|---|
 | `avcs init [--mode m] [--no-hooks]` | 레포 생성 + 모드 + 훅 설치 |
 | `avcs git-mode [sidecar\|committed]` | 모드 표시/전환 |
+| `avcs trunk [<branch>]` | base view를 나르는 브랜치 표시/설정 |
+| `avcs workspace project <n> [--out d]` | workspace를 trunk view 위에 물리 투영 |
+| `avcs workspace land <n> \| list` | workspace를 base에 합류 / 전체 목록(landed 표시) |
 | `avcs git-sync -m <msg> [--commit]` | 수동 동기화 (커밋 직전까지 / 커밋까지) |
 | `avcs verify-git [<commit>]` | git 커밋 ↔ checkpoint provenance 검증 |
 | `avcs install-hooks [--force]` | 훅 5종 설치 |

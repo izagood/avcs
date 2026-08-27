@@ -1,6 +1,8 @@
 # 20 — Workspace-first git 브리지: 토픽 브랜치를 발산이 아니라 수렴으로
 
-> **상태: 설계 (구현 전).** 이 문서는 git 브리지가 토픽 브랜치를 **line**(영구 발산)으로
+> **상태: 구현됨** (#75·#78). §5의 W1~W15가 `test/workspace-bridge.test.ts` ·
+> `test/workspace-landed-visibility.test.ts`에서 회귀 테스트로 고정돼 있고, 구현이 이 문서와
+> 다른 곳은 §3.2·§3.3·§4 각 절에 표시했다. 이 문서는 git 브리지가 토픽 브랜치를 **line**(영구 발산)으로
 > 매핑하는 오류를 교정한다. [16 — Workspace 스코프](16-workspace-scope.md) §4.1이 정의한
 > 대로 단명 수렴 작업은 **workspace**가 맡아야 한다. 이 교정이 없으면
 > [17 — 수렴](17-sync-convergence.md)의 통합 큐가 실사용 경로에서 **작동할 대상 자체가
@@ -64,7 +66,7 @@ accepted이므로 **보여야 한다.**
 들어간 작업을 모른 채 계속 작업하고, land 시점에야 충돌을 만난다. **이것이 바로 이 트랙이
 없애려는 "뒤늦은 충돌 발견"의 workspace판 재연이다.**
 
-현재 workspace 사용률이 0이라 드러나지 않은 잠재 버그다. 수정:
+현재 workspace 사용률이 0이라 드러나지 않은 잠재 버그였다. 수정(적용됨, W5가 고정한다):
 
 ```ts
 const landed = await this.#landedWorkspaces();                  // 항상 조회
@@ -116,8 +118,15 @@ function scopeFor(dir: string, explicitLine?: string): { line?: string; workspac
 - trunk 판정: `config.trunk` ?? (`main` 있으면 `main`) ?? `master`.
 - detached HEAD: 스코프 없음(base view) — 종전 `lineFor`의 `"HEAD"` 처리와 동형.
 - **기존 line과의 충돌 회피:** 브랜치 이름과 같은 `line:<name>` ref가 **이미 존재하면**
-  그 브랜치는 계속 line으로 취급한다. 이렇게 하면 진행 중인 기존 12개 브랜치가 매핑
-  변경으로 히스토리를 잃지 않는다(원칙 2). 신규 브랜치만 workspace가 된다.
+  그 브랜치는 계속 line으로 취급한다. 이렇게 하면 진행 중인 기존 브랜치들이 매핑 변경으로
+  히스토리를 잃지 않는다(원칙 2). 신규 브랜치만 workspace가 된다.
+
+> **구현 노트:** 이 검사는 trunk 판정보다 **앞**에 있다. `trunk`가 없던 시절 main/master가
+> 아닌 trunk는 그 자체가 line이 되어 있었고 축적된 작업이 그 line의 view에 있으므로, 새
+> 캡처를 기본 view로 보내면 같은 브랜치의 히스토리가 둘로 쪼개진다. 그리고 판정은 순수 함수
+> `src/git/scope.ts`(`scopeForBranch`)에 있다 — `src/cli.ts`는 import 시 `main()`이 실행돼
+> 테스트에서 import할 수 없고, 되돌릴 수 없는 연산의 판정은 git 상태를 조작하지 않고 검증할
+> 수 있어야 한다. `lineFor`는 호출자가 남지 않아 제거했다.
 
 ### 3.3 캡처 경로에 workspace 배선
 
@@ -135,6 +144,14 @@ async gitSync(opts: { message; actor; line?; workDir?; ignorePredicate? })
 
 `checkoutInto(workDir, view, { workspace })`는 이미 workspace를 받는다. `gitSync`의 재투영
 단계가 그것을 넘기도록만 고친다.
+
+> **구현이 이 절에 더한 것:** `gitSync`가 찍는 checkpoint도 workspace 스코프여야 한다. 종전
+> 매핑에서는 토픽 브랜치의 view가 곧 line이라 checkpoint와 트레일러 treeHash가 일치했는데,
+> workspace로 옮기면서 checkpoint를 base view로 두면 트레일러가 git이 들고 있지 않은 트리를
+> 가리켜 `avcs verify-git`이 토픽 브랜치 커밋 전부를 불일치로 보고한다 — 회귀다. 그래서
+> `Checkpoint.workspace`(옵셔널이므로 base view checkpoint의 바이트는 불변)에 스코프를 싣고,
+> `finalize`는 그런 checkpoint를 거부한다: land되지 않은 op을 담은 트리로 보호된 head를
+> 전진시키는 것은 미완성 작업을 verified head 아래로 공개하는 일이다.
 
 ### 3.4 land 접합 — "git 머지"가 "avcs land"가 되는 지점
 
@@ -174,7 +191,9 @@ land하지 않는 것보다 나쁘다(land는 되돌릴 수 없다; `landWorkspa
 | `src/cli.ts` — `scopeFor` 신설 | §3.2 판정. `lineFor`는 `--line` 명시 경로용으로 유지 |
 | `src/cli.ts` — `git-sync` / 훅 케이스 | `scopeFor` 사용, workspace 전달 |
 | `src/cli.ts` — `post-merge` 훅 | §3.4 land 접합 + 병합 브랜치 판정 |
-| `src/cli.ts` — `workspace project` | view 하드코딩 제거 → trunk 사용 |
+| `src/cli.ts` — `workspace project` | view 하드코딩 제거 → **trunk 브랜치를 `scopeForBranch`로 해소한 view**(구현 정정: 새 매핑에서 trunk의 작업은 태그 없는 base view로 가므로 trunk *이름*을 view 이름으로 쓰는 것은 레거시(trunk가 line인) 저장소에서만 옳다). `--view`로 재정의 가능 |
+| `src/cli.ts` — `conflicts` | 현재 스코프를 본다(구현 추가). base view를 보면 토픽 브랜치에서 "no open conflicts"라 답하면서 `git-sync`는 그 트리를 스테이징하지 않겠다고 한다 |
+| `src/cli.ts` — `workspace list` | landed 만이 아니라 전부를 `landed`/`in flight` 로 표시(구현 추가). 미land 가 살아있는 작업의 정상 상태가 됐다 |
 | `src/cli.ts` — `trunk` 명령 | 신설 |
 | `src/cli.ts` — `land` 명령 | `<workspace>` 인자 형태 추가 (기존 통합 `land`와 이름 충돌 검토 — Q1) |
 | `docs/14-git-bridge.md` | workspace 매핑·trunk·land 접합 문서화. "하나의 스토어, working tree마다 다른 line" 절을 workspace 기준으로 개정 |
