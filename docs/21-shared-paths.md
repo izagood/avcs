@@ -125,10 +125,14 @@ ignored(rel) = avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?
 즉 `.avcsignore`에 적는 것과 **무관하게** 공유 경로는 캡처되지 않는다. `.avcsignore`에 중복으로
 적어도 무해하다. 이것이 "5만 파일 캡처" 사고를 구조적으로 불가능하게 만든다.
 
-추가로 **symlink를 따라 내려가지 않는다**: 워킹트리 순회는 `lstat`으로 판정해 symlink인 디렉터리
-항목에는 진입하지 않는다. 지금 코어는 이 구분을 하지 않으므로(`#readWorkTree`) 이것은 **동작
-변경**이다 — §5 W6가 회귀 테스트로 고정한다. 안전한 방향의 변경이다(현재는 공유 캐시를 통째로
-캡처할 수 있다).
+**symlink는 이미 안전하다(변경 불필요).** `#readWorkTree`는 `readdir(dir, { withFileTypes: true })`의
+`Dirent`로 분기하는데, `Dirent`의 타입 판정은 **`lstat` 의미**다 — symlink 항목은 `isDirectory()`도
+`isFile()`도 false이므로 순회가 **진입하지도, 읽지도 않는다.** 따라서 `mode: "symlink"`로 연결된
+공유 경로는 설정과 무관하게 이미 캡처되지 않는다. 이 설계는 그 동작에 **의존**하며 바꾸지 않는다 —
+§5 S8이 이를 회귀로 고정한다(장래에 `stat` 기반으로 리팩터되면 즉시 깨지도록).
+
+주의: 그래서 `mode: "copy"`가 오히려 위험한 쪽이다(실제 디렉터리이므로 순회 대상). §3.5 첫 문단의
+ignore 술어 합성이 그 경우의 유일한 방어선이다.
 
 `checkoutInto`도 대칭으로 방어한다: 트리의 파일 경로가 공유 경로 **안쪽**이면 쓰지 않고 경고한다
 (정상적으로는 발생하지 않는다 — 캡처가 막았으므로 — 그러나 과거에 오염된 히스토리를 열 수 있다).
@@ -149,7 +153,7 @@ ignored(rel) = avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?
 | `src/api/repo.ts` — config 접근자 | `readSharedPaths()` / `setSharedPaths()` (aux read/write) |
 | `src/api/repo.ts` — 신규 `deriveSharedKey` | §3.2. 투영 결과에서 키 유도(순수 함수) |
 | `src/api/repo.ts` — 신규 `linkSharedPaths` | §3.4. `checkoutInto` 말미에서 호출 |
-| `src/api/repo.ts` — `#readWorkTree` | §3.5. shared ignore 합성 + `lstat` 기반 symlink 미진입 |
+| `src/api/repo.ts` — `#readWorkTree` | §3.5. shared ignore 합성 **만**. symlink 미진입은 이미 성립(`Dirent`) — 변경 없음 |
 | `src/api/repo.ts` — `checkoutInto` | 공유 경로 안쪽 트리 항목 방어 |
 | `src/api/repo.ts` — `gc` | `--shared` 옵션 |
 | `src/cli.ts` — `workspace project` | 공유 상태(`populated`) 출력 |
@@ -167,7 +171,8 @@ ignored(rel) = avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?
 | S5 | 재투영(멱등) | 이미 올바른 symlink면 no-op, 경고 없음 |
 | S6 | **공유 경로에 실제 디렉터리가 이미 있음** | 건드리지 않고 경고 (사용자 데이터 보호) |
 | S7 | 공유 경로 안에 파일 생성 후 캡처 | **op 0개** (`.avcsignore`에 안 적었어도) |
-| S8 | 공유 경로가 symlink일 때 캡처 | symlink를 **따라가지 않는다**, op 0개 |
+| S8 | 공유 경로가 symlink일 때 캡처 | op 0개. `Dirent`의 lstat 의미에 의존한다는 사실을 고정하는 회귀 |
+| S8b | **`mode: "copy"`** 로 실제 디렉터리가 놓인 뒤 캡처 | op 0개 — ignore 술어 합성이 유일한 방어선이므로 반드시 별도로 검증 |
 | S9 | `keyFrom` 파일이 view에 없음 | 빈 내용으로 해시 + 경고, 조용히 다른 키를 만들지 않음 |
 | S10 | `keyFrom: []` | 상수 키 + 경고 |
 | S11 | `mode: "copy"` | 재귀 복사, 이미 있으면 덮지 않음 |
@@ -182,7 +187,7 @@ ignored(rel) = avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?
 |---|---|---|
 | R1 | **symlink `node_modules`를 일부 툴체인이 싫어한다**(경로 해석·watch·realpath 가정) | `mode: "copy"`를 명시적 탈출구로 제공. 기본은 symlink(비용 0)이되 문서에 한계를 적는다. CoW(APFS `clonefile`)는 플랫폼 의존이라 zero-dep 원칙상 후속 |
 | R2 | 캐시가 **오염**되면(설치 실패 중단) `populated: true`인데 깨진 상태 | 코어는 "비어 있지 않다"만 보고한다 — 무결성 판단은 빌드 툴의 몫(원칙 1). `avcs shared rm --cache <key>`로 버릴 수 있게 한다 |
-| R3 | `lstat` 기반 symlink 미진입은 **동작 변경**이다 | S8이 회귀로 고정. 안전한 방향(현재는 공유 캐시 전체를 캡처할 수 있다)이고, 실사용에서 symlink를 op으로 기록하려던 사례는 없다 |
+| R3 | symlink 미진입이 `Dirent`의 lstat 의미라는 **암묵 의존**이다 — 순회가 `stat` 기반으로 리팩터되면 공유 캐시가 통째로 캡처된다 | 동작 변경은 없다(이미 그렇게 동작한다). S8이 그 의존을 명시적 회귀로 고정하고, `mode: "copy"`는 S8b가 별도로 막는다 |
 | R4 | 여러 workspace가 **같은 캐시에 동시 설치**를 실행 | 코어가 설치를 실행하지 않으므로 코어의 락 범위 밖이다. 다만 `linkSharedPaths`는 `withLock("shared:<key>")` 하에서 캐시 디렉터리를 만들어 생성 경쟁만 막는다. 동시 설치 조율은 호출자 책임 — 문서에 명시 |
 | Q1 | 캐시를 store-local이 아니라 사용자 홈에 두어 **레포 간** 공유를 할지 | 하지 않는다(§3.3). 서로 다른 프로젝트의 키 충돌·정리 책임이 커진다. 필요성이 실측되면 별도 설계 |
 | Q2 | `keyFrom`에 **디렉터리**를 허용할지(예: `patches/`) | v1은 파일만. 디렉터리 해시는 순회 비용과 정렬 규약이 필요해 후속 |
