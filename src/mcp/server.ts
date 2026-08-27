@@ -612,6 +612,7 @@ export const TOOLS: ToolDef[] = [
         sessionOid: { type: "string", description: "use this session's actor + authored keys as the perspective" },
         actor: { type: "string", description: "actor id for the perspective (with no keys: every key they authored on)" },
         line: { type: "string", description: "lineage to check on; default 'main'" },
+        acrossLines: { type: "boolean", description: "also check other lines/branches; each warning names the competing line" },
       },
     },
     handler: (repo, i) =>
@@ -620,6 +621,7 @@ export const TOOLS: ToolDef[] = [
         sessionOid: i.sessionOid as string | undefined,
         actorId: i.actor as string | undefined,
         line: i.line as string | undefined,
+        acrossLines: i.acrossLines as boolean | undefined,
       }),
   },
   {
