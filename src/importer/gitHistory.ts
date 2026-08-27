@@ -87,20 +87,92 @@ export interface ImportGitHistoryResult {
 }
 
 /** What {@link gitCliSource} accepts: a checkout/bare dir, a bundle, or a URL. */
-export type GitCliTarget = string | { dir?: string; url?: string; bundle?: string; ref?: string };
+export type GitCliTarget =
+  | string
+  | {
+      dir?: string;
+      url?: string;
+      bundle?: string;
+      ref?: string;
+      /**
+       * Wall-clock bound for EVERY git invocation (issue #71). A server driving
+       * this cannot afford an unbounded clone: an endpoint that accepts and never
+       * answers would hang the request forever and leak the temp clone. Default
+       * 10 minutes; 0 disables the bound.
+       */
+      timeoutMs?: number;
+    };
 
-async function runGit(dir: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", dir, ...args], {
-    maxBuffer: 1 << 28,
+/** Default bound per git invocation. */
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Refuse a value git would read as an option (issue #71). Positional values also
+ * get a `--` terminator below, but a caller deserves a clear error rather than a
+ * confusing git failure — and `--` does not save every subcommand.
+ */
+function rejectOptionLike(what: string, value: string): void {
+  if (value.startsWith("-")) {
+    throw new Error(
+      `gitCliSource: ${what} may not start with "-" (git would read "${value}" as an option)`,
+    );
+  }
+}
+
+/**
+ * git config forced onto every invocation. `http.followRedirects=false` is the
+ * important one: a caller that vetted a URL must not have git pivot elsewhere on
+ * a 302 (issue #71). Passed via GIT_CONFIG_* so it cannot be overridden by the
+ * repo's own config.
+ */
+function forcedGitConfig(timeoutMs: number): NodeJS.ProcessEnv {
+  // git gives up on a stalled transfer itself. This matters more than the process
+  // timeout below: `git clone` spawns git-remote-http, so killing only the parent
+  // leaves a grandchild holding the pipes and the promise never settles.
+  const stallSecs = timeoutMs > 0 ? Math.max(1, Math.ceil(timeoutMs / 1000)) : 0;
+  const entries: Array<[string, string]> = [
+    ["http.followRedirects", "false"],
+    // Never stop for credentials: a prompt in a server process hangs forever.
+    ["core.askPass", ""],
+  ];
+  if (stallSecs > 0) {
+    entries.push(["http.lowSpeedLimit", "1"], ["http.lowSpeedTime", String(stallSecs)]);
+  }
+  const env: NodeJS.ProcessEnv = {
+    GIT_CONFIG_COUNT: String(entries.length),
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  entries.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = v;
   });
+  return env;
+}
+
+function gitOpts(timeoutMs: number, extra: Record<string, unknown> = {}) {
+  return {
+    maxBuffer: 1 << 28,
+    // Backstop for anything the git-level stall bound misses. `detached` puts the
+    // child in its own process group so the kill reaches git-remote-http too.
+    ...(timeoutMs > 0
+      ? { timeout: Math.ceil(timeoutMs * 1.5), killSignal: "SIGKILL" as const, detached: true }
+      : {}),
+    env: { ...process.env, ...forcedGitConfig(timeoutMs) },
+    ...extra,
+  };
+}
+
+async function runGit(dir: string, args: string[], timeoutMs: number): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["-C", dir, ...args], gitOpts(timeoutMs));
   return stdout;
 }
 
-async function runGitBuffer(dir: string, args: string[]): Promise<Buffer> {
-  const { stdout } = await execFileAsync("git", ["-C", dir, ...args], {
-    maxBuffer: 1 << 28,
-    encoding: "buffer",
-  });
+async function runGitBuffer(dir: string, args: string[], timeoutMs: number): Promise<Buffer> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", dir, ...args],
+    gitOpts(timeoutMs, { encoding: "buffer" }),
+  );
   return stdout as unknown as Buffer;
 }
 
@@ -133,6 +205,12 @@ export async function gitCliSource(target: GitCliTarget): Promise<GitHistorySour
 
   const t = typeof target === "string" ? inferTarget(target) : target;
   const ref = t.ref ?? "HEAD";
+  const timeoutMs = t.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // Positional values reach git as arguments; a leading "-" would be an option.
+  if (t.dir) rejectOptionLike("dir", t.dir);
+  if (t.url) rejectOptionLike("url", t.url);
+  if (t.bundle) rejectOptionLike("bundle", t.bundle);
+  rejectOptionLike("ref", ref);
 
   let dir: string;
   let tempClone: string | null = null;
@@ -142,35 +220,55 @@ export async function gitCliSource(target: GitCliTarget): Promise<GitHistorySour
     const source = t.url ?? t.bundle;
     if (!source) throw new Error("gitCliSource: pass one of dir, url, or bundle");
     tempClone = await mkdtemp(join(tmpdir(), "avcs-git-import-"));
-    await execFileAsync("git", ["clone", "--bare", "--quiet", source, join(tempClone, "src.git")], {
-      maxBuffer: 1 << 24,
-    });
+    try {
+      await execFileAsync(
+        "git",
+        ["clone", "--bare", "--quiet", "--", source, join(tempClone, "src.git")],
+        gitOpts(timeoutMs, { maxBuffer: 1 << 24 }),
+      );
+    } catch (err) {
+      // A bounded clone that was killed still left a temp dir behind.
+      await rm(tempClone, { recursive: true, force: true });
+      const e = err as { killed?: boolean; signal?: string };
+      if (e.killed || e.signal) {
+        throw new Error(`gitCliSource: clone timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    }
     dir = join(tempClone, "src.git");
   }
 
   return {
     async *commits(): AsyncIterable<GitCommitRecord> {
-      const shas = (await runGit(dir, ["rev-list", "--first-parent", "--reverse", ref]))
+      const shas = (await runGit(dir, ["rev-list", "--first-parent", "--reverse", ref, "--"], timeoutMs))
         .split("\n")
         .filter(Boolean);
       for (const sha of shas) {
         // %x00-separated to survive arbitrary subjects/messages.
-        const meta = await runGit(dir, [
-          "show",
-          "-s",
-          "--format=%an%x00%ae%x00%aI%x00%s%x00%B",
-          sha,
-        ]);
+        const meta = await runGit(
+          dir,
+          ["show", "-s", "--format=%an%x00%ae%x00%aI%x00%s%x00%B", sha],
+          timeoutMs,
+        );
         const [authorName = "", authorEmail = "", authorDate = "", subject = "", ...rest] =
           meta.split("\0");
         const message = rest.join("\0").replace(/\n$/, "");
 
         // First-parent diff; --root covers the parentless first commit.
         const hasParent =
-          (await runGit(dir, ["rev-list", "--parents", "-n", "1", sha])).trim().split(" ").length > 1;
+          (await runGit(dir, ["rev-list", "--parents", "-n", "1", sha], timeoutMs)).trim().split(" ").length >
+          1;
         const rawDiff = hasParent
-          ? await runGit(dir, ["diff-tree", "--no-renames", "-r", "-z", "--name-status", `${sha}^`, sha])
-          : await runGit(dir, ["diff-tree", "--root", "--no-renames", "-r", "-z", "--name-status", sha]);
+          ? await runGit(
+              dir,
+              ["diff-tree", "--no-renames", "-r", "-z", "--name-status", `${sha}^`, sha],
+              timeoutMs,
+            )
+          : await runGit(
+              dir,
+              ["diff-tree", "--root", "--no-renames", "-r", "-z", "--name-status", sha],
+              timeoutMs,
+            );
         const fields = rawDiff.split("\0").filter(Boolean);
         // A --root diff-tree echoes the sha as its first record; drop it.
         const records = fields[0] === sha ? fields.slice(1) : fields;
@@ -185,7 +283,7 @@ export async function gitCliSource(target: GitCliTarget): Promise<GitHistorySour
             changes.push({
               path,
               kind: "write",
-              read: () => runGitBuffer(dir, ["cat-file", "blob", `${sha}:${path}`]),
+              read: () => runGitBuffer(dir, ["cat-file", "blob", `${sha}:${path}`], timeoutMs),
             });
           }
         }
@@ -208,7 +306,7 @@ export async function gitCliSource(target: GitCliTarget): Promise<GitHistorySour
   };
 }
 
-function inferTarget(target: string): { dir?: string; url?: string; bundle?: string; ref?: string } {
+function inferTarget(target: string): Exclude<GitCliTarget, string> {
   if (/^[a-z+]+:\/\//i.test(target) || /^[^/\s]+@[^/\s]+:/.test(target)) return { url: target };
   if (target.endsWith(".bundle")) return { bundle: target };
   if (existsSync(target)) return { dir: target };
