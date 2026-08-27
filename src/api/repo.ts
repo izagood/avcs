@@ -27,6 +27,7 @@ import {
 } from "../core/identity.ts";
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
 import { isBinary } from "../core/bytes.ts";
+import { lcsLineLength } from "../merge/merge3.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import type {
@@ -2223,6 +2224,16 @@ export class Repo {
   #reduceCache = new Map<string, ReductionResult>();
   static readonly REDUCE_CACHE_MAX = 64;
 
+  /**
+   * Minimum line similarity for the capture path to call a removed × added pair a MOVE
+   * rather than an unrelated delete + create (docs/19 §3.1, and §6 R3 asks for exactly one
+   * place to tune it). 0.5 is git's `-M` default, so a tree avcs captures and the same tree
+   * `git diff -M` describes agree about what moved. Raising it makes capture more
+   * conservative (more moves recorded as delete + create, which is the pre-Stage-0
+   * behaviour); lowering it risks attaching a wrong merge base, which is worse than none.
+   */
+  static readonly RENAME_SIMILARITY = 0.5;
+
   #cloneResult(r: ReductionResult): ReductionResult {
     return {
       tree: new Map(r.tree),
@@ -2468,6 +2479,98 @@ export class Repo {
   }
 
   /**
+   * Pair `removed` paths against `added` ones to recover MOVES from a path-set diff
+   * (docs/19 §3.1, Stage 0).
+   *
+   * `commitWorkingTree` compares path sets, so a move arrives as a removal plus an
+   * unrelated-looking addition — which the reducer then sees as a delete racing an edit,
+   * plus a create with no merge base. Recovering the move here is what makes Stage 1's
+   * commutativity reachable from actual usage.
+   *
+   * Two tiers, both deterministic and language-blind:
+   *
+   *   1. EXACT content match. Content is hashed, so this is an O(n) bucket join and a pure
+   *      relocation — the common case, and the whole of the binary case — never pays for a
+   *      line diff at all.
+   *   2. LINE SIMILARITY `2·LCS / (linesP + linesQ)` over the leftovers, using merge3's own
+   *      LCS. Binary content (a NUL byte) is excluded: a line diff over bytes is noise, so
+   *      binary is exact-match-only.
+   *
+   * A pair is only accepted when it is UNAMBIGUOUS in both directions — one candidate for
+   * the source and one for the destination. Anything else stays a delete + create rather
+   * than a guess: naming the wrong file as "the same file" invents history, and a wrong
+   * merge base is worse than no merge base. That is also why there is no tie-breaking to
+   * get wrong; ambiguity is not resolved, it is declined.
+   */
+  #detectRenames(
+    removed: string[],
+    added: string[],
+    before: Map<string, Buffer>,
+    after: Map<string, Buffer>,
+  ): { from: string; to: string }[] {
+    if (!removed.length || !added.length) return [];
+    const sources = [...removed].sort();
+    const destinations = [...added].sort();
+
+    /** Accept only pairs that are the single candidate on BOTH sides. */
+    const unambiguous = (links: Map<string, Set<string>>): { from: string; to: string }[] => {
+      const inverse = new Map<string, Set<string>>();
+      for (const [from, tos] of links) for (const to of tos) (inverse.get(to) ?? inverse.set(to, new Set()).get(to)!).add(from);
+      const out: { from: string; to: string }[] = [];
+      for (const from of [...links.keys()].sort()) {
+        const tos = links.get(from)!;
+        if (tos.size !== 1) continue;
+        const to = [...tos][0]!;
+        if (inverse.get(to)!.size !== 1) continue;
+        out.push({ from, to });
+      }
+      return out;
+    };
+
+    // ── Tier 1: exact content ──
+    const byContent = new Map<string, string[]>();
+    for (const to of destinations) {
+      const h = sha256hex(after.get(to)!);
+      (byContent.get(h) ?? byContent.set(h, []).get(h)!).push(to);
+    }
+    const exact = new Map<string, Set<string>>();
+    for (const from of sources) {
+      const hits = byContent.get(sha256hex(before.get(from)!));
+      if (hits) exact.set(from, new Set(hits));
+    }
+    const pairs = unambiguous(exact);
+
+    // ── Tier 2: line similarity over what tier 1 left ──
+    const takenFrom = new Set(pairs.map((p) => p.from));
+    const takenTo = new Set(pairs.map((p) => p.to));
+    const similar = new Map<string, Set<string>>();
+    const linesCache = new Map<string, string[] | null>();
+    const linesOf = (path: string, buf: Buffer): string[] | null => {
+      if (!linesCache.has(path)) linesCache.set(path, isBinary(buf) ? null : buf.toString("utf8").split("\n"));
+      return linesCache.get(path)!;
+    };
+    for (const from of sources) {
+      if (takenFrom.has(from)) continue;
+      const fromLines = linesOf(`-${from}`, before.get(from)!);
+      if (!fromLines) continue; // binary: exact match only (rule 4)
+      for (const to of destinations) {
+        if (takenTo.has(to)) continue;
+        const toLines = linesOf(`+${to}`, after.get(to)!);
+        if (!toLines) continue;
+        const n = fromLines.length;
+        const m = toLines.length;
+        // Sound pre-filter (docs/19 R4): LCS ≤ min(n, m), so this is an upper bound on the
+        // similarity and can never skip a pair that would have passed. It keeps a large
+        // relocation from running an O(n·m) line DP against every unrelated candidate.
+        if ((2 * Math.min(n, m)) / (n + m) < Repo.RENAME_SIMILARITY) continue;
+        if ((2 * lcsLineLength(fromLines, toLines)) / (n + m) < Repo.RENAME_SIMILARITY) continue;
+        (similar.get(from) ?? similar.set(from, new Set()).get(from)!).add(to);
+      }
+    }
+    return [...pairs, ...unambiguous(similar)].sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  }
+
+  /**
    * Commit a working tree: diff `workDir`'s files against the materialized view and
    * author edit_file / put_file / delete_file ops for the changes (the git `add`+`commit`
    * step, which agents do via operation.propose). Causally builds on the current frontier.
@@ -2479,6 +2582,13 @@ export class Repo {
    * ADDED files keep `put_file` (a create genuinely has no base), and so does any content that
    * is not losslessly UTF-8 text (see `#isMergeableText`).
    *
+   * A MOVED file is recovered from the removed × added pair (`#detectRenames`, docs/19 §3.1)
+   * and captured as `rename_file` — plus an `edit_file` at the NEW path, based on the content
+   * from BEFORE the move, when it was edited on the way. Without this the reducer's whole
+   * rename × edit commutativity is unreachable from real usage: a path-set diff turns every
+   * move into a delete racing an edit and a create with nothing to merge against. Recovered
+   * moves are reported in `renamed` and are NOT double-counted in `added`/`removed`.
+   *
    * Capture also runs the early conflict warning with CROSS-LINE visibility: the git bridge
    * maps each branch to its own line, so a competing session is on a *different* line and a
    * line-scoped check would never see it. The warnings are returned (`contention`) so the CLI
@@ -2487,23 +2597,44 @@ export class Repo {
   async commitWorkingTree(
     workDir: string,
     opts: { message: string; actor: Actor; line?: string; ignorePredicate?: (rel: string) => boolean },
-  ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string; contention: ContentionWarning[] }> {
+  ): Promise<{
+    ops: string[];
+    added: string[];
+    modified: string[];
+    removed: string[];
+    /** Moves recovered from the removed × added pairing (docs/19 §3.1). These paths do NOT
+     *  also appear in `added`/`removed`. */
+    renamed: { from: string; to: string }[];
+    intent: string;
+    contention: ContentionWarning[];
+  }> {
     const view = opts.line ?? "main";
     const res = await this.materialize(view);
     const current = new Map((await this.materializedBytes(res)).map((f) => [f.path, f.bytes]));
     const disk = await this.#readWorkTree(workDir, opts.ignorePredicate);
-    const added: string[] = [];
+    let added: string[] = [];
     const modified: string[] = [];
-    const removed: string[] = [];
+    let removed: string[] = [];
     for (const [path, content] of disk) {
       if (!current.has(path)) added.push(path);
       else if (!current.get(path)!.equals(content)) modified.push(path);
     }
     for (const path of current.keys()) if (!disk.has(path)) removed.push(path);
 
+    // Recover moves before deciding op kinds: a paired path is a move, not an unrelated
+    // delete + create, and must not be counted as both.
+    const renamed = this.#detectRenames(removed, added, current, disk);
+    if (renamed.length) {
+      const movedFrom = new Set(renamed.map((r) => r.from));
+      const movedTo = new Set(renamed.map((r) => r.to));
+      removed = removed.filter((p) => !movedFrom.has(p));
+      added = added.filter((p) => !movedTo.has(p));
+    }
+
     const ops: string[] = [];
     const contention: ContentionWarning[] = [];
-    if (!added.length && !modified.length && !removed.length) return { ops, added, modified, removed, intent: "", contention };
+    if (!added.length && !modified.length && !removed.length && !renamed.length)
+      return { ops, added, modified, removed, renamed, intent: "", contention };
 
     const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
     const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
@@ -2518,6 +2649,31 @@ export class Repo {
       }
     };
     const warn = { warnContention: true, contentionAcrossLines: true, onContention: collect } as const;
+    // Moves first, sorted by source. The paired `edit_file` must causally FOLLOW its own
+    // rename: it names the destination path, so if the two were concurrent the reducer would
+    // read them as a move and an unrelated edit fighting over that path (docs/19 §3.2 leaves
+    // rename-vs-destination a genuine contest, and rightly so). Depending on the rename also
+    // states the truth — the author moved the file, then wrote to where it now lives.
+    for (const { from, to } of renamed) {
+      const rn = await this.proposeOperation({
+        sessionOid: sess, intentOid: intent, actor: opts.actor,
+        target: { entityKind: "file", entityId: from },
+        body: { kind: "rename_file", fromPath: from, path: to },
+        declaredPurpose: `move ${from} → ${to}`, causalDeps: deps, line: opts.line, ...warn,
+      });
+      ops.push(rn);
+      const base = current.get(from)!;
+      const content = disk.get(to)!;
+      if (base.equals(content)) continue; // a pure move needs no second op
+      // Content changed on the way. Only mergeable text can say so as an edit; otherwise the
+      // move stands and the new bytes go in byte-exact as a `put_file` at the new path.
+      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path: to, declaredPurpose: opts.message, causalDeps: [...deps, rn], line: opts.line, ...warn };
+      ops.push(
+        this.#isMergeableText(base) && this.#isMergeableText(content)
+          ? await this.proposeEdit({ ...common, newText: content.toString("utf8"), baseBlobOid: await this.putBlob(base) })
+          : await this.proposeFileWrite({ ...common, content }),
+      );
+    }
     const isModified = new Set(modified);
     // One sorted pass over both categories keeps op authoring order (and therefore lamport
     // assignment) exactly as before; only the op KIND differs per category.
@@ -2534,7 +2690,7 @@ export class Repo {
     for (const path of removed.sort()) {
       ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...warn }));
     }
-    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), intent, contention };
+    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), renamed, intent, contention };
   }
 
   // ── git bridge (docs/14) ───────────────────────────────────────────────────
@@ -2684,7 +2840,7 @@ export class Repo {
    */
   async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
     mode: GitMode;
-    captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string };
+    captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; renamed: { from: string; to: string }[]; intent: string };
     /** Cross-line early warnings the capture raised (docs/17 §15.3): another branch/session
      *  has live concurrent work on a file this commit touches. Advisory — never blocking. */
     contention: ContentionWarning[];
@@ -2700,7 +2856,7 @@ export class Repo {
     const lineOpt = opts.line ? { line: opts.line } : {};
     // 1. Capture direct working-tree edits as ops before anything else.
     const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}) });
-    const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, intent: cap.intent };
+    const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, renamed: cap.renamed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
     await this.#writeGitignore(mode);

@@ -212,6 +212,22 @@ function renderSpan(baseLines: string[], start: number, end: number, members: Hu
 }
 
 /**
+ * How many lines of `a` survive into `b` — the length of their longest common
+ * subsequence of lines.
+ *
+ * Derived from `diffHunks` instead of adding a second algorithm: in that edit script every
+ * line of `a` is either matched (producing no hunk) or consumed inside some hunk's
+ * `[start, end)` span, so the LCS length is `a.length` minus the total span the hunks
+ * cover. Exposed for the capture path's rename similarity (docs/19 §3.1), and as
+ * language-blind as the rest of this module — it compares lines and nothing else.
+ */
+export function lcsLineLength(a: string[], b: string[]): number {
+  let consumed = 0;
+  for (const h of diffHunks(a, b)) consumed += h.end - h.start;
+  return a.length - consumed;
+}
+
+/**
  * Line-level diff (LCS) → maximal changed segments. Each Hunk replaces base[start:end)
  * with `lines`. Unchanged lines produce no hunk. Deterministic.
  */
