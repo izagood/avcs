@@ -11,8 +11,8 @@
 // is replayable.
 
 import { mkdir, readFile, readdir, stat, open, rename, appendFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { existsSync, statSync, readFileSync } from "node:fs";
+import { join, dirname, resolve, isAbsolute } from "node:path";
 import { Buffer } from "node:buffer";
 import { computeOid, sha256hex } from "../core/canonical.ts";
 import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
@@ -57,7 +57,7 @@ export class ObjectStore {
   #wc = 0; // temp-file counter for atomic writes
   #packLoc: Map<string, PackLoc> | null = null; // lazy oid → pack location index (B2)
   constructor(repoDir: string) {
-    this.root = join(repoDir, ".avcs");
+    this.root = ObjectStore.resolveStoreDir(repoDir);
   }
 
   async init(): Promise<void> {
@@ -188,8 +188,32 @@ export class ObjectStore {
     return [...seen];
   }
 
+  /**
+   * Where `repoDir`'s store physically lives. Normally `<repoDir>/.avcs`. But `.avcs` may
+   * instead be a *pointer file* holding a single `avcsdir: <path>` line, in which case the
+   * store lives at that path and several working trees share ONE store — the same trick git
+   * uses when a linked working tree's `.git` is a file saying `gitdir: <path>`.
+   *
+   * Deliberately git-free: the pointer is AVCS's own marker, so this works for any kind of
+   * linked working tree, or for none at all. A relative path is resolved against the
+   * directory holding the pointer. Pure/synchronous — every store open goes through it.
+   * A malformed or unreadable pointer degrades to the plain path, so the caller's usual
+   * "not an AVCS repo" error surfaces instead of a parse throw.
+   */
+  static resolveStoreDir(repoDir: string): string {
+    const here = join(repoDir, ".avcs");
+    try {
+      if (!statSync(here).isFile()) return here;
+      const m = /^avcsdir:[ \t]*(.+?)[ \t]*$/m.exec(readFileSync(here, "utf8"));
+      if (!m?.[1]) return here;
+      return isAbsolute(m[1]) ? m[1] : resolve(repoDir, m[1]);
+    } catch {
+      return here; // absent, unreadable, or a directory racing us — the plain path is right
+    }
+  }
+
   static isRepo(repoDir: string): boolean {
-    return existsSync(join(repoDir, ".avcs", "objects"));
+    return existsSync(join(ObjectStore.resolveStoreDir(repoDir), "objects"));
   }
 
   /**
