@@ -468,6 +468,91 @@ test("S8b — `mode: copy` puts a REAL directory there, and the ignore compositi
   }
 });
 
+// ── Slice 5: cache lifecycle (S13, S14) ──────────────────────────────────────
+
+test("S13 — plain `gc` never touches a shared cache", async () => {
+  // Deliberately conservative (docs/21 §3.6): re-installing is expensive, so the routine
+  // reclaim of orphan blobs must not be able to cost someone an install.
+  const { dir, repo } = await projectable();
+  const out = await mkdtemp(join(tmpdir(), "avcs-ws-"));
+  try {
+    const link = (await repo.projectInto(out, "main")).shared[0]!;
+    await writeFile(join(link.cache, "dep.js"), "installed");
+
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 2\n"); // make the old key unreachable
+    const r = await repo.gc({});
+    assert.equal("sharedKeys" in r ? r.sharedKeys.length : 0, 0, "plain gc reports no shared work");
+    assert.equal(existsSync(join(link.cache, "dep.js")), true, "and the unreachable cache is still there");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(out, { recursive: true, force: true });
+  }
+});
+
+test("S14 — `gc --shared` deletes only keys no view derives", async () => {
+  const { dir, repo } = await projectable();
+  const out = await mkdtemp(join(tmpdir(), "avcs-ws-"));
+  const wsOut = await mkdtemp(join(tmpdir(), "avcs-ws2-"));
+  try {
+    const stale = (await repo.projectInto(out, "main")).shared[0]!;
+    await writeFile(join(stale.cache, "old.js"), "old");
+
+    // A workspace with a lockfile of its own: its key is DERIVED, so it must survive.
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 3\n", "feat-x");
+    const wsLink = (await repo.projectInto(wsOut, "main", { workspace: "feat-x" })).shared[0]!;
+    await writeFile(join(wsLink.cache, "ws.js"), "ws");
+
+    // Move the base view on, so `stale` is derived by nothing at all.
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 2\n");
+    const live = (await repo.projectInto(out, "main")).shared[0]!;
+    assert.notEqual(live.key, stale.key);
+    assert.notEqual(wsLink.key, stale.key);
+
+    const dry = await repo.gc({ shared: true, dryRun: true });
+    assert.deepEqual(dry.sharedKeys, [stale.key], "reported, and only that one");
+    assert.equal(existsSync(join(stale.cache, "old.js")), true, "--dry-run deleted nothing");
+
+    const done = await repo.gc({ shared: true });
+    assert.deepEqual(done.sharedKeys, [stale.key]);
+    assert.equal(existsSync(join(dir, ".avcs", "shared", stale.key)), false, "collected");
+    assert.equal(existsSync(join(live.cache)), true, "the base view's key survives");
+    assert.equal(existsSync(join(wsLink.cache, "ws.js")), true, "and so does the workspace's");
+
+    assert.deepEqual((await repo.gc({ shared: true })).sharedKeys, [], "idempotent");
+  } finally {
+    for (const d of [dir, out, wsOut]) await rm(d, { recursive: true, force: true });
+  }
+});
+
+test("`avcs gc --shared` reports what it collected, and plain `avcs gc` says nothing about caches", async () => {
+  const { dir, repo } = await projectable();
+  try {
+    const stale = (await repo.projectInto(dir, "main")).shared[0]!;
+    await writeFile(join(stale.cache, "old.js"), "old");
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 2\n");
+
+    assert.doesNotMatch(avcs(dir, "gc"), /shared/);
+    assert.match(avcs(dir, "gc", "--shared", "--dry-run"), /would collect 1 shared cache/);
+    assert.match(avcs(dir, "gc", "--shared"), /1 shared cache/);
+    assert.equal(existsSync(join(dir, ".avcs", "shared", stale.key)), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("`avcs shared rm --cache <key>` throws one cache away (docs/21 R2)", async () => {
+  const { dir, repo } = await projectable();
+  try {
+    const link = (await repo.projectInto(dir, "main")).shared[0]!;
+    await writeFile(join(link.cache, "half-installed"), "x");
+    assert.match(avcs(dir, "shared", "rm", "--cache", link.key), /dropped shared cache/);
+    assert.equal(existsSync(join(dir, ".avcs", "shared", link.key)), false);
+    assert.match(avcs(dir, "shared", "rm", "--cache", link.key), /no shared cache/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("`avcs shared` lists, adds and removes", async () => {
   const dir = await mk();
   try {

@@ -670,8 +670,13 @@ async function main(): Promise<void> {
     case "gc": {
       const repo = await Repo.open(cwd);
       const dryRun = args.includes("--dry-run");
-      const r = await repo.gc({ dryRun });
-      console.log(`${dryRun ? "would collect" : "collected"} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
+      // `--shared` is opt-in on purpose (docs/21 §3.6): reclaiming a build-environment cache
+      // costs somebody an install, which is not a price a routine `gc` may set.
+      const shared = args.includes("--shared");
+      const r = await repo.gc({ dryRun, ...(shared ? { shared: true } : {}) });
+      const verb = dryRun ? "would collect" : "collected";
+      console.log(`${verb} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
+      if (shared) console.log(`${verb} ${r.sharedKeys.length} shared cache(s)${r.sharedKeys.length ? `: ${r.sharedKeys.join(", ")}` : ""}`);
       break;
     }
     case "pack": {
@@ -1278,7 +1283,7 @@ async function main(): Promise<void> {
           "  key provision <actor-id> | key ls   local signing keys (decisions, hub writes)\n" +
           "  conflicts [view] [--workspace w]  list decisions a human owes (defaults to this branch's scope)\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
-          "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
+          "  gc [--dry-run] [--shared]   reclaim orphan blobs + expired quarantine ops (--shared: unused build caches)\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
           "  compact [view]              persist a base snapshot (cold materialize folds history)\n" +
           "  fsck [--rebuild]            verify object integrity + op-log; --rebuild repairs the log\n" +
@@ -1306,6 +1311,8 @@ async function main(): Promise<void> {
           "  lines                       list lineage lines (Phase 8)\n" +
           "  trunk [<branch>]            show/set the branch that carries the base view (docs/20)\n" +
           "  workspace project <n> [--out d] | land <n> | list   converging work scopes (docs/16, 20)\n" +
+          "  shared ls | add <path> [--key-from f,f] [--mode symlink|copy] | rm <path>|--cache <key>\n" +
+          "                              build environments shared across workspaces (docs/21)\n" +
           "  blame <entityKey> [--line l] who owns an entity and why\n" +
           "  diff <viewA> <viewB>        added/removed/modified paths\n" +
           "  log                         operation history\n" +

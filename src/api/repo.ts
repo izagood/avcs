@@ -3437,8 +3437,12 @@ export class Repo {
    *    past `quarantineTtlMs`, that nothing else builds on — the one place append-only
    *    yields (abandoned/spam contributions, docs/09 G5).
    * `dryRun` reports without deleting.
+   *
+   * `shared` opts IN to collecting shared-path caches (docs/21 §3.6). Plain `gc` never
+   * touches them: re-installing a build environment is expensive, so the routine reclaim of
+   * orphan blobs must not be able to cost somebody an install.
    */
-  async gc(opts: { quarantineTtlMs?: number; dryRun?: boolean } = {}): Promise<{ blobs: string[]; quarantinedOps: string[] }> {
+  async gc(opts: { quarantineTtlMs?: number; dryRun?: boolean; shared?: boolean } = {}): Promise<{ blobs: string[]; quarantinedOps: string[]; sharedKeys: string[] }> {
     const ops = await this.store.collect<Operation>("operation");
     const ttl = opts.quarantineTtlMs ?? 7 * 24 * 3600_000;
     const now = Date.now();
@@ -3483,8 +3487,47 @@ export class Repo {
       for (const oid of quarantinedOps) this.#opCache.delete(oid);
       for (const oid of blobs) this.#blobCache.delete(oid);
     }
-    this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length });
-    return { blobs, quarantinedOps };
+    const sharedKeys = opts.shared ? await this.#collectSharedCaches(opts.dryRun ?? false) : [];
+    this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length, sharedKeys: sharedKeys.length });
+    return { blobs, quarantinedOps, sharedKeys };
+  }
+
+  /**
+   * Every shared cache key that some current scope still derives (docs/21 §3.6).
+   *
+   * "Some current scope" is deliberately generous — the base view, every line, and every one
+   * of those crossed with every known workspace. Deriving a key extra times only costs a
+   * reduce; failing to derive one costs a re-install, so over-approximating live keys is the
+   * cheap mistake and the one to make.
+   */
+  async #derivedSharedKeys(): Promise<Set<string>> {
+    const entries = await this.readSharedPaths();
+    const keys = new Set<string>();
+    if (!entries.length) return keys;
+    const views = ["main", ...(await this.listLines()).map((l) => l.name).filter((n) => n !== "main")];
+    const workspaces = [undefined, ...(await this.workspaceNames())];
+    for (const view of views) {
+      for (const ws of workspaces) {
+        const res = await this.materialize(view, ws ? { workspace: ws } : undefined);
+        for (const e of entries) keys.add(Repo.deriveSharedKey(e.keyFrom, res.tree).key);
+      }
+    }
+    return keys;
+  }
+
+  /** Delete the shared caches no scope derives any more. Returns the keys (sorted). */
+  async #collectSharedCaches(dryRun: boolean): Promise<string[]> {
+    const root = this.#sharedRoot();
+    if (!existsSync(root)) return [];
+    const live = await this.#derivedSharedKeys();
+    const dead: string[] = [];
+    for (const ent of await readdir(root, { withFileTypes: true })) {
+      if (!ent.isDirectory() || live.has(ent.name)) continue;
+      dead.push(ent.name);
+    }
+    dead.sort();
+    if (!dryRun) for (const key of dead) await rm(join(root, key), { recursive: true, force: true });
+    return dead;
   }
 
   /**
