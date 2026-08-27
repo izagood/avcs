@@ -26,6 +26,7 @@ import {
   type Signature,
 } from "../core/identity.ts";
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
+import { isBinary } from "../core/bytes.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import type {
@@ -141,7 +142,8 @@ export interface RemoteConfig {
  */
 export interface ContentionWarning {
   key: string;
-  theirs: { op: string; actor: string; lamport: number; purpose: string; createdAt: string }[];
+  /** `line` is populated for an `acrossLines` check, so the caller can name the branch. */
+  theirs: { op: string; actor: string; lamport: number; purpose: string; createdAt: string; line?: string }[];
   leaseHolders: { actor: string; leaseOid: string; scope: string; expiresAt: string }[];
 }
 
@@ -609,6 +611,13 @@ export class Repo {
      *  structured-log warnings + a metric. Additive only — the return type is unchanged
      *  (surfaces that want the warnings themselves call {@link contention} directly). */
     warnContention?: boolean;
+    /** Make that check cross-line (see {@link contention}'s `acrossLines`). The capture
+     *  path uses this: the git bridge puts every parallel session on its own line, so a
+     *  line-scoped check is structurally blind to them. */
+    contentionAcrossLines?: boolean;
+    /** Receive the warnings the check produced, so a caller can surface them to a human
+     *  without re-running the scan. Called only when `warnContention` is set. */
+    onContention?: (warnings: ContentionWarning[]) => void;
   }): Promise<string> {
     // Multi-process reseed (Phase 13.2): two processes sharing one .avcs (e.g. CLI + MCP)
     // each hold their own in-memory clock, so both could issue the same lamport. Before
@@ -645,16 +654,23 @@ export class Repo {
     // Maintain the entity index (Phase 9): key → op oids for fast history/blame.
     for (const key of keysOf({ ...op, oid })) await this.store.appendEntityIndex(key, oid);
     if (args.warnContention) {
-      const warnings = await this.contention({ keys: [...keysOf({ ...op, oid })], actorId: op.actor.id, line: args.line });
+      const warnings = await this.contention({
+        keys: [...keysOf({ ...op, oid })],
+        actorId: op.actor.id,
+        line: args.line,
+        ...(args.contentionAcrossLines ? { acrossLines: true } : {}),
+      });
       for (const w of warnings) {
         this.metrics.inc("contention.warnings");
         this.logger.warn("contention.warn", {
           key: w.key,
           op: oid,
-          theirs: w.theirs.map((t) => `${t.actor}:${t.op.slice(0, 16)}`),
+          // `@line` appears only for a cross-line check (that is when `line` is populated).
+          theirs: w.theirs.map((t) => `${t.actor}${t.line ? `@${t.line}` : ""}:${t.op.slice(0, 16)}`),
           leaseHolders: w.leaseHolders.map((l) => l.actor),
         });
       }
+      args.onContention?.(warnings);
     }
     return oid;
   }
@@ -673,6 +689,8 @@ export class Repo {
     workspace?: string;
     signWith?: { keyId: string; privateKey: string };
     warnContention?: boolean;
+    contentionAcrossLines?: boolean;
+    onContention?: (warnings: ContentionWarning[]) => void;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.content);
     return this.proposeOperation({
@@ -688,6 +706,8 @@ export class Repo {
       workspace: args.workspace,
       signWith: args.signWith,
       warnContention: args.warnContention,
+      contentionAcrossLines: args.contentionAcrossLines,
+      onContention: args.onContention,
     });
   }
 
@@ -715,6 +735,8 @@ export class Repo {
     workspace?: string;
     signWith?: { keyId: string; privateKey: string };
     warnContention?: boolean;
+    contentionAcrossLines?: boolean;
+    onContention?: (warnings: ContentionWarning[]) => void;
   }): Promise<string> {
     const blobOid = await this.putBlob(args.newText);
     const baseBlobOid =
@@ -732,6 +754,8 @@ export class Repo {
       workspace: args.workspace,
       signWith: args.signWith,
       warnContention: args.warnContention,
+      contentionAcrossLines: args.contentionAcrossLines,
+      onContention: args.onContention,
     });
   }
 
@@ -844,8 +868,14 @@ export class Repo {
    *  - `actorId` (+ optional `keys`): that actor's ops on the resolved keys seed the
    *    closure; with no `keys` given, every key the actor has authored on is checked.
    *  - `keys` alone: no closure filter — everything live by anyone on the key reports.
+   *
+   * `acrossLines` (default false — existing callers are untouched) drops the line-equality
+   * filter. The git bridge maps each git branch to its own line (`lineFor()` in the CLI), so
+   * with N parallel sessions on N branches a line-scoped check cannot see ANY of them; the
+   * cross-line check does, and reports each competing op's `line` so the caller can name the
+   * branch. Lines are intentionally divergent by design, so this stays opt-in.
    */
-  async contention(args: { keys?: string[]; sessionOid?: string; actorId?: string; line?: string }): Promise<ContentionWarning[]> {
+  async contention(args: { keys?: string[]; sessionOid?: string; actorId?: string; line?: string; acrossLines?: boolean }): Promise<ContentionWarning[]> {
     const line = args.line ?? "main";
     let mine = args.actorId;
     const keys = new Set(args.keys ?? []);
@@ -880,7 +910,8 @@ export class Repo {
       for (const oid of await this.store.readEntityIndex(key)) {
         if (!(await this.store.has(oid))) continue; // GC'd since indexed
         const op = await this.store.get<Operation>(oid);
-        if ((op.line ?? "main") !== line || op.private) continue;
+        if (op.private) continue;
+        if (!args.acrossLines && (op.line ?? "main") !== line) continue;
         ops.push({ ...op, oid } as Operation);
       }
       // An op some later op (on any key) causally builds on is superseded work, not
@@ -892,7 +923,16 @@ export class Repo {
           return o.actor.id !== mine && !myClosure.has(oid) && !rejected.has(oid) && !builtUpon.has(oid);
         })
         .sort((a, b) => a.lamport - b.lamport || String(a.oid).localeCompare(String(b.oid)))
-        .map((o) => ({ op: o.oid as string, actor: o.actor.id, lamport: o.lamport, purpose: o.declaredPurpose, createdAt: o.createdAt }));
+        .map((o) => ({
+          op: o.oid as string,
+          actor: o.actor.id,
+          lamport: o.lamport,
+          purpose: o.declaredPurpose,
+          createdAt: o.createdAt,
+          // Only for a cross-line check: without it the field is redundant (always `line`),
+          // and adding it unconditionally would change every existing caller's payload.
+          ...(args.acrossLines ? { line: o.line ?? "main" } : {}),
+        }));
       const leaseHolders = leases
         .filter((l) => l.actor.id !== mine && l.writeScopes.some((s) => scopesOverlap(key as ScopeRef, s)))
         .map((l) => ({
@@ -2415,14 +2455,39 @@ export class Repo {
   }
 
   /**
+   * Whether `buf` may travel the `edit_file` (text 3-way merge) path. `proposeEdit` takes
+   * a `string`, so anything that is not LOSSLESSLY UTF-8 would be silently corrupted by the
+   * Buffer→string→Buffer round trip (invalid sequences become U+FFFD). The NUL check keeps
+   * the classification identical to `merge3`/`reducer`'s binary route (`core/bytes.isBinary`,
+   * git's heuristic), so a file the merger would refuse to line-merge is never captured as
+   * if it could be. Everything rejected here falls back to `put_file`, which is byte-exact.
+   */
+  #isMergeableText(buf: Buffer): boolean {
+    if (isBinary(buf)) return false;
+    return Buffer.from(buf.toString("utf8"), "utf8").equals(buf);
+  }
+
+  /**
    * Commit a working tree: diff `workDir`'s files against the materialized view and
-   * author put_file / delete_file ops for the changes (the git `add`+`commit` step,
-   * which agents do via operation.propose). Causally builds on the current frontier.
+   * author edit_file / put_file / delete_file ops for the changes (the git `add`+`commit`
+   * step, which agents do via operation.propose). Causally builds on the current frontier.
+   *
+   * A MODIFIED file is captured as `edit_file` with the previously projected content as its
+   * 3-way merge base — that base is already in hand here, and blobs are content-addressed so
+   * re-putting it is free (dedup). This is what lets two sessions editing disjoint regions of
+   * one file auto-merge (L1) instead of colliding as two base-less `put_file`s (docs/15 §3).
+   * ADDED files keep `put_file` (a create genuinely has no base), and so does any content that
+   * is not losslessly UTF-8 text (see `#isMergeableText`).
+   *
+   * Capture also runs the early conflict warning with CROSS-LINE visibility: the git bridge
+   * maps each branch to its own line, so a competing session is on a *different* line and a
+   * line-scoped check would never see it. The warnings are returned (`contention`) so the CLI
+   * can put them in front of the human running `git commit`.
    */
   async commitWorkingTree(
     workDir: string,
     opts: { message: string; actor: Actor; line?: string; ignorePredicate?: (rel: string) => boolean },
-  ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string }> {
+  ): Promise<{ ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string; contention: ContentionWarning[] }> {
     const view = opts.line ?? "main";
     const res = await this.materialize(view);
     const current = new Map((await this.materializedBytes(res)).map((f) => [f.path, f.bytes]));
@@ -2437,18 +2502,39 @@ export class Repo {
     for (const path of current.keys()) if (!disk.has(path)) removed.push(path);
 
     const ops: string[] = [];
-    if (!added.length && !modified.length && !removed.length) return { ops, added, modified, removed, intent: "" };
+    const contention: ContentionWarning[] = [];
+    if (!added.length && !modified.length && !removed.length) return { ops, added, modified, removed, intent: "", contention };
 
     const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
     const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
     const deps = res.headOps;
+    // Collect the early warnings each propose raises, de-duplicated per entity key.
+    const seenKeys = new Set<string>();
+    const collect = (warnings: ContentionWarning[]): void => {
+      for (const w of warnings) {
+        if (seenKeys.has(w.key)) continue;
+        seenKeys.add(w.key);
+        contention.push(w);
+      }
+    };
+    const warn = { warnContention: true, contentionAcrossLines: true, onContention: collect } as const;
+    const isModified = new Set(modified);
+    // One sorted pass over both categories keeps op authoring order (and therefore lamport
+    // assignment) exactly as before; only the op KIND differs per category.
     for (const path of [...added, ...modified].sort()) {
-      ops.push(await this.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: opts.actor, path, content: disk.get(path)!, declaredPurpose: opts.message, causalDeps: deps, line: opts.line }));
+      const content = disk.get(path)!;
+      const base = isModified.has(path) ? current.get(path)! : undefined;
+      const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path, declaredPurpose: opts.message, causalDeps: deps, line: opts.line, ...warn };
+      ops.push(
+        base !== undefined && this.#isMergeableText(base) && this.#isMergeableText(content)
+          ? await this.proposeEdit({ ...common, newText: content.toString("utf8"), baseBlobOid: await this.putBlob(base) })
+          : await this.proposeFileWrite({ ...common, content }),
+      );
     }
     for (const path of removed.sort()) {
-      ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line }));
+      ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...warn }));
     }
-    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), intent };
+    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), intent, contention };
   }
 
   // ── git bridge (docs/14) ───────────────────────────────────────────────────
@@ -2599,6 +2685,9 @@ export class Repo {
   async gitSync(opts: { message: string; actor: Actor; line?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; intent: string };
+    /** Cross-line early warnings the capture raised (docs/17 §15.3): another branch/session
+     *  has live concurrent work on a file this commit touches. Advisory — never blocking. */
+    contention: ContentionWarning[];
     conflicts: ReductionResult["conflicts"];
     checkpoint?: string;
     treeHash?: string;
@@ -2617,12 +2706,12 @@ export class Repo {
     await this.#writeGitignore(mode);
     // 2. Conflict gate.
     const res = await this.materialize(view);
-    if (res.conflicts.length > 0) return { mode, captured, conflicts: res.conflicts };
+    if (res.conflicts.length > 0) return { mode, captured, contention: cap.contention, conflicts: res.conflicts };
     // 3. Checkpoint the verified state. 4. Re-project the working tree.
     const checkpoint = await this.createCheckpoint(view, opts.message);
     const written = await this.checkoutInto(workDir, view);
     this.logger.info("git.sync", { view, mode, capturedOps: captured.ops.length, checkpoint, treeHash: res.treeHash });
-    return { mode, captured, conflicts: [], checkpoint, treeHash: res.treeHash, reprojected: written.length };
+    return { mode, captured, contention: cap.contention, conflicts: [], checkpoint, treeHash: res.treeHash, reprojected: written.length };
   }
 
   // ── backup / transfer (docs/10 WS-F) ──────────────────────────────────────
