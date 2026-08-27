@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ObjectStore } from "../src/store/objectStore.ts";
 import { Repo } from "../src/api/repo.ts";
@@ -67,4 +68,34 @@ test("a plain repo directory is unaffected", async () => {
   await Repo.init(main);
   assert.equal(ObjectStore.resolveStoreDir(main), join(main, ".avcs"));
   assert.equal(ObjectStore.isRepo(main), true);
+});
+
+test("MCP repo resolution follows a pointer, and its miss message names the fix", async () => {
+  const { resolveRepoDir } = await import("../src/mcp/server.ts");
+  const main = await tmp();
+  await Repo.init(main);
+  const linked = await tmp();
+  await writeFile(join(linked, ".avcs"), `avcsdir: ${join(main, ".avcs")}\n`);
+
+  assert.equal(await resolveRepoDir(linked, async () => []), linked);
+
+  // The last-resort candidate is the server's own process.cwd(), which under `npm test` is
+  // this repo — so the miss has to be observed from a process that starts somewhere else.
+  const bare = await tmp();
+  const probe = join(bare, "probe.ts");
+  await writeFile(
+    probe,
+    `import { resolveRepoDir } from ${JSON.stringify(join(import.meta.dirname, "..", "src", "mcp", "server.ts"))};\n` +
+      `try { await resolveRepoDir(undefined, async () => []); console.log("RESOLVED"); }\n` +
+      `catch (e) { console.log((e as Error).message); }\n`,
+  );
+  const { stdout } = spawnSync(process.execPath, ["--experimental-strip-types", probe], {
+    cwd: bare,
+    encoding: "utf8",
+  });
+  assert.match(
+    stdout,
+    /avcs worktree attach/,
+    "a linked working tree is the likeliest cause, so the message must name the fix",
+  );
 });

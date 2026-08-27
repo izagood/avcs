@@ -235,8 +235,9 @@ export async function resolveRepoDir(
   if (root) return root;
   throw new Error(
     `could not locate an AVCS repo. Searched at and above: ${tried.join(", ") || "(nowhere)"}. ` +
-      "Pass `cwd` to the tool, register the server with AVCS_REPO (`avcs mcp install --repo <dir>`), " +
-      "or run `avcs init`.",
+      "If this is a linked working tree, run `avcs worktree attach` in it to point at the main " +
+      "checkout's store. Otherwise pass `cwd` to the tool, register the server with AVCS_REPO " +
+      "(`avcs mcp install --repo <dir>`), or run `avcs init`.",
   );
 }
 
