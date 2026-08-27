@@ -154,7 +154,11 @@ interface Built {
 }
 
 /** A scaffold `put_file` plus N concurrent `edit_file`s over it, all sharing one base. */
-function scenario(edits: Edit[], materializeStatuses?: ReduceInput["materializeStatuses"]): Built {
+function scenario(
+  edits: Edit[],
+  materializeStatuses?: ReduceInput["materializeStatuses"],
+  policy = defaultPolicy(),
+): Built {
   const blobContent = new Map<string, Buffer>();
   const blob = (content: string): string => {
     const oid = `blob_${sha256hex(content).slice(0, 24)}`;
@@ -188,7 +192,7 @@ function scenario(edits: Edit[], materializeStatuses?: ReduceInput["materializeS
   }
   const input: ReduceInput = {
     ops, evidence, decisions: [], intents: new Map<string, Intent>(),
-    policy: defaultPolicy(), blobContent, materializeStatuses,
+    policy, blobContent, materializeStatuses,
   };
   const result = reduce(input);
   return {
@@ -633,4 +637,43 @@ test("R12: a policy change that flips a region's winner survives a cold load of 
   } finally {
     await rm(l.dir, { recursive: true, force: true });
   }
+});
+
+// ── R4: code ownership — what the current policy engine can and cannot express ──
+//
+// docs/22 R4 expects "the code-owner's side takes the region". Against the code as it
+// stands that is only half expressible: `ownersFor`/`Conflict.requiredOwners` ROUTE a
+// conflict to its owners but contribute nothing to `evaluateOp`'s score, so ownership alone
+// cannot win a region. What a policy CAN declare is `prefer_actor`, and that does decide it.
+// Both halves are pinned here so the gap is a recorded fact rather than a surprise.
+test("R4: an owner rule alone does not decide a region; a declared prefer_actor does", () => {
+  const owned = scenario(
+    [
+      { actor: AI_A, text: say("A"), at: 1 },
+      { actor: AI_B, text: say("B"), at: 2 },
+    ],
+    undefined,
+    { ...defaultPolicy(), owners: [{ scope: `file:${FILE}`, owners: [AI_B.id] }] },
+  );
+  assert.equal(
+    owned.text(),
+    say("A"),
+    "ownership routes the decision, it does not score it — so the region stays undecided",
+  );
+
+  const preferred = scenario(
+    [
+      { actor: AI_A, text: say("A"), at: 1 },
+      { actor: CI, text: say("CI"), at: 2 },
+    ],
+    undefined,
+    {
+      ...defaultPolicy(),
+      rules: [
+        ...defaultPolicy().rules,
+        { name: "prefer_the_runner", when: { onConflict: true }, effect: { type: "prefer_actor", kind: "ci_bot" } },
+      ],
+    },
+  );
+  assert.equal(preferred.text(), say("CI"), "a policy-declared actor preference takes the region");
 });
