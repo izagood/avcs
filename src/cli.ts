@@ -145,6 +145,24 @@ function gitIgnorePredicate(dir: string): (rel: string) => boolean {
   return (rel: string): boolean => gitCmd(dir, ["check-ignore", "-q", rel]) !== null;
 }
 
+/**
+ * Put the capture path's cross-line contention warnings in front of the human (docs/17 §15.3).
+ * The git bridge gives every branch its own AVCS line, so this is the only place a session
+ * learns that another branch has live concurrent work on a file it just committed. Advisory:
+ * it never changes the exit code — only an open conflict blocks a commit.
+ */
+function reportContention(warnings: import("./api/repo.ts").ContentionWarning[]): void {
+  for (const w of warnings) {
+    const file = w.key.startsWith("file:") ? w.key.slice("file:".length) : w.key;
+    for (const t of w.theirs) {
+      console.error(`avcs: contention on ${file} — ${t.actor} has live concurrent work on line '${t.line ?? "main"}' (${t.op.slice(0, 16)}: ${t.purpose}). Not blocking; coordinate before you land.`);
+    }
+    for (const l of w.leaseHolders) {
+      console.error(`avcs: contention on ${file} — ${l.actor} holds a lease over '${l.scope}' until ${l.expiresAt}. Not blocking; coordinate before you land.`);
+    }
+  }
+}
+
 /** Ensure the line/view exists before sync targets it (auto-forked from main on the first
  *  commit on a branch). No-op for the default `main` line/view, which always exists. */
 async function ensureLine(repo: Repo, line?: string): Promise<void> {
@@ -619,6 +637,7 @@ async function main(): Promise<void> {
       for (const p of r.added) console.log(`  A ${p}`);
       for (const p of r.modified) console.log(`  M ${p}`);
       for (const p of r.removed) console.log(`  D ${p}`);
+      reportContention(r.contention);
       console.log(`committed ${r.ops.length} change(s) as "${message}"`);
       break;
     }
@@ -665,6 +684,7 @@ async function main(): Promise<void> {
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
+      reportContention(r.contention);
       if (r.conflicts.length) {
         console.error(`\n✗ ${r.conflicts.length} open conflict(s) need a human — refusing to stage a conflicted tree.`);
         console.error(`  run \`avcs conflicts ${line ?? "main"}\` to review; resolve, then re-run git-sync.`);
@@ -825,6 +845,7 @@ async function main(): Promise<void> {
             break; // fail open: let git complete the commit
           }
           const r = res.value;
+          reportContention(r.contention);
           if (r.conflicts.length) {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
             process.exit(1); // abort the commit
@@ -880,7 +901,10 @@ async function main(): Promise<void> {
             return repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...(line ? { line } : {}), ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
           if (!res.ok) console.error(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
-          else if (res.value.conflicts.length) console.error(`avcs: ${res.value.conflicts.length} open conflict(s) after merge — run \`avcs conflicts ${line ?? "main"}\`.`);
+          else {
+            reportContention(res.value.contention);
+            if (res.value.conflicts.length) console.error(`avcs: ${res.value.conflicts.length} open conflict(s) after merge — run \`avcs conflicts ${line ?? "main"}\`.`);
+          }
           break;
         }
         default:
