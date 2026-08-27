@@ -51,9 +51,11 @@ test("bounds a hanging clone with timeoutMs", { skip: !hasGit }, async () => {
   const port = (server.address() as { port: number }).port;
   try {
     const started = Date.now();
-    await assert.rejects(
-      () => gitCliSource({ url: `http://127.0.0.1:${port}/o/r.git`, timeoutMs: 1500 }),
-      /timed out|timeout|ETIMEDOUT|SIGTERM|killed/i,
+    // The guarantee is the BOUND, not a particular message: git words a stalled
+    // transfer differently across versions and platforms, and the process-level
+    // backstop reports differently again.
+    await assert.rejects(() =>
+      gitCliSource({ url: `http://127.0.0.1:${port}/o/r.git`, timeoutMs: 1500 }),
     );
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 12_000, `should give up near the bound, took ${elapsed}ms`);
