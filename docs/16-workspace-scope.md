@@ -119,10 +119,17 @@ avcs엔 이미 actor kind(human/ai_agent/ci_bot) + authority weight + keyring이
 
 ## 7. shared-paths — 빌드 환경 공유 (코어 무지 유지)
 
+> **구현됨.** 명세와 검증 매트릭스는 [21 — shared-paths](21-shared-paths.md)로 분리했다.
+> 설정은 `.avcs/shared-paths.json`, 표면은 `avcs shared ls|add|rm` · `avcs workspace project`의
+> 공유 상태 출력 · `avcs gc --shared`다.
+
 git worktree의 약점이 #11의 고통이다: worktree마다 `node_modules`가 따로라 매번 install. native workspace는 **shared-paths**로 해결한다 — 투영에서 제외하고 중앙 캐시를 심링크/오버레이하는 경로 집합.
 
 - avcs는 그게 `node_modules`인지 **모른다.** `.avcsignore`(#10)와 같은 "내용 모르고 경로 규칙만" 패턴이라 코어의 빌드 무지(원칙 2)가 유지된다.
 - 효과: 의존성 install이 workspace 생성당 1회(같은 lock-해시끼리 캐시 공유), 매 검증마다 아님. #11의 "매번 빌드 환경 재현"이 외부 의존이 아니라 **workspace 구조**로 풀린다.
+- **코어는 설치를 실행하지 않는다.** 자리를 만들고 연결하고 캐시가 비어 있는지(`populated`)만
+  보고한다. 채우는 일은 호출자(사람/에이전트/CI)의 것이고, 코어가 설치 방법을 아는 순간 원칙 2가
+  깨진다 — 그 경계가 이 부품의 전체 인터페이스다([21](21-shared-paths.md) §2-2).
 
 ## 8. `validate_run` 재정의
 
@@ -143,9 +150,15 @@ avcs는 환경을 만들지 않고 빌려 쓴다. 자가검증(작성자=서명�
 
 0. ~~**landed workspace 가시성**~~ — 해소됨(#78, §4.2의 구현 정정). land된 workspace의 op은
    base view와 다른 workspace view 모두에서 보인다.
-1. **shared-path 무결성** — `node_modules`를 공유하는데 두 workspace의 `package.json`/lock이 다르면 깨진다. 공유 키(lock 경로/해시)를 사용자·에이전트가 지정하는 형태가 유력(코어 무지 유지). lock-해시 기반 자동 분리까지 코어가 책임질지는 미정.
+1. ~~**shared-path 무결성**~~ — 해소됨([21](21-shared-paths.md) §3.2). 사용자가 `keyFrom`으로
+   *어떤 파일이 환경을 결정하는지* 선언하고, 코어는 그 파일들의 **투영된 내용**을 해시해 캐시를
+   키별로 분리한다. 파일의 의미는 여전히 모르므로 코어 무지가 유지되고, lock 내용이 다른 두
+   workspace는 자동으로 다른 캐시를 얻는다.
 2. **투영 비용** — 큰 저장소 물리 복제. hardlink/CoW 투영 필요.
-3. **op 캡처 경계** — workspace에서의 수정을 op로 캡처할 때 shared-path가 op로 새지 않게(#10 ignore 재사용).
+3. ~~**op 캡처 경계**~~ — 해소됨([21](21-shared-paths.md) §3.5). shared-path를 `#readWorkTree`의
+   ignore 술어에 **코어에서 합성**하므로 `.avcsignore`에 적었는지와 무관하게 새지 않는다.
+   symlink 모드는 `Dirent`의 lstat 의미로 이미 순회에서 빠지고(S8이 회귀로 고정), 실제 디렉터리를
+   놓는 `copy` 모드는 그 합성이 유일한 방어선이다(S8b).
 4. **land merge 시맥틱** — workspace op를 base에 accept할 때 reduce의 3-way merge로 자동 합류(§6). conflict는 `conflict_list`로 표면화 → 사람/정책 결정.
 5. **land 취소 없음** — `landWorkspace`는 추가 전용이고 `unlandWorkspace`는 없다. 그래서
    자동 land 경로(git 브리지, [20](20-workspace-bridge.md) §3.4)는 병합 브랜치를 확신할 수

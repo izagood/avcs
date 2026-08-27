@@ -265,6 +265,10 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [16 — Workspace scope](docs/16-workspace-scope.md)
 - [17 — Sync convergence: integration queue & live sync (design)](docs/17-sync-convergence.md)
 - [18 — MCP as the first-class connection](docs/18-mcp-first-class.md)
+- [19 — Entity identity: rename × edit commutativity](docs/19-entity-identity.md)
+- [20 — Workspace-first git bridge](docs/20-workspace-bridge.md)
+- [21 — shared-paths: build environments shared across workspaces](docs/21-shared-paths.md)
+- [22 — Region policy arbitration (design)](docs/22-region-arbitration.md)
 
 ## Contributing
 

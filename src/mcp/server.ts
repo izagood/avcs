@@ -466,9 +466,20 @@ export const TOOLS: ToolDef[] = [
     handler: async (repo, i) => {
       const view = (i.view as string) ?? "main";
       const workspace = typeof i.name === "string" ? i.name : undefined;
-      const files = await repo.checkoutInto(String(i.out), view, workspace ? { workspace } : undefined);
+      const projected = await repo.projectInto(String(i.out), view, workspace ? { workspace } : undefined);
       const res = await repo.materialize(view, workspace ? { workspace } : undefined);
-      return { dir: String(i.out), fileCount: files.length, treeHash: res.treeHash };
+      // Shared build environments (docs/21). An agent about to build needs exactly one fact
+      // the core can supply — is the cache empty? — and the core supplies only that. It never
+      // learns to run the install itself (docs/21 §2 principle 2).
+      const shared = projected.shared.map((s) => ({
+        path: s.path, key: s.key, cache: s.cache, mode: s.mode, linked: s.linked, populated: s.populated,
+        ...(s.warning ? { warning: s.warning } : {}),
+      }));
+      return {
+        dir: String(i.out), fileCount: projected.written.length, treeHash: res.treeHash,
+        ...(shared.length ? { shared } : {}),
+        ...(projected.skipped.length ? { skippedInSharedPaths: projected.skipped.length } : {}),
+      };
     },
   },
   {

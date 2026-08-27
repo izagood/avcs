@@ -670,8 +670,13 @@ async function main(): Promise<void> {
     case "gc": {
       const repo = await Repo.open(cwd);
       const dryRun = args.includes("--dry-run");
-      const r = await repo.gc({ dryRun });
-      console.log(`${dryRun ? "would collect" : "collected"} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
+      // `--shared` is opt-in on purpose (docs/21 §3.6): reclaiming a build-environment cache
+      // costs somebody an install, which is not a price a routine `gc` may set.
+      const shared = args.includes("--shared");
+      const r = await repo.gc({ dryRun, ...(shared ? { shared: true } : {}) });
+      const verb = dryRun ? "would collect" : "collected";
+      console.log(`${verb} ${r.blobs.length} orphan blob(s), ${r.quarantinedOps.length} expired quarantine op(s)`);
+      if (shared) console.log(`${verb} ${r.sharedKeys.length} shared cache(s)${r.sharedKeys.length ? `: ${r.sharedKeys.join(", ")}` : ""}`);
       break;
     }
     case "pack": {
@@ -1085,6 +1090,45 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "shared": {
+      // Build-environment sharing (docs/21): the path rules whose content the core keeps out
+      // of the op graph but still puts in the directory. This command only EDITS the rules —
+      // the linking happens at projection time, and nothing here ever runs an install.
+      const repo = await Repo.open(cwd);
+      const sub = args[1];
+      if (!sub || sub === "ls") {
+        const entries = await repo.readSharedPaths();
+        if (!entries.length) { console.log("(no shared paths — `avcs shared add <path> --key-from <file>`)"); break; }
+        for (const e of entries) {
+          const keyFrom = e.keyFrom?.length ? e.keyFrom.join(",") : "(unkeyed — one cache for every workspace)";
+          console.log(`${e.path}  mode=${e.mode ?? "symlink"}  key-from=${keyFrom}`);
+        }
+      } else if (sub === "add") {
+        const path = args[2];
+        if (!path || path.startsWith("--")) throw new Error("usage: avcs shared add <path> [--key-from <file>[,<file>...]] [--mode symlink|copy]");
+        const keyFrom = (flag("--key-from") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+        const mode = flag("--mode");
+        if (mode && mode !== "symlink" && mode !== "copy") throw new Error(`--mode must be symlink or copy: ${mode}`);
+        await repo.addSharedPath({ path, keyFrom, ...(mode ? { mode: mode as "symlink" | "copy" } : {}) });
+        console.log(`shared: ${path} (mode=${mode ?? "symlink"}, key-from=${keyFrom.length ? keyFrom.join(",") : "(unkeyed)"})`);
+        if (!keyFrom.length) console.log("  warning: no --key-from, so EVERY workspace shares one cache regardless of its lockfiles (docs/21 §3.2)");
+      } else if (sub === "rm") {
+        // `--cache <key>` throws away a cache directory (docs/21 R2: the core only reports
+        // "non-empty", so a half-finished install is the caller's to discard).
+        const key = flag("--cache");
+        if (key) {
+          const dropped = await repo.dropSharedCache(key);
+          console.log(dropped ? `dropped shared cache ${key}` : `no shared cache ${key}`);
+          break;
+        }
+        const path = args[2];
+        if (!path) throw new Error("usage: avcs shared rm <path> | avcs shared rm --cache <key>");
+        console.log(await repo.removeSharedPath(path) ? `removed shared path ${path} (its cache is kept — use \`avcs gc --shared\`)` : `no shared path ${path}`);
+      } else {
+        throw new Error("usage: avcs shared <ls|add|rm> ...");
+      }
+      break;
+    }
     case "workspace": {
       // Native build/verify isolation (docs/16): project a workspace's view to a dir,
       // land it onto its base, or list landed workspaces. `project` is the physical
@@ -1105,8 +1149,20 @@ async function main(): Promise<void> {
           hasExistingLine: !!(await repo.store.getRef(`line:${trunk}`)),
         });
         const view = flag("--view") ?? trunkScope.line ?? "main";
-        const written = await repo.checkoutInto(out, view, { workspace: name });
-        console.log(`projected workspace ${name} over ${view}: ${written.length} file(s) to ${out}`);
+        const projected = await repo.projectInto(out, view, { workspace: name });
+        console.log(`projected workspace ${name} over ${view}: ${projected.written.length} file(s) to ${out}`);
+        // Shared build environment (docs/21). The core linked a cache and reported whether it
+        // is empty; running the install is the caller's job and stays the caller's job, so all
+        // this does is say which side of that line each path is on.
+        for (const s of projected.shared) {
+          const state = !s.linked ? "NOT LINKED" : s.populated ? "ready" : "EMPTY — run your install once";
+          console.log(`shared: ${s.path} → ${s.cache} (${state})`);
+          if (s.warning) console.log(`  warning: ${s.warning}`);
+        }
+        if (projected.skipped.length) {
+          console.error(`avcs: ${projected.skipped.length} recorded file(s) live inside a shared path and were NOT written (e.g. ${projected.skipped[0]}).`);
+          console.error(`  that history predates this shared-path rule; capture can no longer add to it.`);
+        }
       } else if (sub === "land") {
         const name = args[2];
         if (!name) throw new Error("usage: avcs workspace land <name>");
@@ -1227,7 +1283,7 @@ async function main(): Promise<void> {
           "  key provision <actor-id> | key ls   local signing keys (decisions, hub writes)\n" +
           "  conflicts [view] [--workspace w]  list decisions a human owes (defaults to this branch's scope)\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
-          "  gc [--dry-run]              reclaim orphan blobs + expired quarantine ops\n" +
+          "  gc [--dry-run] [--shared]   reclaim orphan blobs + expired quarantine ops (--shared: unused build caches)\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
           "  compact [view]              persist a base snapshot (cold materialize folds history)\n" +
           "  fsck [--rebuild]            verify object integrity + op-log; --rebuild repairs the log\n" +
@@ -1255,6 +1311,8 @@ async function main(): Promise<void> {
           "  lines                       list lineage lines (Phase 8)\n" +
           "  trunk [<branch>]            show/set the branch that carries the base view (docs/20)\n" +
           "  workspace project <n> [--out d] | land <n> | list   converging work scopes (docs/16, 20)\n" +
+          "  shared ls | add <path> [--key-from f,f] [--mode symlink|copy] | rm <path>|--cache <key>\n" +
+          "                              build environments shared across workspaces (docs/21)\n" +
           "  blame <entityKey> [--line l] who owns an entity and why\n" +
           "  diff <viewA> <viewB>        added/removed/modified paths\n" +
           "  log                         operation history\n" +
