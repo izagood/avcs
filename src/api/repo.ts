@@ -330,8 +330,8 @@ export class Repo {
   async importLocalKey(source: string, actorId?: string): Promise<string> {
     const { readdir: rd } = await import("node:fs/promises");
     let file = source;
-    const asRepoRoot = existsSync(join(source, ".avcs", "private"))
-      ? join(source, ".avcs", "private")
+    const asRepoRoot = existsSync(join(ObjectStore.resolveStoreDir(source), "private"))
+      ? join(ObjectStore.resolveStoreDir(source), "private")
       : existsSync(join(source, "private")) && existsSync(join(source, "objects"))
         ? join(source, "private")
         : null;
@@ -2454,7 +2454,7 @@ export class Repo {
   // ── git bridge (docs/14) ───────────────────────────────────────────────────
   /** Read `.avcs/config.json` (a torn/absent file is treated as empty). */
   async #readConfig(): Promise<Record<string, unknown>> {
-    const p = join(this.dir, ".avcs", "config.json");
+    const p = join(this.store.root, "config.json");
     if (!existsSync(p)) return {};
     try { return JSON.parse(await readFile(p, "utf8")) as Record<string, unknown>; } catch { return {}; }
   }
@@ -2547,14 +2547,14 @@ export class Repo {
 
   /** Read the pending provenance handoff for `workDir`, or null if none is staged. */
   async readGitPending(workDir = this.dir): Promise<{ checkpoint: string; treeHash: string; intent?: string } | null> {
-    const p = join(this.dir, ".avcs", this.#pendingRel(workDir));
+    const p = join(this.store.root, this.#pendingRel(workDir));
     if (!existsSync(p)) return null;
     try { return JSON.parse(await readFile(p, "utf8")); } catch { return null; }
   }
 
   /** Clear the pending provenance handoff for `workDir` (post-commit, after recording the back-link). */
   async clearGitPending(workDir = this.dir): Promise<void> {
-    await rm(join(this.dir, ".avcs", this.#pendingRel(workDir)), { force: true });
+    await rm(join(this.store.root, this.#pendingRel(workDir)), { force: true });
   }
 
   /**
@@ -2567,7 +2567,7 @@ export class Repo {
    * Idempotent.
    */
   async reindex(): Promise<{ ops: number }> {
-    await rm(join(this.dir, ".avcs", "indexes"), { recursive: true, force: true });
+    await rm(join(this.store.root, "indexes"), { recursive: true, force: true });
     let ops = 0;
     for await (const op of this.store.list<Operation>("operation")) {
       const oid = op.oid as string;
@@ -2578,7 +2578,7 @@ export class Repo {
     // cursor) so both reflect objects that arrived via git rather than the store's writes.
     await this.store.rebuildOpLog();
     this.#opCache.clear();
-    await rm(join(this.dir, ".avcs", "objlog"), { force: true }); // lazily backfilled on next read
+    await rm(join(this.store.root, "objlog"), { force: true }); // lazily backfilled on next read
     this.logger.info("reindex", { ops });
     return { ops };
   }
@@ -2700,7 +2700,7 @@ export class Repo {
    *  Rejects (and ignores) a corrupt file, a pre-13.3 headerless file, or a header whose
    *  materializer version / policy oid no longer matches — full reduce is always correct. */
   async #loadPersistedSnapshot(view: string): Promise<void> {
-    const p = join(this.dir, ".avcs", "snapshot", `${view}.cbor`);
+    const p = join(this.store.root, "snapshot", `${view}.cbor`);
     if (!existsSync(p)) return;
     try {
       const raw = decodeCbor(await readFile(p)) as { header?: { materializerVersion?: string; policyOid?: string }; snapshot?: unknown };

@@ -29,7 +29,7 @@ avcs git-mode committed        # 전환 (.gitignore/.gitattributes 재작성)
 
 ### 자동 (권장) — git 훅
 
-`avcs init`은 git 레포 안이면 훅 4종을 자동 설치한다(`--no-hooks`로 생략, 나중에 `avcs install-hooks`). 그러면 **평소처럼 git만 써도** AVCS가 따라온다:
+`avcs init`은 git 레포 안이면 훅 5종을 자동 설치한다(`--no-hooks`로 생략, 나중에 `avcs install-hooks`). 그러면 **평소처럼 git만 써도** AVCS가 따라온다:
 
 ```bash
 # 파일 편집 (사람이든 에이전트든)
@@ -41,6 +41,8 @@ git commit -m "feat: ..."   # 훅이 알아서:
 git push
 
 git pull                    # post-merge: reindex(op-log 재구축) + 재투영 → 결정론적 수렴
+
+git worktree add ../feat -b feat   # post-checkout: 새 working tree를 메인 스토어에 attach
 ```
 
 - 열린(needs-human) 충돌이 있으면 pre-commit이 커밋을 **중단**한다. `avcs conflicts`로 해결 후 다시 커밋.
@@ -84,11 +86,41 @@ avcs verify-git <commit>     # 특정 커밋 검사
 - 두 replica가 같은 객체 집합을 가지면 같은 `treeHash`로 수렴한다(결정론).
 - **refs 충돌**: 가변 ref(view/checkpoint head)는 git에서 텍스트 충돌할 수 있다. 현재는 수동 해결(union/latest 선택) 후 `avcs reindex`. 전용 merge driver는 후속 과제.
 
+## Linked working tree (git worktree)
+
+git worktree로 만든 **linked working tree**는 `.git`이 디렉터리가 아니라 `gitdir: <경로>` 한 줄을 담은 **파일**이다. AVCS도 같은 방식을 쓴다: linked tree의 `.avcs`는 `avcsdir: <경로>` 한 줄을 담은 **포인터 파일**이고, 실제 스토어는 메인 체크아웃에 하나만 있다.
+
+왜 필요한가: sidecar 모드에서 `.avcs/`는 git이 추적하지 않으므로 **git이 새 working tree로 스토어를 배달해 주지 않는다**. 그리고 AVCS의 루트 탐색은 git처럼 위로 올라가는데, linked tree는 보통 메인 체크아웃의 하위 경로가 아니라 위로 올라가도 스토어를 못 만난다. 포인터가 그 간극을 메운다.
+
+```bash
+cd <linked-working-tree>
+avcs worktree attach            # 메인 체크아웃을 git으로 찾아 포인터를 쓴다
+avcs worktree attach --to <dir> # git이 없거나 다른 스토어를 가리키고 싶을 때
+avcs worktree status            # attached → <store> / own store: <path>
+avcs worktree detach            # 포인터 제거 (실제 스토어는 절대 지우지 않는다)
+```
+
+훅이 설치돼 있으면 **수동 단계는 필요 없다**. `git worktree add`가 새 tree 안에서 `post-checkout`을 실행하고, 그 자리에서 포인터가 생긴다. 평범한 브랜치 전환은 아무것도 바꾸지 않는다.
+
+### 하나의 스토어, working tree마다 다른 line
+
+`lineFor`는 현재 git 브랜치를 AVCS line으로 매핑한다(`main`/`master`는 기본 line). working tree마다 브랜치가 다르므로 **스토어는 공유하되 line은 분리**된다 — git의 "하나의 object store + 여러 worktree"와 동형이다.
+
+투영 위치는 헷갈리지 않는다: 포인터를 따라가도 **repo root는 그 working tree 자신**이고 스토어만 메인에 있다. `materialize`/`checkout`은 해당 tree에 쓰고, 워킹트리 캡처도 그 tree를 읽는다.
+
+### 안전장치
+
+- `avcs init`은 메인 체크아웃에 이미 스토어가 있는 linked tree에서 **멈추고** `avcs worktree attach`를 안내한다. 분기된 스토어는 서로를 영원히 모르는 두 히스토리가 되므로, 기본 경로에서는 만들 수 없게 했다. 의도적 분리는 `avcs init --force`.
+- `avcs worktree attach`는 이미 진짜 스토어가 있는 디렉터리를 덮지 않고, `detach`는 진짜 스토어를 지우지 않는다.
+- 포인터는 레포 공용 `info/exclude`에 등록되므로 git status가 더럽혀지지 않는다(`.avcs/.gitignore`는 스토어 *안*에 있어서 포인터에는 적용되지 않는다).
+- **committed 모드에서는 attach를 거부한다.** 그 모드에서는 git이 이미 `.avcs`를 모든 working tree로 배달하므로 포인터가 git과 자리를 다툰다.
+
 ## 한계 (MVP)
 
 - 훅은 **전체 워킹트리 커밋**을 가정한다(`git commit <부분파일>`은 미지원). `--no-verify`는 캡처를 건너뛴다.
 - committed 모드의 refs 텍스트 충돌은 수동 해결.
 - sidecar 모드의 히스토리는 git으로 이동하지 않는다(로컬/hub 전용) — 팀 도입 시 `avcs git-mode committed`.
+- **committed 모드 + linked working tree는 아직 지원하지 않는다.** git이 working tree마다 `.avcs` 사본을 배달하므로 스토어가 tree 수만큼 갈라진다. 그래서 그 조합에서는 attach가 거부된다.
 
 ## 관련 명령 요약
 
@@ -98,5 +130,7 @@ avcs verify-git <commit>     # 특정 커밋 검사
 | `avcs git-mode [sidecar\|committed]` | 모드 표시/전환 |
 | `avcs git-sync -m <msg> [--commit]` | 수동 동기화 (커밋 직전까지 / 커밋까지) |
 | `avcs verify-git [<commit>]` | git 커밋 ↔ checkpoint provenance 검증 |
-| `avcs install-hooks [--force]` | 훅 4종 설치 |
+| `avcs install-hooks [--force]` | 훅 5종 설치 |
 | `avcs reindex` | entity index + op-log 재구축 (git pull 후 복구) |
+| `avcs worktree attach [--to <dir>]` | linked working tree를 메인 체크아웃의 스토어에 연결 |
+| `avcs worktree detach \| status` | 포인터 제거 / 스토어 위치 확인 |

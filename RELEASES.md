@@ -19,6 +19,44 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Added — linked git working trees share one store via a `.avcs` pointer file.**
+
+- `.avcs` may now be a *file* holding a single `avcsdir: <path>` line instead of a directory,
+  naming the store to use. This mirrors git's own trick: in a linked working tree `.git` is a
+  file saying `gitdir: <path>`. Resolution lives in `ObjectStore.resolveStoreDir()`, which the
+  `ObjectStore` constructor and `isRepo` both route through — the single place that computes a
+  store path — so the CLI, the MCP server, and any future entry point are fixed together.
+  - **No determinism impact.** The op format, `MERGE3_VERSION`, and `MATERIALIZER_VERSION` are
+    untouched; this changes only *where a store is found*, never how one reduces. A plain repo
+    resolves exactly as before.
+  - `findRepoRoot` still returns the **working tree**, not the store's owner, so `materialize`
+    and `checkout` keep writing to the tree the caller is in, and work-tree capture keeps
+    reading from it. Only the store is shared.
+  - New `avcs worktree attach [--to <dir>] | detach | status`. Attach writes the pointer and
+    adds `/.avcs` to the repo's shared `info/exclude` (`.avcs/.gitignore` cannot cover a
+    pointer, since that file lives *inside* the store). It refuses to shadow an existing store,
+    and `detach` refuses to delete one.
+  - `install-hooks` gains **`post-checkout`**, so `git worktree add` attaches the new tree by
+    itself. Fails open — a checkout is never blocked.
+  - `avcs init` now **stops** inside a linked working tree whose main checkout already has a
+    store, and names `avcs worktree attach`. `--force` still allows a deliberate split.
+  - **Why:** in sidecar mode `.avcs/` is untracked by design, so git cannot deliver the store
+    to a new working tree, and AVCS's upward root-finding never reaches it because a linked
+    tree is usually not under the main checkout. Only `git-sync`/`git-hook` had a workaround.
+    Everything else — including the whole MCP surface — reported "not an AVCS repo", and the
+    obvious next move (`avcs init`) silently forked the history into a second store.
+  - **Limitation:** committed mode + linked working trees is still unsupported — there git
+    carries `.avcs` into every tree, so the store forks per tree. `attach` refuses that
+    combination rather than fighting it.
+
+**Fixed — repo-local state is read through the store root.**
+
+- Seven call sites built paths as `join(this.dir, ".avcs", …)` rather than using `store.root`.
+  For a plain repo the two agree, so the split was invisible; through a pointer they diverge.
+  Notably `writeGitPending` already used `store.root` while `readGitPending` did not, so the
+  writer and the reader of the git-hook provenance handoff disagreed about its location.
+
+
 **Added — SSH-style transport authentication for hub writes. `HUB_PROTOCOL_VERSION` 1 → 2.**
 
 - Hub write endpoints (`POST /objects`, `POST /finalize`) can now require an `Authorization:
