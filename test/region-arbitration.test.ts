@@ -677,3 +677,46 @@ test("R4: an owner rule alone does not decide a region; a declared prefer_actor 
   );
   assert.equal(preferred.text(), say("CI"), "a policy-declared actor preference takes the region");
 });
+
+test("R10: two replicas that partition the authoring converge on the policy's region winner", async () => {
+  const a = await liveRepo();
+  const bDir = await mkdtemp(join(tmpdir(), "avcs-region-b-"));
+  try {
+    // A establishes the file, B clones that state, then each authors ONE concurrent edit.
+    const scaffold = await a.repo.proposeFileWrite({
+      sessionOid: a.sess, intentOid: a.intent, actor: HUMAN, path: FILE, content: SCAFFOLD,
+      declaredPurpose: "scaffold",
+    });
+    const b = await Repo.init(bDir);
+    await b.pull(a.dir);
+    const bIntent = await b.createIntent({ title: "region-b", owner: AI_B.id });
+    const bSess = await b.startSession({ intentOid: bIntent, actor: AI_B });
+
+    await a.repo.proposeEdit({
+      sessionOid: a.sess, intentOid: a.intent, actor: AI_A, path: FILE, baseText: SCAFFOLD,
+      newText: say("UNVERIFIED"), declaredPurpose: "A", causalDeps: [scaffold],
+    });
+    const bOp = await b.proposeEdit({
+      sessionOid: bSess, intentOid: bIntent, actor: AI_B, path: FILE, baseText: SCAFFOLD,
+      newText: say("VERIFIED"), declaredPurpose: "B", causalDeps: [scaffold],
+    });
+    await b.attachEvidence({ forOps: [bOp], kind: "unit_test", result: "pass", producedBy: CI });
+
+    // Cross-pull: both replicas now hold the identical object set.
+    await a.repo.pull(bDir);
+    await b.pull(a.dir);
+
+    const ra = await a.repo.materialize();
+    const rb = await b.materialize();
+    assert.equal(rb.treeHash, ra.treeHash, "identical object sets ⇒ identical treeHash");
+    const ca = (await a.repo.materializedFiles(ra)).find((f) => f.path === FILE)?.content;
+    const cb = (await b.materializedFiles(rb)).find((f) => f.path === FILE)?.content;
+    assert.equal(ca, say("VERIFIED"), "the verified change owns the region on replica A");
+    assert.equal(cb, say("VERIFIED"), "…and on replica B, which authored the loser's rival");
+    assert.equal(ra.fileConflicts.length, 0, "and neither replica reports it as open");
+    assert.equal(rb.fileConflicts.length, 0);
+  } finally {
+    await rm(a.dir, { recursive: true, force: true });
+    await rm(bDir, { recursive: true, force: true });
+  }
+});
