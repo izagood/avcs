@@ -825,6 +825,18 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     for (const d of deltaOpIds) if (a.has(d)) return true; // a delta op became this op's ancestor
     return false;
   };
+  // A contended region's winner is a function of the SCORES of the ops writing that path
+  // (docs/22 §4.2), so a change to a score INPUT dirties the path even when the projection is
+  // untouched: new evidence for an op, or a reliability shift for its actor, can flip which
+  // option takes the region. Without this the warm path would keep a region the cold path
+  // re-decides, and warm/cold would disagree on the tree — the one thing incremental reduce
+  // may never do. Group dirtiness already covers both signals; this carries them to PATHS.
+  const newEvidenceFor = new Set<string>();
+  for (const e of evidence)
+    if (!prevEvIds.has(e.oid as string)) for (const oid of e.forOps) newEvidenceFor.add(oid);
+  const scoreChanged = (o: Operation): boolean =>
+    newEvidenceFor.has(o.oid as string) || changedActors.has(o.actor.id);
+
   const dirtyPaths = new Set<string>();
   for (const o of ops) {
     const oid = o.oid as string;
@@ -843,6 +855,8 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     // agreement; `AVCS_VERIFY_INCREMENTAL=1`, incremental-equivalence and the C22 cases in
     // test/rename-incremental.test.ts are what catch it.
     else if (projectedNow(oid) && isCrossPath(o)) for (const p of pathsOf(o)) dirtyPaths.add(p);
+    // Score-input change (docs/22): the op still projects, but what it is WORTH changed.
+    else if (projectedNow(oid) && scoreChanged(o)) for (const p of pathsOf(o)) dirtyPaths.add(p);
   }
 
   const { tree, treeHash, headOps, synthBlobs } = materializeIncremental(

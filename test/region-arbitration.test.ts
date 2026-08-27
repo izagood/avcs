@@ -514,3 +514,123 @@ test("R-d: re-materializing the same op set does not mint a second decision for 
     await rm(s.dir, { recursive: true, force: true });
   }
 });
+
+// ── R9/R10/R11: determinism and warm/cold agreement ──────────────────────────
+
+import { reduceIncremental, snapshotReduce } from "../src/reducer/incremental.ts";
+
+/** The same op set as `scenario`, but as raw parts so a test can vary evidence/reliability. */
+function parts(edits: Edit[]): { input: ReduceInput; blobContent: Map<string, Buffer> } {
+  const b = scenario(edits);
+  return { input: b.input, blobContent: b.input.blobContent! };
+}
+const textOf = (r: ReturnType<typeof reduce>, blobContent: Map<string, Buffer>): string | undefined => {
+  const oid = r.tree.get(FILE);
+  return oid === undefined ? undefined : (r.synthBlobs.get(oid) ?? blobContent.get(oid))?.toString("utf8");
+};
+
+test("R9: shuffling the input order — and swapping who wrote first — leaves the tree identical", () => {
+  const mk = (humanAt: number, aiAt: number, shuffle: boolean): ReturnType<typeof reduce> => {
+    const { input } = parts([
+      { actor: HUMAN, text: say("HUMAN"), at: humanAt },
+      { actor: AI_A, text: say("AGENT"), at: aiAt },
+    ]);
+    const ops = shuffle ? [...input.ops].reverse() : input.ops;
+    return reduce({ ...input, ops });
+  };
+  const hashes = new Set([
+    mk(1, 2, false).treeHash,
+    mk(1, 2, true).treeHash,
+    mk(2, 1, false).treeHash,
+    mk(2, 1, true).treeHash,
+  ]);
+  assert.equal(hashes.size, 1, "one treeHash for every ordering — policy decided, not order");
+});
+
+test("R11: a region whose SCORE inputs changed is re-decided on the incremental path too", () => {
+  // The op set is identical in base and next; only the evidence differs. Nothing about the
+  // projection changed, so without a score-driven dirty path the warm path would keep the
+  // region it decided under the OLD evidence while a full reduce re-decides it.
+  const withEv = parts([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2, verified: true },
+  ]);
+  const noEv = parts([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2 },
+  ]);
+  const baseInput: ReduceInput = { ...noEv.input };
+  const nextInput: ReduceInput = { ...baseInput, evidence: withEv.input.evidence };
+
+  const snap = snapshotReduce(baseInput);
+  assert.equal(textOf(snap.result, noEv.blobContent), say("A"), "tie before the evidence lands");
+
+  const inc = reduceIncremental(snap, nextInput).result;
+  const full = reduce(nextInput);
+  assert.equal(textOf(full, noEv.blobContent), say("B"), "the evidence decides the region");
+  assert.equal(inc.treeHash, full.treeHash, "incremental ≡ full after an evidence-only delta");
+  assert.deepEqual([...inc.tree], [...full.tree]);
+});
+
+test("R11b: a reliability shift alone also re-decides the region incrementally", () => {
+  const { input, blobContent } = parts([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2 },
+  ]);
+  const baseInput: ReduceInput = { ...input, reliability: new Map<string, number>() };
+  const nextInput: ReduceInput = { ...input, reliability: new Map([[AI_B.id, 1]]) };
+  const snap = snapshotReduce(baseInput);
+  const inc = reduceIncremental(snap, nextInput).result;
+  const full = reduce(nextInput);
+  assert.equal(textOf(full, blobContent), say("B"), "the learned-trust nudge breaks the tie");
+  assert.equal(inc.treeHash, full.treeHash, "incremental ≡ full after a reliability-only delta");
+});
+
+test("R12: a policy change that flips a region's winner survives a cold load of a compacted base", async () => {
+  const l = await liveRepo();
+  try {
+    const base = { sessionOid: l.sess, intentOid: l.intent };
+    const scaffold = await l.repo.proposeFileWrite({
+      ...base, actor: HUMAN, path: FILE, content: SCAFFOLD, declaredPurpose: "scaffold",
+    });
+    await l.repo.proposeEdit({
+      ...base, actor: AI_A, path: FILE, baseText: SCAFFOLD, newText: say("AGENT"),
+      declaredPurpose: "agent", causalDeps: [scaffold],
+    });
+    await l.repo.proposeEdit({
+      ...base, actor: HUMAN, path: FILE, baseText: SCAFFOLD, newText: say("HUMAN"),
+      declaredPurpose: "human", causalDeps: [scaffold],
+    });
+    const before = await l.repo.materialize();
+    assert.equal(
+      (await l.repo.materializedFiles(before)).find((f) => f.path === FILE)?.content,
+      say("HUMAN"),
+      "the default policy's ladder puts the human on top",
+    );
+    await l.repo.compact("main");
+
+    // Invert the ladder and drop the prefer-human rule: the SAME ops must now yield the
+    // agent's region content. The persisted base was computed under the old policy, so the
+    // cold load must reject it (its header stamps the policy oid) rather than serve a tree
+    // the current policy would never produce.
+    const policy = await l.repo.policy();
+    await l.repo.setPolicy({
+      ...policy,
+      version: `${policy.version}+inverted`,
+      actorTrust: ["human", "ci_bot", "ai_agent"],
+      rules: policy.rules.filter((r) => r.name !== "human_wins_conflicts"),
+      createdAt: new Date().toISOString(),
+    });
+
+    const cold = await Repo.open(l.dir);
+    const after = await cold.materialize();
+    assert.equal(
+      (await cold.materializedFiles(after)).find((f) => f.path === FILE)?.content,
+      say("AGENT"),
+      "the inverted ladder gives the region to the agent",
+    );
+    assert.equal(cold.metrics.snapshot().counters["snapshot.cold.rejected"], 1, "stale base rejected");
+  } finally {
+    await rm(l.dir, { recursive: true, force: true });
+  }
+});
