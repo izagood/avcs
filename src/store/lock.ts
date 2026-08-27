@@ -29,6 +29,20 @@ export interface LockOptions {
 }
 
 /**
+ * A lock name is an IDENTIFIER, not a path. Callers build names by interpolation
+ * (`snapshot:${viewName}`, `lease:${scope}`), and those values routinely carry a slash — a
+ * view named after a `feature/x` git branch, for instance. Left raw, the name would reach
+ * the filesystem as a nested path whose parent does not exist, `mkdir` would fail ENOENT
+ * forever, and the acquire loop would spin at full CPU without ever timing out.
+ *
+ * Percent-encode the separators, `%` first so the mapping stays injective: "a/b" and the
+ * literal "a%2Fb" must not collide into one lock.
+ */
+function encodeLockName(name: string): string {
+  return name.replace(/%/g, "%25").replace(/\//g, "%2F").replace(/\\/g, "%5C");
+}
+
+/**
  * Run `fn` while holding the named lock under `locksDir`. Serializes concurrent
  * callers (same process or different processes) on the same name.
  */
@@ -40,7 +54,7 @@ export async function withLock<T>(
 ): Promise<T> {
   const maxWaitMs = opts.maxWaitMs ?? 10_000;
   const staleMs = opts.staleMs ?? 30_000;
-  const lockPath = join(locksDir, `${name}.lock`);
+  const lockPath = join(locksDir, `${encodeLockName(name)}.lock`);
   const ownerFile = join(lockPath, "owner");
   const start = Date.now();
 
@@ -59,7 +73,11 @@ export async function withLock<T>(
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
-        await mkdir(locksDir, { recursive: true }); // locks dir not there yet
+        // The locks dir isn't there yet — create it and retry. Bounded by the same deadline
+        // as every other retry: an ENOENT that does NOT clear (a name that escaped encoding,
+        // a dir removed underneath us) must surface as a timeout, never as a hot spin.
+        if (Date.now() - start > maxWaitMs) throw new Error(`lock timeout acquiring "${name}"`);
+        await mkdir(locksDir, { recursive: true });
         continue;
       }
       if (code !== "EEXIST") throw e;
