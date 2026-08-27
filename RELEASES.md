@@ -19,6 +19,25 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — a lock name containing a path separator spun forever instead of acquiring.**
+
+- `withLock` built its lock directory as `join(locksDir, name + ".lock")` with the name raw.
+  Names are built by interpolation — `snapshot:${viewName}`, `finalize:${view}` — and a view
+  named after a git branch carries a slash, so the path became nested and its parent did not
+  exist. `mkdir` failed `ENOENT`, which the acquire loop read as "the locks dir isn't there
+  yet", recreated it, and retried — forever, at full CPU, never consulting `maxWaitMs`.
+  - **Symptom:** `git commit` in a working tree on a `feature/x` branch hangs indefinitely
+    once the store is `AUTO_COMPACT_DELTA` ops past its persisted base, because the git hook's
+    materialize reaches snapshot auto-compaction. `land`/`integration.submit` on such a view
+    hang the same way through `finalize:${view}`.
+  - Lock names are now percent-encoded (`%` first, so the mapping stays injective and "a/b"
+    cannot collide with the literal "a%2Fb"), the same discipline `ObjectStore` already
+    applies to ref names.
+  - The `ENOENT` retry now honours the deadline, so no future path can spin unbounded.
+  - **Compatibility:** lock files are ephemeral, so nothing needs migrating. A lock held under
+    an old raw name cannot exist — that path never acquired.
+
+
 **Added — linked git working trees share one store via a `.avcs` pointer file.**
 
 - `.avcs` may now be a *file* holding a single `avcsdir: <path>` line instead of a directory,
