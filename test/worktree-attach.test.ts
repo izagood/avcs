@@ -119,3 +119,32 @@ test("attach refuses committed git mode, where git already delivers the store", 
   avcs(main, ["git-mode", "committed"]);
   assert.match(avcsErr(linked, ["worktree", "attach"]), /committed/);
 });
+
+test("with hooks installed, `git worktree add` attaches the new tree by itself", async () => {
+  const { main } = await fixture({ hooks: true });
+  const fresh = join(main, "..", "auto");
+  execFileSync("git", ["-C", main, "worktree", "add", "-q", "-b", "auto", fresh], { stdio: "ignore" });
+  assert.match(avcs(fresh, ["status"]), /view:/, "the new tree resolved the main store with no manual step");
+});
+
+test("post-checkout leaves an already-attached tree alone", async () => {
+  const { linked } = await fixture({ hooks: true });
+  avcs(linked, ["worktree", "attach"]);
+  const before = await readFile(join(linked, ".avcs"), "utf8");
+  execFileSync("git", ["-C", linked, "checkout", "-q", "-b", "other"], { stdio: "ignore" });
+  assert.equal(await readFile(join(linked, ".avcs"), "utf8"), before, "an ordinary branch switch changes nothing");
+});
+
+test("post-checkout never shadows the main checkout's own store", async () => {
+  const { main } = await fixture({ hooks: true });
+  execFileSync("git", ["-C", main, "checkout", "-q", "-b", "elsewhere"], { stdio: "ignore" });
+  assert.equal(statSync(join(main, ".avcs")).isDirectory(), true, "the real store is untouched");
+});
+
+test("post-checkout honours the committed-mode refusal too", async () => {
+  const { main } = await fixture({ hooks: true });
+  avcs(main, ["git-mode", "committed"]);
+  const fresh = join(main, "..", "committed-auto");
+  execFileSync("git", ["-C", main, "worktree", "add", "-q", "-b", "committed-auto", fresh], { stdio: "ignore" });
+  assert.equal(existsSync(join(fresh, ".avcs")), false, "a hook must not create what the command forbids");
+});

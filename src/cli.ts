@@ -100,9 +100,28 @@ function excludePointerFromGit(dir: string): void {
 function attachWorktree(dir: string, to: string): string {
   const target = ObjectStore.resolveStoreDir(resolve(to));
   if (!ObjectStore.isRepo(resolve(to))) throw new Error(`${to} is not an AVCS repo (no .avcs/objects)`);
+  // In committed mode git itself carries `.avcs` into every working tree, so a pointer would
+  // sit exactly where git wants to write the store. Refuse rather than fight it. Checked here
+  // rather than in the command so the hook cannot create a state the command forbids. (Read
+  // the config directly: `Repo.getGitMode` is async, and this runs before any store opens.)
+  if (gitModeOfStore(target) === "committed") {
+    throw new Error("this repo is in committed git mode \u2014 git already delivers .avcs to every working tree, so attaching would fight it");
+  }
   writeFileSync(join(dir, ".avcs"), `avcsdir: ${target}\n`);
   excludePointerFromGit(dir);
   return target;
+}
+
+/** The git-bridge mode recorded in a store, defaulting to `sidecar` exactly like
+ *  `Repo.getGitMode` (which also treats a missing or torn config as empty). */
+function gitModeOfStore(storeRoot: string): GitMode {
+  const p = join(storeRoot, "config.json");
+  if (!existsSync(p)) return "sidecar";
+  try {
+    return (JSON.parse(readFileSync(p, "utf8")) as { gitMode?: string }).gitMode === "committed" ? "committed" : "sidecar";
+  } catch {
+    return "sidecar";
+  }
 }
 
 /** The AVCS line a working dir maps to: an explicit `--line` wins; otherwise the current
@@ -149,7 +168,7 @@ function avcsInvocation(): string {
   return `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
 }
 
-const HOOK_PHASES = ["pre-commit", "prepare-commit-msg", "post-commit", "post-merge"] as const;
+const HOOK_PHASES = ["pre-commit", "prepare-commit-msg", "post-commit", "post-merge", "post-checkout"] as const;
 const HOOK_MARKER = "# avcs-git-bridge-hook";
 
 function hookScript(phase: string, avcsCmd: string): string {
@@ -618,12 +637,6 @@ async function main(): Promise<void> {
             "Outside a linked git working tree there is nothing to infer from.",
         );
       }
-      if (!ObjectStore.isRepo(resolve(to))) throw new Error(`${to} is not an AVCS repo (no .avcs/objects)`);
-      // In committed mode git itself carries `.avcs` into every working tree, so a pointer
-      // would sit where git wants to write the store. Refuse rather than fight it.
-      if ((await (await Repo.open(resolve(to))).getGitMode()) === "committed") {
-        throw new Error("this repo is in committed git mode \u2014 git already delivers .avcs to every working tree, so attaching would fight it");
-      }
       console.log(`attached \u2192 ${attachWorktree(cwd, to)}`);
       break;
     }
@@ -758,6 +771,22 @@ async function main(): Promise<void> {
       // let the next sync catch up — rather than spinning forever. AVCS_HOOK_TIMEOUT_MS=0
       // restores the old unbounded behavior; a non-zero value overrides the default.
       const hookMs = hookTimeoutMs();
+      // `git worktree add` fires post-checkout inside the brand-new tree, which is exactly
+      // when the store pointer should appear — before anything tries to open a store there.
+      // A plain branch switch is a no-op: the tree already has a store or a pointer.
+      if (phase === "post-checkout") {
+        if (!existsSync(join(cwd, ".avcs"))) {
+          const to = mainCheckoutOf(cwd);
+          if (to && ObjectStore.isRepo(to)) {
+            try {
+              console.log(`avcs: attached this working tree \u2192 ${attachWorktree(cwd, to)}`);
+            } catch (e) {
+              console.error(`avcs: could not attach this working tree (${(e as Error).message})`);
+            }
+          }
+        }
+        break; // never blocks the checkout
+      }
       const line = lineFor(cwd);
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
       // cwd is the working tree (possibly a linked git worktree); the store may live in
