@@ -38,6 +38,10 @@
       "types": "./dist/hub/hubClient.d.ts",
       "default": "./dist/hub/hubClient.js"
     },
+    "./importer": {
+      "types": "./dist/importer/gitHistory.d.ts",
+      "default": "./dist/importer/gitHistory.js"
+    },
     "./store": {
       "types": "./dist/store/objectStore.d.ts",
       "default": "./dist/store/objectStore.js"

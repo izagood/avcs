@@ -134,3 +134,33 @@ avcs worktree detach            # 포인터 제거 (실제 스토어는 절대 �
 | `avcs reindex` | entity index + op-log 재구축 (git pull 후 복구) |
 | `avcs worktree attach [--to <dir>]` | linked working tree를 메인 체크아웃의 스토어에 연결 |
 | `avcs worktree detach \| status` | 포인터 제거 / 스토어 위치 확인 |
+
+## History import (programmatic) — `@izagood/avcs/importer`
+
+`avcs import <dir>` ingests a working tree; it does not replay history, and it is
+CLI-only. Servers and embedders that want "import this git repository, history
+included" use the importer module (issue #63):
+
+```ts
+import { Repo } from "@izagood/avcs";
+import { importGitHistory, gitCliSource } from "@izagood/avcs/importer";
+
+const repo = await Repo.init(dir);
+// a checkout dir, a bare repo, a *.bundle file, or a clone URL:
+const result = await importGitHistory(repo, "https://example.com/some/repo.git", {
+  onCommit: (done, sha) => console.log(done, sha),
+});
+```
+
+- The walk is the **first-parent line** (`rev-list --first-parent --reverse`): a
+  merge commit lands as its net mainline effect; side-branch internals are not
+  replayed. AVCS history is an operation graph, not a diff replay.
+- Mapping (no object-schema changes): one intent + session per commit (title =
+  subject, owner = `git:<author-email>`), `put_file`/`delete_file` ops per
+  changed path, `causalDeps` anchored on the previous frontier,
+  `Co-authored-by:` trailers → `coAuthors`, and `declaredPurpose` carries the
+  full message plus a `[git <sha>] <author> <date>` provenance line.
+- `gitCliSource` shells out to `git` (like the rest of the bridge) and
+  bare-clones URLs/bundles into a temp dir. The core stays git-independent: the
+  import seam is the `GitHistorySource` interface — implement it yourself (e.g.
+  over a parsed bundle) to import with **no git binary at all**.
