@@ -71,6 +71,17 @@ export interface ReductionResult {
   /** Frontier op ids: accepted ops that no other accepted op descends from. */
   headOps: string[];
   /**
+   * Why a rejected op was blocked, op oid → reason (issue #66). The policy engine
+   * already computes this; surfacing it means a file can never leave the
+   * projection without an explanation the caller can print.
+   */
+  blockedReasons: Map<string, string>;
+  /**
+   * Count of evidence + decisions discarded by the signature trust gate. Non-zero
+   * means trust — not content — removed support from some op.
+   */
+  untrustedEvidence: number;
+  /**
    * Content for blob oids synthesized during reduction (a 3-way text merge produces file
    * content that is not any single stored blob). oid → content. The caller persists or
    * writes these directly. Synthetic oids are content-derived, so the treeHash that
@@ -507,6 +518,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
   // reuse a clean group verbatim (incremental.ts), while the final arrays preserve the
   // exact group-iteration order.
   const conflicts: Conflict[] = [];
+  const blockedReasons = new Map<string, string>();
   const autoDecisions: AutoDecision[] = [];
   const perKey = new Map<string, PerKeyDecision>();
   const groupOrder: string[] = [];
@@ -516,7 +528,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
     groupMembers.set(key, groupOps.map((o) => o.oid as string));
     const kc: Conflict[] = [];
     const ka: AutoDecision[] = [];
-    const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, kc, ka);
+    const local = decideGroup(key, groupOps, anc, verdicts, evalOf, policy, kc, ka, blockedReasons);
     perKey.set(key, { local, conflicts: kc, autoDecisions: ka });
     for (const [oid, st] of local) statuses.set(oid, stricter(statuses.get(oid) ?? "proposed", st));
     conflicts.push(...kc);
@@ -542,7 +554,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
     input.blobContent ?? new Map<string, Buffer>(),
   );
 
-  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs };
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs, blockedReasons, untrustedEvidence: 0 };
   const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: groups.size, groupsReused: 0, dirtyKeys: groups.size };
   return { input, result, perKey, groupOrder, groupMembers, stats };
 }
@@ -678,6 +690,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
 
   // ── Decide each group: recompute the dirty ones, reuse the clean ones. ──
   const conflicts: Conflict[] = [];
+  const blockedReasons = new Map<string, string>();
   const autoDecisions: AutoDecision[] = [];
   const perKey = new Map<string, PerKeyDecision>();
   const groupOrder: string[] = [];
@@ -691,7 +704,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     if (dirty.has(key)) {
       const kc: Conflict[] = [];
       const ka: AutoDecision[] = [];
-      const local = decideGroup(key, groupOps, anc, verdicts, evalOf, next.policy, kc, ka);
+      const local = decideGroup(key, groupOps, anc, verdicts, evalOf, next.policy, kc, ka, blockedReasons);
       dec = { local, conflicts: kc, autoDecisions: ka };
       recomputed++;
     } else {
@@ -756,7 +769,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     dirtyPaths,
   );
 
-  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs };
+  const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs, blockedReasons, untrustedEvidence: 0 };
   const stats: IncrementalStats = { groupsTotal: groups.size, groupsRecomputed: recomputed, groupsReused: reused, dirtyKeys: dirty.size };
   return { input: next, result, perKey, groupOrder, groupMembers, stats };
 }
@@ -826,6 +839,8 @@ export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
     fileConflicts: r.fileConflicts as ReductionResult["fileConflicts"],
     headOps: r.headOps as string[],
     synthBlobs: entriesToMap(r.synthBlobs as Entries<Buffer>),
+    blockedReasons: entriesToMap((r.blockedReasons ?? []) as Entries<string>),
+    untrustedEvidence: (r.untrustedEvidence as number | undefined) ?? 0,
   };
   const perKey = new Map<string, PerKeyDecision>(
     (s.perKey as [string, any][]).map(([k, d]) => [k, { local: entriesToMap(d.local), conflicts: d.conflicts, autoDecisions: d.autoDecisions }]),
@@ -900,6 +915,7 @@ function decideGroup(
   policy: Policy,
   conflicts: Conflict[],
   autoDecisions: AutoDecision[],
+  blockedReasons: Map<string, string>,
 ): Map<string, OperationStatus> {
   const out = new Map<string, OperationStatus>();
   // Frontier of this group: ops not an ancestor of another group member. Only the frontier
@@ -933,7 +949,10 @@ function decideGroup(
   if (remaining.length === 1) {
     const op = remaining[0]!;
     const ev = evalOf(op, false);
-    if (ev.blocked) out.set(op.oid as string, "rejected");
+    if (ev.blocked) {
+      out.set(op.oid as string, "rejected");
+      if (ev.blockedReason) blockedReasons.set(op.oid as string, ev.blockedReason);
+    }
     else if (ev.requiresHuman) {
       out.set(op.oid as string, "needs_decision");
       conflicts.push(makeConflict(key, "needs_human", [op], (o) => evalOf(o, false), null, ev.notes.join("; ")));
@@ -943,7 +962,11 @@ function decideGroup(
 
   // 3) Contended: policy reduction.
   const blocked = remaining.filter((o) => evalOf(o, inConflict).blocked);
-  for (const o of blocked) out.set(o.oid as string, "rejected");
+  for (const o of blocked) {
+    out.set(o.oid as string, "rejected");
+    const why = evalOf(o, inConflict).blockedReason;
+    if (why) blockedReasons.set(o.oid as string, why);
+  }
   const viable = remaining.filter((o) => !blocked.includes(o));
 
   const needsHuman = viable.some((o) => evalOf(o, inConflict).requiresHuman);

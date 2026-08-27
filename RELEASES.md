@@ -19,6 +19,29 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed (determinism) — the signature trust gate no longer keys on local state.
+New optional `Policy` fields `requireSignedEvidence` / `requireSignedDecisions`.**
+
+- Evidence and decisions were required to carry a valid signature the moment a
+  keyring existed (`keyring.size > 0`). A keyring is per-machine and **never
+  replicated**, so the same object graph reduced to different trees on different
+  replicas: provisioning one local key flipped already-accepted operations to
+  `rejected` and their files silently left the projection (`conflicts` stayed
+  empty). Issue #66.
+- The requirement now lives in the **policy** — a replicated governance object,
+  so every replica agrees. Default (field absent/false) keeps the Phase-1
+  `producedBy` heuristic, i.e. **provisioning a key changes nothing**. Opt in
+  with `setPolicy({ ...policy, requireSignedEvidence: true })`.
+- **Migration.** A repo that had a keyring and unsigned non-agent evidence was
+  losing those operations; on this version they are accepted again, so its
+  `treeHash` changes back (the point of the fix). To keep the stricter behavior,
+  set `requireSignedEvidence: true` in the policy — and note that unsigned
+  historical evidence stays untrusted under that setting.
+- Reduction results now also carry `blockedReasons` (op oid → why it was
+  rejected, from the policy engine) and `untrustedEvidence` (how much evidence
+  and how many decisions the gate discarded), so a projection can no longer lose
+  files without an explanation.
+
 **Breaking (determinism) — file identity: a rename and a concurrent edit now merge.
 `MERGE3_VERSION` `text3/0.1.0` → `text3/0.2.0`, so `MATERIALIZER_VERSION` becomes
 `avcs-text3/0.2.0`.**

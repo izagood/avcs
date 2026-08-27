@@ -275,8 +275,15 @@ export class Repo {
   /** actorId → learned reliability nudge, from history. */
   async reliability(): Promise<Map<string, number>> {
     const ops = await this.store.collect<Operation>("operation");
-    const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
-    const decisions = this.#verifiedDecisions(await this.store.collect<Decision>("decision"));
+    const pol = await this.policy();
+    const evidence = this.#verifiedEvidence(
+      await this.store.collect<Evidence>("evidence"),
+      pol.requireSignedEvidence === true,
+    ).kept;
+    const decisions = this.#verifiedDecisions(
+      await this.store.collect<Decision>("decision"),
+      pol.requireSignedDecisions === true,
+    ).kept;
     return computeReliability(ops, evidence, decisions);
   }
 
@@ -973,12 +980,13 @@ export class Repo {
    * op it vouched for stays gated. With no keyring, fall back to the Phase-1
    * producedBy heuristic (keep everything; the policy ignores agent self-reports).
    */
-  #verifiedEvidence(all: Evidence[]): Evidence[] {
-    if (this.keyring.size === 0) return all;
-    return all.filter((e) => {
+  #verifiedEvidence(all: Evidence[], require: boolean): { kept: Evidence[]; dropped: number } {
+    if (!require) return { kept: all, dropped: 0 };
+    const kept = all.filter((e) => {
       if (e.producedBy.kind === "ai_agent") return true; // policy ignores these anyway
       return this.keyring.verifyFor(e.producedBy.id, e.oid as string, e.sig);
     });
+    return { kept, dropped: all.length - kept.length };
   }
 
   /**
@@ -991,9 +999,12 @@ export class Repo {
    * evidence there is no ai_agent passthrough: a decision is an authority act, so every
    * decision must verify once a keyring exists. Mirrors #verifiedEvidence.
    */
-  #verifiedDecisions(all: Decision[]): Decision[] {
-    if (this.keyring.size === 0) return all;
-    return all.filter((d) => this.keyring.verifyFor(d.decidedBy.id, d.oid as string, d.sig));
+  #verifiedDecisions(all: Decision[], require: boolean): { kept: Decision[]; dropped: number } {
+    if (!require) return { kept: all, dropped: 0 };
+    const kept = all.filter((d) =>
+      this.keyring.verifyFor(d.decidedBy.id, d.oid as string, d.sig),
+    );
+    return { kept, dropped: all.length - kept.length };
   }
 
   // ── views & materialization ──────────────────────────────────────────────
@@ -1328,7 +1339,11 @@ export class Repo {
   /** Verified (non-agent, canonically ordered) evidence bound to exactly `treeHash`. */
   async #boundEvidenceFor(treeHash: string): Promise<Partial<Record<EvidenceKind, EvidenceResult>>> {
     const out: Partial<Record<EvidenceKind, EvidenceResult>> = {};
-    const all = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence")).sort(
+    const boundPolicy = await this.policy();
+    const all = this.#verifiedEvidence(
+      await this.store.collect<Evidence>("evidence"),
+      boundPolicy.requireSignedEvidence === true,
+    ).kept.sort(
       (a, b) =>
         (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) ||
         ((a.oid ?? "") < (b.oid ?? "") ? -1 : 1),
@@ -2273,6 +2288,8 @@ export class Repo {
       statuses: new Map(r.statuses),
       conflicts: r.conflicts.map((c) => ({ ...c })),
       autoDecisions: r.autoDecisions.map((a) => ({ ...a })),
+      blockedReasons: new Map(r.blockedReasons),
+      untrustedEvidence: r.untrustedEvidence,
       fileConflicts: r.fileConflicts.map((s) => ({ ...s })),
       headOps: [...r.headOps],
       synthBlobs: new Map(r.synthBlobs),
@@ -2331,8 +2348,20 @@ export class Repo {
   }
 
   async #reduceOpSet(ops: Operation[], includeStatuses: ViewQuery["includeStatuses"], useInc = false): Promise<ReductionResult> {
-    const evidence = this.#verifiedEvidence(await this.store.collect<Evidence>("evidence"));
-    const decisions = this.#verifiedDecisions(await this.store.collect<Decision>("decision"));
+    const reducePolicy = await this.policy();
+    const ev = this.#verifiedEvidence(
+      await this.store.collect<Evidence>("evidence"),
+      reducePolicy.requireSignedEvidence === true,
+    );
+    const dec = this.#verifiedDecisions(
+      await this.store.collect<Decision>("decision"),
+      reducePolicy.requireSignedDecisions === true,
+    );
+    const evidence = ev.kept;
+    const decisions = dec.kept;
+    // Evidence/decisions discarded by the signature gate (issue #66): reported on
+    // the result so a projection can never lose files silently.
+    const untrustedEvidence = ev.dropped + dec.dropped;
 
     // Redactions overwrite blob bytes while keeping the oid, so they don't change op
     // oids — include them in the signature so a redaction invalidates the cache.
@@ -2357,9 +2386,12 @@ export class Repo {
     }
     this.metrics.inc("reduce.cache.miss");
 
-    const result = await this.metrics.time("reduce.ms", () =>
+    const reduced = await this.metrics.time("reduce.ms", () =>
       this.#reduceOpSetUncached(ops, includeStatuses, evidence, decisions, useInc),
     );
+    // Report what the signature gate discarded (issue #66): a file must never
+    // leave the projection without the caller being able to see why.
+    const result: ReductionResult = { ...reduced, untrustedEvidence };
     if (this.#reduceCache.size >= Repo.REDUCE_CACHE_MAX) {
       this.#reduceCache.delete(this.#reduceCache.keys().next().value as string);
     }
