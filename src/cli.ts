@@ -1144,8 +1144,20 @@ async function main(): Promise<void> {
           hasExistingLine: !!(await repo.store.getRef(`line:${trunk}`)),
         });
         const view = flag("--view") ?? trunkScope.line ?? "main";
-        const written = await repo.checkoutInto(out, view, { workspace: name });
-        console.log(`projected workspace ${name} over ${view}: ${written.length} file(s) to ${out}`);
+        const projected = await repo.projectInto(out, view, { workspace: name });
+        console.log(`projected workspace ${name} over ${view}: ${projected.written.length} file(s) to ${out}`);
+        // Shared build environment (docs/21). The core linked a cache and reported whether it
+        // is empty; running the install is the caller's job and stays the caller's job, so all
+        // this does is say which side of that line each path is on.
+        for (const s of projected.shared) {
+          const state = !s.linked ? "NOT LINKED" : s.populated ? "ready" : "EMPTY — run your install once";
+          console.log(`shared: ${s.path} → ${s.cache} (${state})`);
+          if (s.warning) console.log(`  warning: ${s.warning}`);
+        }
+        if (projected.skipped.length) {
+          console.error(`avcs: ${projected.skipped.length} recorded file(s) live inside a shared path and were NOT written (e.g. ${projected.skipped[0]}).`);
+          console.error(`  that history predates this shared-path rule; capture can no longer add to it.`);
+        }
       } else if (sub === "land") {
         const name = args[2];
         if (!name) throw new Error("usage: avcs workspace land <name>");

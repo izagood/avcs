@@ -5,9 +5,9 @@
 // agent workflow: intent → session → propose op → attach evidence → materialize →
 // decide → checkpoint.
 
-import { mkdir, writeFile, rm, readdir, readFile } from "node:fs/promises";
+import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname, resolve, relative, isAbsolute } from "node:path";
+import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
@@ -2734,11 +2734,102 @@ export class Repo {
     return true;
   }
 
-  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
-  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+  /**
+   * Connect every configured shared path to its store-local cache (docs/21 §3.4). Runs
+   * AFTER the tree has been written, because writing the tree can create directories.
+   *
+   * What the core does: derive the key, create the cache directory, connect it, and report
+   * `populated`. What the core does NOT do: run an install. It does not know what
+   * `node_modules` is, which package manager owns it, or whether the network is up — and the
+   * moment it did, docs/21 §2 principle 1 would be gone. `populated` is the entire interface
+   * between "the core made a place" and "somebody has to fill it".
+   *
+   * Existing content at a shared path is never destroyed. A real directory there is the
+   * user's data and the core cannot recreate it (it does not know how to install), so it is
+   * left alone with a warning. The one thing that IS re-pointed is a symlink the core itself
+   * put inside this store's own cache tree, which is how a key change (S4) takes effect
+   * instead of leaving the workspace wired to a stale environment.
+   *
+   * With `mode: "copy"`, a directory already at the target counts as materialized and is not
+   * copied over — local edits inside it survive (S11). Re-materializing after a key change
+   * therefore means removing that directory by hand; the core will not delete user data to
+   * refresh a cache.
+   */
+  async linkSharedPaths(workDir: string, tree: Map<string, string>): Promise<SharedPathLink[]> {
+    const entries = await this.readSharedPaths();
+    if (!entries.length) return []; // S1: unconfigured ⇒ not even a mkdir
+    const root = resolve(workDir);
+    const sharedRoot = resolve(this.#sharedRoot());
+    const out: SharedPathLink[] = [];
+    for (const entry of entries) {
+      const mode: SharedPathMode = entry.mode === "copy" ? "copy" : "symlink";
+      const { key, missing, unkeyed } = Repo.deriveSharedKey(entry.keyFrom, tree);
+      // One key may hold several shared paths, so the leaf is the path slugged `/`→`__`.
+      const cache = join(sharedRoot, key, entry.path.split("/").join("__"));
+      const target = join(root, entry.path);
+      const notes: string[] = [];
+      if (unkeyed) notes.push("no keyFrom, so every workspace shares this one cache");
+      if (missing.length) notes.push(`keyFrom absent from the view, hashed as empty: ${missing.join(", ")}`);
+
+      // R4: the LOCK covers only creating the directory, so two concurrent projections cannot
+      // race it. Coordinating concurrent INSTALLS is outside the core's reach by construction
+      // — it does not run them.
+      await this.store.withLock(`shared:${key}`, async () => { await mkdir(cache, { recursive: true }); });
+      const populated = (await readdir(cache)).length > 0;
+
+      let linked = false;
+      const st = await lstat(target).catch(() => null);
+      if (st?.isSymbolicLink()) {
+        const dest = resolve(dirname(target), await readlink(target));
+        if (dest === cache) {
+          linked = true; // S5: already correct — no-op, and nothing to say about it
+        } else if (dest === sharedRoot || dest.startsWith(sharedRoot + sep)) {
+          await rm(target, { force: true }); // our own cache tree: the key moved (S4)
+          await symlink(cache, target, "dir");
+          linked = true;
+        } else {
+          notes.push(`${entry.path} is a symlink to ${dest}, outside this store's cache — left alone`);
+        }
+      } else if (st) {
+        if (mode === "copy" && st.isDirectory()) linked = true; // already materialized (S11)
+        else notes.push(`${entry.path} exists and is not a link to the cache — left alone (your data)`);
+      } else {
+        await mkdir(dirname(target), { recursive: true });
+        if (mode === "copy") await cp(cache, target, { recursive: true });
+        else await symlink(cache, target, "dir");
+        linked = true;
+      }
+
+      const link: SharedPathLink = { path: entry.path, key, cache, target, mode, linked, populated };
+      if (notes.length) link.warning = notes.join("; ");
+      if (link.warning) this.logger.warn("shared.link", { path: entry.path, key, warning: link.warning });
+      out.push(link);
+    }
+    return out;
+  }
+
+  /**
+   * Project a view into `workDir` AND connect its shared paths (docs/21 §3.4) — the full
+   * physical checkout `avcs workspace project` performs. `checkoutInto` is this without the
+   * shared report, kept as-is for every existing caller.
+   *
+   * `skipped` are tree entries that live INSIDE a shared path. Normally there are none —
+   * capture cannot produce them (§3.5) — but a history contaminated before shared paths
+   * existed can still be opened, and writing those files would spill recorded content over a
+   * live build environment. So they are skipped and named rather than written.
+   */
+  async projectInto(
+    workDir: string,
+    view = "main",
+    opts?: { workspace?: string },
+  ): Promise<{ written: string[]; shared: SharedPathLink[]; skipped: string[] }> {
     const res = await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
+    const shared = await this.readSharedPaths();
+    const inShared = (rel: string): boolean => shared.some((e) => rel === e.path || rel.startsWith(e.path + "/"));
     const written: string[] = [];
+    const skipped: string[] = [];
     for (const [path, blobOid] of res.tree) {
+      if (shared.length && inShared(path)) { skipped.push(path); continue; }
       const full = join(workDir, path);
       const synth = res.synthBlobs.get(blobOid);
       const want = synth ?? (await this.readBlob(blobOid));
@@ -2759,7 +2850,13 @@ export class Repo {
       }
       written.push(path);
     }
-    return written.sort();
+    if (skipped.length) this.logger.warn("shared.projection.skipped", { count: skipped.length, sample: skipped.slice(0, 5) });
+    return { written: written.sort(), shared: await this.linkSharedPaths(workDir, res.tree), skipped: skipped.sort() };
+  }
+
+  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
+  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+    return (await this.projectInto(workDir, view, opts)).written;
   }
 
   /**
