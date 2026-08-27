@@ -932,6 +932,12 @@ export const TOOLS: ToolDef[] = [
     handler: (repo, i) => repo.blame(String(i.entityKey), (i.line as string) ?? "main"),
   },
   {
+    name: "avcs.blame.lines",
+    description: "Per-line provenance: the op that last wrote each line, with actor, intent and purpose. Why THIS line is here.",
+    inputSchema: { type: "object", properties: { entityKey: { type: "string" }, path: { type: "string" }, line: { type: "string" } }, required: ["entityKey", "path"] },
+    handler: (repo, i) => repo.blameLines(String(i.entityKey), String(i.path), (i.line as string) ?? "main"),
+  },
+  {
     name: "avcs.history",
     description: "History of one entity in causal order. Paged: limit (default 20) + cursor.",
     inputSchema: {

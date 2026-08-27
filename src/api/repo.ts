@@ -2848,6 +2848,117 @@ export class Repo {
     return out;
   }
 
+  /**
+   * Per-line provenance (`blame`, but for lines): who wrote each line of a file
+   * and WHY. Entity-level {@link blame} answers "who owns this file now"; this
+   * answers "why is THIS line here" — the operation that last wrote it, with
+   * its actor, intent title and declared purpose.
+   *
+   * Derived, not stored: the entity's causal history is replayed and each op's
+   * before→after line diff re-attributes the lines it changed (an insertion is
+   * attributed to the inserting op, untouched lines keep their earlier owner).
+   * No new object kind, no determinism impact.
+   */
+  async blameLines(
+    entityKey: string,
+    filePath: string,
+    line = "main",
+  ): Promise<
+    Array<{
+      line: number;
+      text: string;
+      op: string;
+      actor: Actor;
+      purpose: string;
+      intentTitle?: string;
+      at: string;
+    }>
+  > {
+    const { diffHunks } = await import("../merge/merge3.ts");
+    const res = await this.materialize(line);
+    const final = (await this.materializedFiles(res)).find((f) => f.path === filePath);
+    if (!final) return [];
+
+    const split = (s: string): string[] =>
+      s === "" ? [] : s.split("\n").slice(0, s.endsWith("\n") ? -1 : undefined);
+
+    // Replay the history that actually shaped the file, carrying an owning op
+    // per surviving line. `superseded` counts: a later put_file supersedes an
+    // earlier one, but the earlier op still authored the lines it introduced —
+    // dropping it would credit every line to the last write. Ops that never
+    // landed (rejected / needs_decision / quarantined / still proposed) do not
+    // contribute lines to the projection, so they are excluded.
+    const LANDED = new Set(["accepted", "superseded"]);
+    const hist = (await this.historyOf(entityKey)).filter((o) =>
+      LANDED.has(res.statuses.get(o.oid as string) ?? ""),
+    );
+    let lines: string[] = [];
+    let owners: string[] = [];
+    const opsByOid = new Map<string, (typeof hist)[number]>();
+    for (const op of hist) {
+      opsByOid.set(op.oid as string, op);
+      const after = split(
+        (await this.materializedFiles(await this.materializeAt([op.oid as string]))).find(
+          (f) => f.path === filePath,
+        )?.content ?? "",
+      );
+      const nextOwners = new Array<string>(after.length);
+      let cursor = 0; // index into `after` consumed so far
+      let baseCursor = 0; // index into `lines` consumed so far
+      for (const h of diffHunks(lines, after)) {
+        // Unchanged run before this hunk keeps its previous owner.
+        for (let k = 0; k < h.start - baseCursor; k++) {
+          nextOwners[cursor + k] = owners[baseCursor + k]!;
+        }
+        cursor += h.start - baseCursor;
+        baseCursor = h.start;
+        // The hunk's replacement lines belong to this op.
+        for (let k = 0; k < h.lines.length; k++) nextOwners[cursor + k] = op.oid as string;
+        cursor += h.lines.length;
+        baseCursor = h.end;
+      }
+      for (let k = 0; baseCursor + k < lines.length && cursor + k < after.length; k++) {
+        nextOwners[cursor + k] = owners[baseCursor + k]!;
+      }
+      // Anything still unassigned (e.g. a fresh file) is this op's.
+      for (let k = 0; k < after.length; k++) nextOwners[k] ??= op.oid as string;
+      lines = after;
+      owners = nextOwners;
+    }
+
+    const intentCache = new Map<string, string | undefined>();
+    const out: Array<{
+      line: number;
+      text: string;
+      op: string;
+      actor: Actor;
+      purpose: string;
+      intentTitle?: string;
+      at: string;
+    }> = [];
+    const finalLines = split(final.content);
+    for (let i = 0; i < finalLines.length; i++) {
+      const oid = owners[i] ?? owners[owners.length - 1];
+      const op = oid ? opsByOid.get(oid) : undefined;
+      if (!op) continue;
+      if (!intentCache.has(op.intentOid)) {
+        const intent = await this.readIntent(op.intentOid).catch(() => null);
+        intentCache.set(op.intentOid, intent?.title);
+      }
+      const intentTitle = intentCache.get(op.intentOid);
+      out.push({
+        line: i + 1,
+        text: finalLines[i]!,
+        op: op.oid as string,
+        actor: op.actor,
+        purpose: op.declaredPurpose,
+        ...(intentTitle ? { intentTitle } : {}),
+        at: op.createdAt,
+      });
+    }
+    return out;
+  }
+
   /** Diff two views (or, with materializeAt, two frontiers). */
   async diff(viewA: string, viewB: string): Promise<import("../query/diff.ts").TreeDiff> {
     const { diffTrees } = await import("../query/diff.ts");
