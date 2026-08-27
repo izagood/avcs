@@ -56,6 +56,15 @@ export interface AutoDecision {
   rejectedOps: string[];
   reason: string;
   policyVersion: string;
+  /** Set when the decision settled one contended REGION of a file rather than a whole op
+   *  (docs/22 §3.3): the base line range `[baseStart, baseEnd)` the winner took. Together
+   *  with `key` and `chosenOp` this is the decision's idempotent identity — the same region
+   *  never mints a second record on a re-reduce. */
+  region?: { baseStart: number; baseEnd: number };
+  /** Per-option score breakdown, in option order: which option each op represented, the
+   *  score that represented it, and whether it was out of candidacy. Answers "why did my
+   *  change lose this region". Free — `evaluateOp` already computed all of it. */
+  optionScores?: { opOid: string; score: number; excluded: boolean }[];
 }
 
 export interface ReductionResult {
@@ -216,6 +225,10 @@ export interface FileConflict {
   file: string;
   ops: string[]; // the concurrent edit_file ops whose hunks overlapped
   regions: ConflictRegion[]; // the contested base line ranges + per-op options
+  /** Binary/non-line-mergeable content: the whole file is ONE opaque contest and the
+   *  region's `sides` index distinct contents, not `ops`. Never arbitrated (docs/22 §3.1)
+   *  — side → op is not recoverable, so only a human can settle it. */
+  atomic?: boolean;
 }
 
 /**
@@ -281,7 +294,7 @@ export function detectFileConflicts(
           options: distinct.map((text, i) => ({ sides: [i], text })),
         },
       ];
-      out.push({ file, ops: ordered.map((o) => o.oid as string), regions });
+      out.push({ file, ops: ordered.map((o) => o.oid as string), regions, atomic: true });
       continue;
     }
     const base = baseBuf.toString("utf8");
@@ -290,6 +303,74 @@ export function detectFileConflicts(
     if (!m.clean) out.push({ file, ops: ordered.map((o) => o.oid as string), regions: m.conflicts });
   }
   return out;
+}
+
+/** The authoritative conflict set after region arbitration (docs/22 §3.4). */
+export interface FileConflictArbitration {
+  /** Files that still hold at least one region policy could not decide. A file whose every
+   *  region was decided drops out entirely — there is nothing left to ask. */
+  remaining: FileConflict[];
+  /** One {@link AutoDecision} per decided region (docs/22 §3.3). */
+  decisions: AutoDecision[];
+}
+
+/**
+ * Arbitrate the regions {@link detectFileConflicts} found — the authoritative pass, and the
+ * one place where side → op is exact: `FileConflict.ops` is the file's concurrent frontier in
+ * canonical order and `region.options[].sides` index straight into it.
+ *
+ * A decided region leaves the conflict set (policy decided it, so it is no longer a question
+ * for a human) and is recorded as an `AutoDecision` — an automatic decision without an audit
+ * trail is not allowed (docs/00 principle 4, at region granularity). An undecided region
+ * stays exactly as it was: the tree holds the deterministic fallback content and the conflict
+ * still reaches the release gate.
+ *
+ * Scores are lazy and memoized per op, so only the ops of a file that actually contended are
+ * ever evaluated (docs/22 R-c).
+ */
+export function arbitrateFileConflicts(
+  fileConflicts: FileConflict[],
+  input: ReduceInput,
+): FileConflictArbitration {
+  if (fileConflicts.length === 0) return { remaining: [], decisions: [] };
+  const scoreOf = buildOpScorer(input);
+  const remaining: FileConflict[] = [];
+  const decisions: AutoDecision[] = [];
+  const seen = new Set<string>(); // idempotent identity: key + region bounds + winner (R-d)
+  for (const fc of fileConflicts) {
+    if (fc.atomic) {
+      remaining.push(fc);
+      continue;
+    }
+    const key = `file:${fc.file}`;
+    const open: ConflictRegion[] = [];
+    for (const region of fc.regions) {
+      const sideOps = (side: number): string[] => {
+        const oid = fc.ops[side];
+        return oid === undefined ? [] : [oid];
+      };
+      const v = judgeRegion(region, sideOps, scoreOf);
+      if (!v) {
+        open.push(region);
+        continue;
+      }
+      const idem = `${key}|${region.baseStart}|${region.baseEnd}|${v.chosen}`;
+      if (seen.has(idem)) continue;
+      seen.add(idem);
+      decisions.push({
+        key,
+        conflictId: conflictIdFor(key),
+        chosenOp: v.chosen,
+        rejectedOps: v.rejected,
+        reason: "region-arbitration",
+        policyVersion: input.policy.version,
+        region: { baseStart: region.baseStart, baseEnd: region.baseEnd },
+        optionScores: v.optionScores,
+      });
+    }
+    if (open.length) remaining.push({ ...fc, regions: open });
+  }
+  return { remaining, decisions };
 }
 
 /** A single group's locally-decided statuses + the conflicts/autoDecisions it emitted. */

@@ -356,3 +356,161 @@ test("R1: disjoint concurrent edits produce the same tree as before arbitration 
   // MERGE3_VERSION bump. If this changes, arbitration leaked outside its scope.
   assert.equal(r.treeHash, "aa5f5c936fa9fbfd62ccf2d3ec02b677b1675d739059bfbdc14191ffcf5179f7");
 });
+
+// ── the authoritative pass: a decided region leaves the conflict set (docs/22 §3.4) ──
+//
+// Driven through the real Repo pipeline, where `detectFileConflicts` runs the N-way merge
+// over the file's concurrent frontier and its regions are arbitrated with the same rule.
+
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Repo } from "../src/api/repo.ts";
+
+interface Live {
+  dir: string;
+  repo: Repo;
+  intent: string;
+  sess: string;
+}
+async function liveRepo(): Promise<Live> {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-region-"));
+  const repo = await Repo.init(dir);
+  const intent = await repo.createIntent({ title: "region", owner: HUMAN.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: HUMAN });
+  return { dir, repo, intent, sess };
+}
+
+/** Scaffold FILE, then author N concurrent overlapping edits; `verified` ops get a CI test. */
+async function liveScenario(edits: { actor: Actor; text: string; verified?: boolean }[]) {
+  const l = await liveRepo();
+  const base = { sessionOid: l.sess, intentOid: l.intent };
+  const scaffold = await l.repo.proposeFileWrite({
+    ...base, actor: HUMAN, path: FILE, content: SCAFFOLD, declaredPurpose: "scaffold",
+  });
+  const oids: string[] = [];
+  for (const e of edits) {
+    const oid = await l.repo.proposeEdit({
+      ...base, actor: e.actor, path: FILE, baseText: SCAFFOLD, newText: e.text,
+      declaredPurpose: `edit by ${e.actor.id}`, causalDeps: [scaffold],
+    });
+    oids.push(oid);
+    if (e.verified)
+      await l.repo.attachEvidence({ forOps: [oid], kind: "unit_test", result: "pass", producedBy: CI });
+  }
+  const res = await l.repo.materialize();
+  const text = (await l.repo.materializedFiles(res)).find((f) => f.path === FILE)?.content;
+  return { ...l, oids, res, text };
+}
+
+test("R2/R13/R1(§3.4): a decided region drops out of the conflict set and is recorded", async () => {
+  const s = await liveScenario([
+    { actor: AI_A, text: say("UNVERIFIED") },
+    { actor: AI_B, text: say("VERIFIED"), verified: true },
+  ]);
+  try {
+    assert.equal(s.text, say("VERIFIED"), "the verified change owns the region");
+    assert.equal(s.res.fileConflicts.length, 0, "policy decided it, so it is not a conflict any more");
+    assert.equal(
+      s.res.conflicts.filter((c) => c.key === `file:${FILE}`).length,
+      0,
+      "…and the release gate is not blocked on a decision that was made",
+    );
+    // R13: the decision is auditable — who won, who lost, and on what score.
+    const region = s.res.autoDecisions.filter((d) => d.reason === "region-arbitration");
+    assert.equal(region.length, 1, "exactly one region was arbitrated");
+    const d = region[0]!;
+    assert.equal(d.key, `file:${FILE}`);
+    assert.equal(d.chosenOp, s.oids[1], "the verified op is recorded as the winner");
+    assert.deepEqual(d.rejectedOps, [s.oids[0]], "and the unverified op as the loser");
+    assert.deepEqual(d.region, { baseStart: 1, baseEnd: 2 }, "the contested base line range");
+    assert.equal(d.optionScores?.length, 2, "per-option score breakdown");
+    const chosen = d.optionScores!.find((o) => o.opOid === s.oids[1])!;
+    const lost = d.optionScores!.find((o) => o.opOid === s.oids[0])!;
+    assert.ok(chosen.score > lost.score, `winning score must be higher (${chosen.score} vs ${lost.score})`);
+    assert.equal(chosen.excluded, false);
+    assert.ok(d.policyVersion.length > 0);
+  } finally {
+    await rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test("R5 (§3.4): an undecidable region stays a conflict and mints no decision", async () => {
+  const s = await liveScenario([
+    { actor: AI_A, text: say("A") },
+    { actor: AI_B, text: say("B") },
+  ]);
+  try {
+    assert.equal(s.res.fileConflicts.length, 1, "a tie must still reach a human");
+    assert.equal(s.res.fileConflicts[0]!.regions.length, 1);
+    assert.ok(s.res.conflicts.some((c) => c.key === `file:${FILE}`), "and the gate still blocks");
+    assert.deepEqual(
+      s.res.autoDecisions.filter((d) => d.reason === "region-arbitration"),
+      [],
+      "no decision is recorded for something policy did not decide",
+    );
+    assert.ok(s.text === say("A") || s.text === say("B"), "provisional content, never a blend");
+  } finally {
+    await rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test("R14 (§3.4): a 3-way region with a shared top stays open; a unique top is decided", async () => {
+  const shared = await liveScenario([
+    { actor: AI_A, text: say("A") },
+    { actor: AI_B, text: say("B"), verified: true },
+    { actor: AI_C, text: say("C"), verified: true },
+  ]);
+  try {
+    assert.equal(shared.res.fileConflicts.length, 1, "two verified options tie ⇒ a human decides");
+    assert.equal(shared.res.fileConflicts[0]!.regions[0]!.options.length, 3);
+  } finally {
+    await rm(shared.dir, { recursive: true, force: true });
+  }
+  const unique = await liveScenario([
+    { actor: AI_A, text: say("A") },
+    { actor: AI_B, text: say("B"), verified: true },
+    { actor: AI_C, text: say("C") },
+  ]);
+  try {
+    assert.equal(unique.text, say("B"), "the single verified option takes the region");
+    assert.equal(unique.res.fileConflicts.length, 0);
+    assert.equal(unique.res.autoDecisions.filter((d) => d.reason === "region-arbitration").length, 1);
+    const d = unique.res.autoDecisions.find((x) => x.reason === "region-arbitration")!;
+    assert.equal(d.chosenOp, unique.oids[1]);
+    assert.equal(d.rejectedOps.length, 2, "both losing options are named");
+  } finally {
+    await rm(unique.dir, { recursive: true, force: true });
+  }
+});
+
+test("R3 (§3.4): the trust ladder decides a region end-to-end, and the tree agrees with the record", async () => {
+  const s = await liveScenario([
+    { actor: AI_A, text: say("AGENT") },
+    { actor: HUMAN, text: say("HUMAN") },
+  ]);
+  try {
+    assert.equal(s.text, say("HUMAN"));
+    assert.equal(s.res.fileConflicts.length, 0);
+    const d = s.res.autoDecisions.find((x) => x.reason === "region-arbitration")!;
+    assert.equal(d.chosenOp, s.oids[1], "the record names the op whose text is in the tree");
+  } finally {
+    await rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test("R-d: re-materializing the same op set does not mint a second decision for the region", async () => {
+  const s = await liveScenario([
+    { actor: AI_A, text: say("UNVERIFIED") },
+    { actor: AI_B, text: say("VERIFIED"), verified: true },
+  ]);
+  try {
+    const again = await s.repo.materialize();
+    const first = s.res.autoDecisions.filter((d) => d.reason === "region-arbitration");
+    const second = again.autoDecisions.filter((d) => d.reason === "region-arbitration");
+    assert.equal(second.length, 1, "one region ⇒ one decision, however often it is reduced");
+    assert.deepEqual(second, first, "and it is the identical record (idempotent key)");
+  } finally {
+    await rm(s.dir, { recursive: true, force: true });
+  }
+});
