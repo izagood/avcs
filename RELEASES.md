@@ -42,6 +42,69 @@ New optional `Policy` fields `requireSignedEvidence` / `requireSignedDecisions`.
   and how many decisions the gate discarded), so a projection can no longer lose
   files without an explanation.
 
+**Breaking (determinism) — region arbitration: policy, not order, decides who wins a
+contended region. `MERGE3_VERSION` `text3/0.2.0` → `text3/0.3.0`, so
+`MATERIALIZER_VERSION` becomes `avcs-text3/0.3.0`.**
+
+Closes what [docs/15](docs/15-language-neutral-core.md) §10.4 records as **H1**, "the most
+substantial gap": the language-neutral rewrite moved the unit of merge down to the hunk, and
+the policy engine did not follow it down. Design: [docs/22](docs/22-region-arbitration.md).
+
+- **What was wrong.** `applyOp` composed concurrent `edit_file`s with
+  `merge3(opBase, [current, opNew], { onConflict: "first" })`, and `"first"` takes the
+  lowest side index. Side indices come from canonical (`lamport, oid`) order, so the content
+  of an overlapping region went to whichever op was applied first — **first-write-wins**,
+  the mirror image of the last-write-wins that [docs/00](docs/00-overview.md) principle 6
+  forbids ("정책이 정한 우선순위에서 이긴 변경이 맞다. recency는 최후의 tie-break일 뿐이다").
+  The trust ladder, reliability learning, code-owner rules and evidence gates had no say
+  over region content at all — only a `needs_human` flag — so a **verified change could
+  lose a region to an unverified one**, and nothing recorded that it had happened.
+- **What changed.** `merge3` gained an injected `arbitrate?: (region) => number | null`
+  hook. It computes nothing about policy and is told nothing about why — it hands over
+  variant indices and takes back an option index, staying as policy-blind as it is
+  language-blind. The reducer supplies the arbiter from the scores `evaluateOp` already
+  produced for the group decision:
+  - an option several ops agree on is represented by its **highest**-scoring op (an average
+    would let a low-trust actor dilute an option by co-signing it);
+  - an op that failed an evidence gate, or that a rule reserves for a human, is **out of
+    candidacy** — this is the substance of the change: an unverified behaviour change cannot
+    take a region;
+  - a **tie goes to a human, never to recency**. The arbiter returns `null`, the tree keeps
+    the deterministic `onConflict` fallback content, and the region stays an open conflict.
+    Region content is where meaning diverges; deciding it quietly is worse than raising it.
+- **Decided regions leave the conflict set, and are recorded.** The authoritative N-way pass
+  (`detectFileConflicts` → `arbitrateFileConflicts`) drops a region policy decided, so fewer
+  conflicts reach a human and the ones left are the ones policy genuinely could not settle.
+  Each decided region becomes an `AutoDecision` (`reason: "region-arbitration"`) carrying the
+  winning and losing ops, the contested base line range and the per-option score breakdown —
+  "why did my change lose this region" is now answerable. Its identity is
+  key + region bounds + winner, so a re-reduce does not mint a second record.
+  Binary/oversized atomic contests are deliberately NOT arbitrated: their option `sides`
+  index distinct contents rather than variants, so side → op is not recoverable there.
+
+**Migration.**
+
+- **An op set with no overlapping region materializes byte-identically.** The arbiter is
+  only reachable from inside a `ConflictRegion`, so a history whose concurrent hunks never
+  overlapped — the overwhelming majority — is unaffected in content and in `treeHash`. This
+  is pinned by a golden-hash regression (docs/22 R1) plus the full pre-existing suite passing
+  unchanged. Only a file whose concurrent edits actually contended can reduce differently,
+  and only when the policy can separate the contending options.
+- **Persisted compaction snapshots invalidate.** Their header stamps the materializer version
+  (and the active policy oid), so a cold load rejects the stale file and falls back to a full
+  reduce — automatic and safe (Phase 13.3), costing one rebuild.
+- **Stored checkpoints stay valid.** Each records the `materializerVersion` that produced its
+  `treeHash`, so old checkpoints remain accurate records of what the tree was. The bump is
+  what keeps that honest: a replica on `text3/0.2.0` now sees an explicit version mismatch
+  instead of computing a divergent tree under a stamp claiming the same substrate.
+- **`verify-git` can differ on a contended file.** Re-projecting a history whose concurrent
+  edits overlapped may now produce the policy winner's content where it previously produced
+  the first-applied op's. That is the intended fix, not drift.
+- **The tree now depends on policy at region granularity.** Changing the policy can change
+  the content of a contended region, exactly as it can already change which op is accepted
+  ([docs/07](docs/07-roadmap.md) "known limitation 4"); the same mitigations apply (policy
+  versioning, the audit record above, `require_human`).
+
 **Breaking (determinism) — file identity: a rename and a concurrent edit now merge.
 `MERGE3_VERSION` `text3/0.1.0` → `text3/0.2.0`, so `MATERIALIZER_VERSION` becomes
 `avcs-text3/0.2.0`.**
