@@ -17,7 +17,13 @@
 // correct) tree than it did at 0.1.0. A rename-free op set is byte-identical either way.
 // The stamp moves so a replica still on the older substrate cannot silently disagree about
 // a rename-bearing one — `Checkpoint.materializerVersion` makes the mismatch explicit.
-export const MERGE3_VERSION = "text3/0.2.0";
+// 0.3.0 — region arbitration (docs/22). The line merge itself is unchanged; what changed is
+// who wins a CONTENDED region. It used to be the lowest side index, i.e. whichever op the
+// canonical order applied first (first-write-wins). The reducer now injects an `arbitrate`
+// callback that answers from the policy engine's score, so a verified change can no longer
+// lose a region to an unverified one. An op set whose hunks never overlap produces no
+// ConflictRegion, never calls the arbiter, and materializes byte-identically.
+export const MERGE3_VERSION = "text3/0.3.0";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
