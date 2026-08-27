@@ -164,3 +164,14 @@ const result = await importGitHistory(repo, "https://example.com/some/repo.git",
   bare-clones URLs/bundles into a temp dir. The core stays git-independent: the
   import seam is the `GitHistorySource` interface — implement it yourself (e.g.
   over a parsed bundle) to import with **no git binary at all**.
+- **Hardened for server use** (issue #71), because the source is usually
+  untrusted input:
+  - positional values (`dir`/`url`/`bundle`/`ref`) are rejected when they start
+    with `-`, and a `--` terminator separates them from paths, so a value can
+    never be read as a git option;
+  - every invocation is bounded — `timeoutMs` (default 10 min) sets git's own
+    stall bound (`http.lowSpeedLimit/Time`) plus a process-level backstop in its
+    own process group, and a killed clone cleans its temp dir up;
+  - **redirects are not followed** (`http.followRedirects=false`) and credential
+    prompts are disabled. A caller that vetted a URL keeps that guarantee: git
+    cannot pivot to another host on a 302, and never blocks on a prompt.
