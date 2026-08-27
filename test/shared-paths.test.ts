@@ -340,6 +340,134 @@ test("`avcs workspace project` tells the human whether an install is owed", asyn
   }
 });
 
+// ── Slice 4: capture contamination is structurally impossible (S1, S7, S8, S8b) ──
+
+test("S1 — with no shared-paths.json, projection and capture behave exactly as before", async () => {
+  // The backward-compatibility gate. Everything this track adds must be inert when nothing
+  // is configured, and "inert" is asserted directly rather than assumed.
+  const dir = await mk();
+  try {
+    const repo = await Repo.init(dir);
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 1\n");
+    await put(repo, "src/a.ts", "export const a = 1;\n");
+
+    const res = await repo.materialize("main");
+    const projected = await repo.projectInto(dir, "main");
+    assert.deepEqual(projected.written, [...res.tree.keys()].sort(), "every tree entry written, none skipped");
+    assert.deepEqual(projected.shared, [], "no shared paths ⇒ nothing linked");
+    assert.deepEqual(projected.skipped, []);
+    assert.equal(existsSync(join(dir, ".avcs", "shared")), false, "no cache tree is created");
+    assert.equal(existsSync(join(dir, ".avcs", "shared-paths.json")), false, "and no config file appears");
+
+    // Byte-level: the projection is what materializedBytes says it is.
+    for (const f of await repo.materializedBytes(res)) {
+      assert.deepEqual(await readFile(join(dir, f.path)), f.bytes, f.path);
+    }
+
+    // `checkoutInto` still answers with the same list it always did.
+    assert.deepEqual(await repo.checkoutInto(dir, "main"), projected.written);
+
+    // Capture: a directory that LOOKS like a build environment is still captured, because
+    // nothing declared it shared. The core has no built-in list of "obviously shared" names,
+    // and this is what proves it (docs/21 §2-1: path rules only, no ecosystem knowledge).
+    await mkdir(join(dir, "node_modules", "dep"), { recursive: true });
+    await writeFile(join(dir, "node_modules", "dep", "index.js"), "module.exports = 1;");
+    const cap = await repo.commitWorkingTree(dir, { message: "capture", actor: dev });
+    assert.deepEqual(cap.added, ["node_modules/dep/index.js"], "unconfigured ⇒ captured, as always");
+
+    // Round trip: projecting that capture reproduces the identical tree, treeHash included.
+    const after = await repo.materialize("main");
+    const back = await mkdtemp(join(tmpdir(), "avcs-back-"));
+    await repo.projectInto(back, "main");
+    for (const f of await repo.materializedBytes(after)) {
+      assert.deepEqual(await readFile(join(back, f.path)), f.bytes, f.path);
+    }
+    assert.equal((await repo.commitWorkingTree(back, { message: "no-op", actor: dev })).ops.length, 0, "and re-capturing it is a no-op");
+    await rm(back, { recursive: true, force: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("S7 — files inside a shared path are never captured, even absent from .avcsignore", async () => {
+  // Principle 5: contamination must be structurally impossible. Forgetting to list
+  // `node_modules` in `.avcsignore` must not be able to capture 50k files, so the shared
+  // paths are folded into the ignore predicate IN THE CORE.
+  const { dir, repo } = await projectable();
+  try {
+    await repo.projectInto(dir, "main");
+    assert.equal(existsSync(join(dir, ".avcsignore")), false, "nothing is written to .avcsignore — the config is not the defence");
+
+    // A REAL directory at the shared path (not the symlink) is the hard case: the walk can
+    // descend into it, so only the ignore composition stops it.
+    await rm(join(dir, "node_modules"), { recursive: true, force: true });
+    await mkdir(join(dir, "node_modules", ".pnpm", "lodash@4"), { recursive: true });
+    for (const n of ["a", "b", "c"]) await writeFile(join(dir, "node_modules", ".pnpm", "lodash@4", `${n}.js`), "x");
+    await writeFile(join(dir, "node_modules", ".modules.yaml"), "hoisted: true");
+
+    const cap = await repo.commitWorkingTree(dir, { message: "capture", actor: dev });
+    assert.deepEqual(cap.ops, [], "op 0개");
+    assert.deepEqual([cap.added, cap.modified, cap.removed], [[], [], []]);
+
+    // A file OUTSIDE the shared path still captures — the predicate is scoped, not global.
+    await writeFile(join(dir, "src", "b.ts"), "export const b = 2;\n");
+    assert.deepEqual((await repo.commitWorkingTree(dir, { message: "real change", actor: dev })).added, ["src/b.ts"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("S8 — a symlinked shared path is not captured because Dirent means lstat (regression pin)", async () => {
+  // This is a DEPENDENCE, not a change: `#readWorkTree` branches on `Dirent`, whose type
+  // predicates are lstat-based, so a symlink is neither isDirectory() nor isFile() and the
+  // walk never enters or reads it. docs/21 R3 calls this an implicit dependency; the point of
+  // this test is to make a refactor to `stat` fail loudly instead of capturing a whole cache.
+  const { dir, repo } = await projectable();
+  try {
+    const link = (await repo.projectInto(dir, "main")).shared[0]!;
+    // Fill the cache the way an install would — through the link, from the workspace's side.
+    await mkdir(join(dir, "node_modules", "dep"), { recursive: true });
+    await writeFile(join(dir, "node_modules", "dep", "index.js"), "module.exports = 1;");
+    assert.equal(existsSync(join(link.cache, "dep", "index.js")), true, "the write landed in the cache");
+
+    // The pin: Dirent must classify the entry as neither a directory nor a file.
+    const ent = (await readdir(dir, { withFileTypes: true })).find((e) => e.name === "node_modules")!;
+    assert.equal(ent.isSymbolicLink(), true);
+    assert.equal(ent.isDirectory(), false, "if this ever becomes true the walk will capture the whole cache");
+    assert.equal(ent.isFile(), false);
+
+    // And the consequence: capture skips it EVEN WITH NO SHARED CONFIG AT ALL, which is what
+    // isolates this test to the lstat dependency rather than the ignore composition (S8b).
+    assert.equal(await repo.removeSharedPath("node_modules"), true);
+    assert.deepEqual((await repo.readSharedPaths()), []);
+    const cap = await repo.commitWorkingTree(dir, { message: "capture", actor: dev });
+    assert.deepEqual(cap.ops, [], "op 0개 — the symlink alone was enough");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("S8b — `mode: copy` puts a REAL directory there, and the ignore composition is its only defence", async () => {
+  const { dir, repo } = await projectable({ mode: "copy" });
+  try {
+    const link = (await repo.projectInto(dir, "main")).shared[0]!;
+    await mkdir(join(dir, "node_modules", "dep"), { recursive: true });
+    await writeFile(join(dir, "node_modules", "dep", "index.js"), "module.exports = 1;");
+    assert.equal((await lstat(join(dir, "node_modules"))).isSymbolicLink(), false, "a real directory: the walk CAN descend");
+
+    assert.deepEqual((await repo.commitWorkingTree(dir, { message: "capture", actor: dev })).ops, [], "op 0개");
+
+    // Ablation, in the test itself: drop the shared path and the same files DO get captured.
+    // That is the proof that the composition — not the filesystem — is what held here.
+    await repo.removeSharedPath("node_modules");
+    const leaked = await repo.commitWorkingTree(dir, { message: "unguarded", actor: dev });
+    assert.deepEqual(leaked.added, ["node_modules/dep/index.js"], "unguarded, copy mode leaks — hence S8b exists");
+    assert.equal(link.mode, "copy");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("`avcs shared` lists, adds and removes", async () => {
   const dir = await mk();
   try {

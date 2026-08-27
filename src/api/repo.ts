@@ -2541,7 +2541,18 @@ export class Repo {
     const root = resolve(workDir);
     const out2 = out; // keep the closure below reading naturally
     const avcsIgnore = await this.#loadAvcsIgnore(root);
-    const ignored = (rel: string): boolean => avcsIgnore(rel) || (ignorePredicate?.(rel) ?? false);
+    // Shared paths are folded in HERE, in the core, and not left to the user's `.avcsignore`
+    // (docs/21 §3.5). If listing `node_modules` in an ignore file were the defence, forgetting
+    // to list it would capture 50k files — so contamination is made structurally impossible
+    // instead of merely configurable. Listing a shared path in `.avcsignore` too is harmless.
+    //
+    // A symlinked shared path is already safe without this: the walk below branches on
+    // `Dirent`, whose predicates are lstat-based, so a symlink is neither isDirectory() nor
+    // isFile() and is never entered or read (pinned by docs/21 S8). `mode: "copy"` is the
+    // dangerous one — a real directory the walk CAN descend — and this composition is its
+    // only defence (S8b).
+    const sharedIgnore = await this.#loadSharedIgnore();
+    const ignored = (rel: string): boolean => avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?? false);
     const walk = async (dir: string): Promise<void> => {
       for (const ent of await readdir(dir, { withFileTypes: true })) {
         const rel = relative(root, join(dir, ent.name)).split("\\").join("/");
@@ -2556,6 +2567,23 @@ export class Repo {
     };
     await walk(root);
     return out;
+  }
+
+  /**
+   * Build an ignore predicate from the configured shared paths (docs/21 §3.5).
+   *
+   * A shared path matches itself and everything under it, and nothing else — it is a path
+   * PREFIX rule, deliberately narrower than `.avcsignore`'s basename and `*.ext` matching,
+   * because a shared path names one place in the projection rather than a family of files.
+   *
+   * Unconfigured ⇒ `() => false`, the same object shape `#loadAvcsIgnore` returns for a
+   * missing file, so capture is byte-identical to before this existed (S1).
+   */
+  async #loadSharedIgnore(): Promise<(rel: string) => boolean> {
+    const entries = await this.readSharedPaths();
+    if (!entries.length) return () => false;
+    const paths = entries.map((e) => e.path);
+    return (rel: string): boolean => paths.some((p) => rel === p || rel.startsWith(p + "/"));
   }
 
   /**
