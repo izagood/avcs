@@ -60,7 +60,16 @@ op는 불변(content-addressed)이다. 격리는 **op에 새 필드 `workspace`*
 - **materialize 필터:**
   - **base line view**: `op.workspace`가 달린 op는 **제외** → base(main)는 깨끗하게 유지된다.
   - **workspace view**: `base accepted` + `op.workspace == 나` → 에이전트가 보는 작업 트리.
+    `base accepted`에는 **land된 다른 workspace의 op이 포함된다** — land가 곧 base accept이므로.
 - **land** = op를 바꾸는 게 아니라(불변), base line이 그 op들을 **accept**하는 것(게이트 통과 후 base view에 합류). 미land면 폐기(op는 남되 어디서도 투영되지 않음).
+
+> **구현 정정 (#78, 해소됨).** `materialize`의 workspace view는 landed 집합을 조회하지 않고
+> 다른 workspace의 op을 land 여부와 무관하게 배제했다. 그래서 workspace A가 land한 뒤에도
+> B는 그 변경을 보지 못하고, 이미 base에 들어간 작업을 모른 채 계속 작업했다 — 이 문서가
+> 없애려는 "뒤늦은 충돌 발견"의 workspace판 재연. 이제 landed는 **모든 view**에서 조회되고
+> 필터는 "태그가 있고 · 내 것이 아니며 · land되지 않은" op만 배제한다. workspace가 없는
+> view에서는 가운데 조건이 항상 참이므로 **base view 동작은 불변**이다
+> ([20](20-workspace-bridge.md) §1.3, 회귀 테스트 W5).
 
 `session`/`intent`와는 직교한다: workspace=공간적 격리(어디서 빌드되나), session=시간적 추적, intent=의도.
 
@@ -132,7 +141,15 @@ avcs는 환경을 만들지 않고 빌려 쓴다. 자가검증(작성자=서명�
 
 ## 10. 미해결 / 오픈 질문
 
+0. ~~**landed workspace 가시성**~~ — 해소됨(#78, §4.2의 구현 정정). land된 workspace의 op은
+   base view와 다른 workspace view 모두에서 보인다.
 1. **shared-path 무결성** — `node_modules`를 공유하는데 두 workspace의 `package.json`/lock이 다르면 깨진다. 공유 키(lock 경로/해시)를 사용자·에이전트가 지정하는 형태가 유력(코어 무지 유지). lock-해시 기반 자동 분리까지 코어가 책임질지는 미정.
 2. **투영 비용** — 큰 저장소 물리 복제. hardlink/CoW 투영 필요.
 3. **op 캡처 경계** — workspace에서의 수정을 op로 캡처할 때 shared-path가 op로 새지 않게(#10 ignore 재사용).
 4. **land merge 시맥틱** — workspace op를 base에 accept할 때 reduce의 3-way merge로 자동 합류(§6). conflict는 `conflict_list`로 표면화 → 사람/정책 결정.
+5. **land 취소 없음** — `landWorkspace`는 추가 전용이고 `unlandWorkspace`는 없다. 그래서
+   자동 land 경로(git 브리지, [20](20-workspace-bridge.md) §3.4)는 병합 브랜치를 확신할 수
+   없으면 아무것도 land하지 않는다. 되돌리기의 필요성이 실측되면 별도 설계.
+6. **`workspaces.landed`는 전역 집합** — line별이 아니다. 여러 line이 같은 workspace 이름을
+   쓰면 의미가 뒤섞인다([20](20-workspace-bridge.md) R3). 현재 실사용에 그 조합이 없어
+   제약으로만 명시한다.

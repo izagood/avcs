@@ -209,15 +209,17 @@ test("two working trees committing at once share the store without corrupting it
     );
   }
 
-  // Each tree's branch became its own line, and the store survives its own integrity check.
-  const lines = avcs(main, ["lines"]);
-  assert.match(lines, /topic\b/);
-  assert.match(lines, /topic-2/);
+  // Each tree's branch became its own workspace (docs/20 — a topic branch converges, so it
+  // is a workspace, not a line), and the store survives its own integrity check.
+  const workspaces = avcs(main, ["workspace", "list"]);
+  assert.match(workspaces, /topic\b/);
+  assert.match(workspaces, /topic-2/);
+  assert.doesNotMatch(avcs(main, ["lines"]), /topic/, "no line was minted for either branch");
   assert.doesNotMatch(avcs(main, ["fsck"]), /corrupt|missing|broken/i);
 });
 
 test("a working tree on a slashed branch can commit end-to-end", async () => {
-  // A smoke test for the shape that broke in practice: branch -> line -> lock name. It does
+  // A smoke test for the shape that broke in practice: branch -> scope -> lock name. It does
   // NOT by itself reproduce the spin (this fixture has far too few ops to trigger the
   // incremental reducer's auto-compaction, which is where the lock was taken). The tight
   // regressions live in phase7-local-concurrency ("a lock name containing a path separator")
@@ -230,5 +232,5 @@ test("a working tree on a slashed branch can commit end-to-end", async () => {
   await writeFile(join(slashed, "from-slashed.txt"), "hi\n");
   const out = await avcsAsync(slashed, ["git-sync", "-m", "from a slashed branch"]);
   assert.match(out, /from-slashed\.txt/);
-  assert.match(avcs(main, ["lines"]), /team\/feature-x/);
+  assert.match(avcs(main, ["workspace", "list"]), /team\/feature-x/);
 });
