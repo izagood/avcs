@@ -19,6 +19,30 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Changed — an updated install no longer kills a running MCP server; it says so instead.**
+
+- A long-lived stdio server holds the code it was spawned with, so `npm i -g` never reaches
+  it. The server used to detect that and `exit(0)`, on the assumption that the client would
+  respawn it. Claude Code — the common client — does not: it marks the server disconnected
+  and waits for a manual `/mcp`. Exiting there strips every AVCS tool out of a live session
+  with no visible cause, which is worse than serving code one version behind that still works.
+  - The default is now to emit a `notifications/message` (level `warning`) naming both
+    versions and the fix, **once**, and keep serving.
+  - The same notice is appended to subsequent errors. A stale server fails in ways that point
+    at the wrong culprit — it cannot read a newer on-disk layout and reports "not an AVCS
+    repo" about a directory the upgraded CLI reads fine — so the error now names its own cause.
+  - Clients that *do* respawn keep the old behaviour with `AVCS_MCP_RELOAD=exit`.
+    `AVCS_MCP_RELOAD_CHECK_MS=0` still disables the check entirely.
+
+**Fixed — the server never actually sent any log notification.**
+
+- `notifications/message` is gated by the SDK on a declared `logging` capability
+  (`assertNotificationCapability`), which the server did not declare. Every such send was
+  wrapped in `.catch(() => {})`, so the failures were invisible: watch events
+  (`head-advanced`, `foreign-op-hot-key`, `conflict-opened`) were emitted into nothing and no
+  client ever received one. Declaring `logging` makes them arrive.
+
+
 **Fixed — a lock name containing a path separator spun forever instead of acquiring.**
 
 - `withLock` built its lock directory as `join(locksDir, name + ".lock")` with the name raw.
