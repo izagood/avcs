@@ -553,6 +553,41 @@ test("`avcs shared rm --cache <key>` throws one cache away (docs/21 R2)", async 
   }
 });
 
+test("committed git mode never commits the shared cache", async () => {
+  // Not in docs/21 — the spec places the cache under `.avcs/` and stops there, which is right
+  // for sidecar mode (everything under `.avcs/` is ignored). In COMMITTED mode `.avcs/` is
+  // deliberately tracked except for a named list of rebuildable caches, and a build cache is
+  // very much one of those: without the entry, `git add` would sweep 50k dependency files
+  // into the history AVCS was trying to keep clean.
+  const dir = await mk();
+  try {
+    const repo = await Repo.init(dir);
+    await repo.setGitMode("committed");
+    assert.match(await readFile(join(dir, ".avcs", ".gitignore"), "utf8"), /^\/shared\/$/m);
+
+    // A repo that went committed BEFORE shared paths existed has the old file. Configuring a
+    // shared path is the moment the cache tree comes into being, so that is where it is fixed.
+    await repo.store.writeAux(".gitignore", "/indexes/\n/locks/\n");
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 1\n");
+    await repo.addSharedPath({ path: "node_modules", keyFrom: ["pnpm-lock.yaml"] });
+    await repo.projectInto(dir, "main");
+    assert.match(await readFile(join(dir, ".avcs", ".gitignore"), "utf8"), /^\/shared\/$/m);
+
+    // Sidecar mode is untouched: its `*` already covers everything, including this. A repo
+    // that never set a mode has no `.avcs/.gitignore` at all, and projecting must not write one.
+    const side = await mk();
+    const sideRepo = await Repo.init(side);
+    const sideIgnore = join(side, ".avcs", ".gitignore");
+    const before = existsSync(sideIgnore) ? await readFile(sideIgnore, "utf8") : null;
+    await sideRepo.addSharedPath({ path: "node_modules" });
+    await sideRepo.projectInto(side, "main");
+    assert.equal(existsSync(sideIgnore) ? await readFile(sideIgnore, "utf8") : null, before, "S1's spirit: no gratuitous rewrite");
+    await rm(side, { recursive: true, force: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a history contaminated BEFORE the rule existed is not written over the live cache", async () => {
   // §3.5's symmetric defence. Capture can no longer produce such ops, but an existing repo
   // can already hold them — and writing them would spill recorded bytes straight through the

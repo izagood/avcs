@@ -236,9 +236,13 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /oplog
 /objlog
 /pending/
+/shared/
 *.lock
 *.tmp*
 `;
+
+/** The committed-mode ignore entry for the shared-path cache tree (docs/21 §3.3). */
+const SHARED_IGNORE_LINE = "/shared/";
 
 export class Repo {
   readonly dir: string;
@@ -2736,6 +2740,26 @@ export class Repo {
   }
 
   /**
+   * Keep the cache tree out of git in COMMITTED mode.
+   *
+   * Sidecar mode ignores all of `.avcs/` (its `*` covers this), but committed mode
+   * deliberately TRACKS `.avcs/` except for a named list of rebuildable caches — and a build
+   * environment is emphatically one of those. Without the entry, `git add` would sweep tens
+   * of thousands of dependency files into the history AVCS exists to keep clean.
+   *
+   * A repo that flipped to committed mode before shared paths existed has the older file, so
+   * this repairs it at the moment the cache tree first comes into being. Cheap: it reads the
+   * small ignore file and writes only when the entry is genuinely missing, and it never
+   * touches a sidecar repo (nothing there needs it).
+   */
+  async #ensureSharedCacheIgnored(): Promise<void> {
+    if ((await this.getGitMode()) !== "committed") return;
+    const raw = (await this.store.readAux(".gitignore"))?.toString("utf8") ?? "";
+    if (raw.split(/\r?\n/).some((l) => l.trim() === SHARED_IGNORE_LINE)) return;
+    await this.#writeGitignore("committed");
+  }
+
+  /**
    * Root of the store-local shared-cache tree (docs/21 §3.3).
    *
    * Store-local, not `$HOME`: cleanup is then one `.avcs` away, the home directory stays
@@ -2802,6 +2826,7 @@ export class Repo {
       // R4: the LOCK covers only creating the directory, so two concurrent projections cannot
       // race it. Coordinating concurrent INSTALLS is outside the core's reach by construction
       // — it does not run them.
+      await this.#ensureSharedCacheIgnored();
       await this.store.withLock(`shared:${key}`, async () => { await mkdir(cache, { recursive: true }); });
       const populated = (await readdir(cache)).length > 0;
 
