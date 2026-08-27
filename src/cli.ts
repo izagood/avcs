@@ -183,9 +183,34 @@ async function landMergedWorkspace(
  *  prunes ignored directories, so this is invoked per surviving entry, not per ignored file. */
 function gitIgnorePredicate(dir: string): (rel: string) => boolean {
   if (gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") return () => false;
-  // `git check-ignore -q <path>`: exit 0 (ignored) ⇒ gitCmd returns ""; exit 1 (not ignored)
-  // or any error ⇒ gitCmd returns null. So "ignored" is exactly a non-null result.
-  return (rel: string): boolean => gitCmd(dir, ["check-ignore", "-q", rel]) !== null;
+  // One git invocation for the whole tree, not one per entry (issue #64). The old
+  // predicate spawned `git check-ignore` per surviving entry — hundreds of process
+  // spawns per hook, the dominant cost of a pre-commit ingest and the reason a
+  // deadline could not be honored. `ls-files -i -o --exclude-standard --directory`
+  // lists ignored untracked paths once, collapsing whole ignored directories into a
+  // single entry; a tracked file is by definition not filtered out here.
+  const listed = gitCmd(dir, [
+    "ls-files",
+    "-i",
+    "-o",
+    "--exclude-standard",
+    "--directory",
+    "-z",
+  ]);
+  if (listed === null) {
+    // Fall back to the per-entry probe rather than silently filtering nothing.
+    return (rel: string): boolean => gitCmd(dir, ["check-ignore", "-q", rel]) !== null;
+  }
+  const files = new Set<string>();
+  const dirs: string[] = [];
+  for (const raw of listed.split("\0")) {
+    const entry = raw.replace(/\/$/, "");
+    if (!entry) continue;
+    if (raw.endsWith("/")) dirs.push(`${entry}/`);
+    else files.add(entry);
+  }
+  return (rel: string): boolean =>
+    files.has(rel) || dirs.some((d) => rel === d.slice(0, -1) || rel.startsWith(d));
 }
 
 /**
@@ -905,14 +930,29 @@ async function main(): Promise<void> {
         }
         break; // never blocks the checkout
       }
+      // A timed-out hook must EXIT, not merely `break` (issue #64). `withDeadline`
+      // races a timer against the work; it cannot cancel it (deadline.ts has no
+      // AbortSignal, and a synchronous section would starve the timer anyway). The
+      // abandoned ingest keeps running — reading the whole work tree, spawning git per
+      // entry, rewriting the projection — and git waits for this child process to exit,
+      // so "fail open" held only on paper: the commit still blocked for as long as the
+      // full ingest took (10s+ on a mid-sized repo against a 300ms deadline).
+      //
+      // Exiting drops that work with the process. Safe by design here: every hook phase
+      // already treats a timeout as skippable (the change is captured on the next sync),
+      // and exiting also removes a worse hazard — a zombie hook's `checkoutInto`
+      // overwriting the work tree while git is committing it.
+      function failOpen(message: string): never {
+        console.error(message);
+        process.exit(0);
+      }
+
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
       // cwd is the working tree (possibly a linked git worktree); the store may live in
       // the main checkout. Opening the store can itself block under contention, so bound it.
       const opened = await withDeadline(() => Repo.open(storeDirFor(cwd)), hookMs);
-      if (!opened.ok) {
-        console.error(`avcs: opening the store exceeded ${hookMs}ms — skipping git-hook ${phase} (#33). Another avcs process may be holding it; set AVCS_HOOK_TIMEOUT_MS=0 to wait.`);
-        break; // fail open: never block git on a busy store
-      }
+      if (!opened.ok)
+        failOpen(`avcs: opening the store exceeded ${hookMs}ms — skipping git-hook ${phase} (#33). Another avcs process may be holding it; set AVCS_HOOK_TIMEOUT_MS=0 to wait.`);
       const repo = opened.value;
       switch (phase) {
         case "pre-commit": {
@@ -926,10 +966,8 @@ async function main(): Promise<void> {
             await ensureLine(repo, scope.line);
             return repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
-          if (!res.ok) {
-            console.error(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
-            break; // fail open: let git complete the commit
-          }
+          if (!res.ok)
+            failOpen(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
           const r = res.value;
           reportContention(r.contention);
           if (r.conflicts.length) {
@@ -953,7 +991,7 @@ async function main(): Promise<void> {
             const trailer = repo.gitTrailer({ checkpoint: pending.checkpoint, treeHash: pending.treeHash, ...(pending.intent ? { intent: pending.intent } : {}) });
             await writeFile(msgFile, `${cur.replace(/\n*$/, "")}\n\n${trailer}\n`, "utf8");
           }, hookMs);
-          if (!res.ok) console.error(`avcs: prepare-commit-msg exceeded ${hookMs}ms — commit trailer skipped (#33).`);
+          if (!res.ok) failOpen(`avcs: prepare-commit-msg exceeded ${hookMs}ms — commit trailer skipped (#33).`);
           break;
         }
         case "post-commit": {
@@ -968,7 +1006,7 @@ async function main(): Promise<void> {
             await repo.recordGitCommit(sha, pending.checkpoint);
             await repo.clearGitPending(cwd);
           }, hookMs);
-          if (!res.ok) console.error(`avcs: post-commit bookkeeping exceeded ${hookMs}ms — commit↔checkpoint link deferred (#33).`);
+          if (!res.ok) failOpen(`avcs: post-commit bookkeeping exceeded ${hookMs}ms — commit↔checkpoint link deferred (#33).`);
           break;
         }
         case "post-merge": {
@@ -994,7 +1032,7 @@ async function main(): Promise<void> {
             const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
             return { outcome, scope, sync };
           }, hookMs);
-          if (!res.ok) console.error(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
+          if (!res.ok) failOpen(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
           else {
             const { outcome, scope, sync } = res.value;
             if ("landed" in outcome) console.log(`avcs: landed workspace ${outcome.landed} — its ops are now part of the base view`);

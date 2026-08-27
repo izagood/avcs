@@ -2521,9 +2521,23 @@ export class Repo {
     const written: string[] = [];
     for (const [path, blobOid] of res.tree) {
       const full = join(workDir, path);
-      await mkdir(dirname(full), { recursive: true });
       const synth = res.synthBlobs.get(blobOid);
-      await writeFile(full, synth ?? await this.readBlob(blobOid));
+      const want = synth ?? (await this.readBlob(blobOid));
+      // Skip a file whose bytes already match (issue #64). Rewriting the whole
+      // projection on every hook was the bulk of a git-sync's I/O, and it churned
+      // mtimes — which makes build tools and `git status` see phantom changes. The
+      // return value still lists the view's files, not just the ones touched: callers
+      // (git-sync's re-stage, tests) treat it as "what the view projects here".
+      let same = false;
+      try {
+        same = (await readFile(full)).equals(Buffer.from(want));
+      } catch {
+        /* absent or unreadable → write it */
+      }
+      if (!same) {
+        await mkdir(dirname(full), { recursive: true });
+        await writeFile(full, want);
+      }
       written.push(path);
     }
     return written.sort();
