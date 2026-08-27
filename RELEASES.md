@@ -19,6 +19,53 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Breaking (determinism) — file identity: a rename and a concurrent edit now merge.
+`MERGE3_VERSION` `text3/0.1.0` → `text3/0.2.0`, so `MATERIALIZER_VERSION` becomes
+`avcs-text3/0.2.0`.**
+
+Restores `docs/00` principle 2 ("파일 경로가 아니라 Entity ID가 정체성이다 → rename + edit가
+자동 병합 가능"), which the language-neutral redesign dropped without recording it as a
+tradeoff. Design: [docs/19](docs/19-entity-identity.md). Regression noted in
+[docs/15](docs/15-language-neutral-core.md) §11.
+
+- **What was wrong.** `applyOp` applied content ops at the path they name, so the outcome of
+  a concurrent `rename_file(P→Q)` and `edit_file(P)` depended on their canonical
+  (`lamport, oid`) order: edit-then-rename produced the right tree, while rename-then-edit
+  found no `tree.get(P)`, fell back to `current = opBase`, and **resurrected P** — the
+  content ended up at two paths with the edit sitting on the dead one. Determinism held;
+  correctness was left to an accident of ordering.
+- **What changed.** The reducer builds a path-alias map from the rename closure and routes
+  content ops to the file's final path, so rename and edit commute (identical `treeHash`
+  under either ordering). An op that causally *descends* from a rename is not aliased, so a
+  new file created at the vacated path stays a new file. Concurrent renames to different
+  destinations, two renames racing for one destination, and concurrent base-less `put_file`
+  remain conflicts. `merge3` itself is untouched and still sees nothing but lines.
+- **Capture now emits `rename_file`.** `commitWorkingTree` previously computed changes by
+  path-set difference, so a move looked like `delete_file` + `put_file` and no rename op was
+  ever authored on the git-bridge path. It now pairs removals with additions: exact blob
+  match → a bare rename; ≥50% line similarity (reusing this module's LCS, no new algorithm)
+  → rename + `edit_file` based on the pre-move content; many-to-many ambiguity or binary
+  content without an exact match → left as delete + put.
+
+**Migration.**
+
+- **A rename-free op set materializes byte-identically.** Only op sets containing
+  `rename_file` can reduce differently, and before this release the git bridge never authored
+  one (nor does `importGitHistory`, which maps changed paths to `put_file`/`delete_file`), so
+  a store built through either is unaffected in content. Verified by case C21 plus the full
+  pre-existing suite passing unchanged.
+- **Persisted compaction snapshots invalidate.** Their header stamps the materializer version,
+  so a cold load rejects the stale file and falls back to a full reduce — automatic and safe
+  (Phase 13.3), costing one rebuild.
+- **Stored checkpoints stay valid.** Each records the `materializerVersion` that produced its
+  `treeHash`, so old checkpoints remain accurate records. That field is also the point of the
+  bump: a replica on `text3/0.1.0` that receives rename-bearing ops from a `0.2.0` store now
+  sees an explicit version mismatch instead of computing a divergent tree under a stamp
+  claiming the same substrate.
+- If you authored `rename_file` ops directly through the API, re-materializing changes those
+  trees. The previous result was the duplicated-path bug described above.
+
+
 **Changed — an updated install no longer kills a running MCP server; it says so instead.**
 
 - A long-lived stdio server holds the code it was spawned with, so `npm i -g` never reaches

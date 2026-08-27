@@ -11,7 +11,13 @@
 // replica. The algorithm version is pinned into MATERIALIZER_VERSION so a different
 // merge implementation cannot silently diverge a replica's tree.
 
-export const MERGE3_VERSION = "text3/0.1.0";
+// 0.2.0 — file identity (docs/19). The merge of a single file's TEXT is unchanged; what
+// changed is which file a content op applies to: the reducer now resolves paths through the
+// rename closure, so an op set containing `rename_file` can reduce to a different (and
+// correct) tree than it did at 0.1.0. A rename-free op set is byte-identical either way.
+// The stamp moves so a replica still on the older substrate cannot silently disagree about
+// a rename-bearing one — `Checkpoint.materializerVersion` makes the mismatch explicit.
+export const MERGE3_VERSION = "text3/0.2.0";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
@@ -209,6 +215,22 @@ function renderSpan(baseLines: string[], start: number, end: number, members: Hu
   }
   for (let i = cur; i < end; i++) out.push(baseLines[i]!);
   return joinLines(out);
+}
+
+/**
+ * How many lines of `a` survive into `b` — the length of their longest common
+ * subsequence of lines.
+ *
+ * Derived from `diffHunks` instead of adding a second algorithm: in that edit script every
+ * line of `a` is either matched (producing no hunk) or consumed inside some hunk's
+ * `[start, end)` span, so the LCS length is `a.length` minus the total span the hunks
+ * cover. Exposed for the capture path's rename similarity (docs/19 §3.1), and as
+ * language-blind as the rest of this module — it compares lines and nothing else.
+ */
+export function lcsLineLength(a: string[], b: string[]): number {
+  let consumed = 0;
+  for (const h of diffHunks(a, b)) consumed += h.end - h.start;
+  return a.length - consumed;
 }
 
 /**
