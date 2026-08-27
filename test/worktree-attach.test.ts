@@ -148,3 +148,28 @@ test("post-checkout honours the committed-mode refusal too", async () => {
   execFileSync("git", ["-C", main, "worktree", "add", "-q", "-b", "committed-auto", fresh], { stdio: "ignore" });
   assert.equal(existsSync(join(fresh, ".avcs")), false, "a hook must not create what the command forbids");
 });
+
+test("init in a linked tree whose main checkout has a store stops and offers attach", async () => {
+  const { linked } = await fixture();
+  const msg = avcsErr(linked, ["init", "--no-hooks"]);
+  assert.match(msg, /already has an AVCS store/);
+  assert.match(msg, /avcs worktree attach/);
+  assert.equal(existsSync(join(linked, ".avcs")), false, "no divergent store was created");
+});
+
+test("init --force still creates an independent store in a linked tree", async () => {
+  const { linked } = await fixture();
+  avcs(linked, ["init", "--force", "--no-hooks"]);
+  assert.equal(statSync(join(linked, ".avcs")).isDirectory(), true);
+});
+
+test("init in a plain directory is unaffected", async () => {
+  const solo = await mkdtemp(join(tmpdir(), "avcs-plain-"));
+  avcs(solo, ["init", "--no-hooks"]);
+  assert.match(avcs(solo, ["status"]), /view:/);
+});
+
+test("init in the main checkout of a repo with worktrees is unaffected", async () => {
+  const { main } = await fixture();
+  assert.match(avcs(main, ["init", "--no-hooks"]), /initialized|already/i);
+});

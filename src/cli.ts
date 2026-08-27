@@ -208,6 +208,20 @@ async function main(): Promise<void> {
     }
     case "init": {
       const dir = args[1] && !args[1].startsWith("--") ? args[1] : cwd;
+      // A linked working tree whose main checkout already has a store almost never wants a
+      // second one: the two would accumulate separate history and push to separate remotes,
+      // with nothing that could ever reconcile them — and it looks fine until it doesn't.
+      // Stop and name the fix; `--force` stays available for a deliberate split.
+      if (!args.includes("--force") && !ObjectStore.isRepo(dir)) {
+        const owner = mainCheckoutOf(dir);
+        if (owner && ObjectStore.isRepo(owner)) {
+          throw new Error(
+            `the main checkout of this linked working tree already has an AVCS store (${owner}). ` +
+              "Creating another one here would fork the history. Run `avcs worktree attach` to share " +
+              "that store, or `avcs init --force` if you really want an independent one.",
+          );
+        }
+      }
       const repo = await Repo.init(dir);
       const want = flag("--mode");
       const mode: GitMode = want === "committed" ? "committed" : "sidecar";
