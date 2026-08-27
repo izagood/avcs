@@ -87,6 +87,49 @@ test("shared-paths config: add/remove are read-modify-write, and escaping paths 
   }
 });
 
+// ── Slice 2: key derivation (S9, S10, S15) ───────────────────────────────────
+
+test("S15 — the key is a pure function of the PROJECTED content of the declared files", async () => {
+  // A tree is `path → blobOid`, and a blob object is `{type,data,encoding}` — content and
+  // nothing else. So equal content means an equal oid means an equal key, with no disk read
+  // and no clock in the way. Determinism buys cache correctness for free.
+  const a = new Map([["pnpm-lock.yaml", "oid-lock"], ["src/a.ts", "oid-a"]]);
+  const b = new Map([["src/a.ts", "oid-a"], ["pnpm-lock.yaml", "oid-lock"]]); // different insertion order
+  const k1 = Repo.deriveSharedKey(["pnpm-lock.yaml"], a);
+  const k2 = Repo.deriveSharedKey(["pnpm-lock.yaml"], b);
+  assert.equal(k1.key, k2.key, "insertion order of the tree must not move the key");
+  assert.match(k1.key, /^[0-9a-f]{32}$/);
+  assert.deepEqual(k1.missing, []);
+
+  // Order and duplication of keyFrom itself are also normalised away (§3.2 sorts).
+  assert.equal(
+    Repo.deriveSharedKey(["b.lock", "a.lock", "a.lock"], new Map([["a.lock", "1"], ["b.lock", "2"]])).key,
+    Repo.deriveSharedKey(["a.lock", "b.lock"], new Map([["b.lock", "2"], ["a.lock", "1"]])).key,
+  );
+
+  // S4's mechanism: different declared content ⇒ different key.
+  assert.notEqual(k1.key, Repo.deriveSharedKey(["pnpm-lock.yaml"], new Map([["pnpm-lock.yaml", "oid-lock-v2"]])).key);
+  // A file NOT declared cannot move the key, however much it changes.
+  assert.equal(k1.key, Repo.deriveSharedKey(["pnpm-lock.yaml"], new Map([["pnpm-lock.yaml", "oid-lock"], ["src/a.ts", "changed"]])).key);
+});
+
+test("S9/S10 — a missing declared file hashes as empty and says so; `keyFrom: []` is a named constant", async () => {
+  // S9: silently deriving a DIFFERENT key would split the cache for a lockfile that has not
+  // been written yet, and nobody would know why the install ran twice. So it participates as
+  // empty content and the absence is reported.
+  const missing = Repo.deriveSharedKey(["pnpm-lock.yaml"], new Map([["src/a.ts", "oid-a"]]));
+  assert.deepEqual(missing.missing, ["pnpm-lock.yaml"], "the absence is reported, not swallowed");
+  assert.equal(missing.key, Repo.deriveSharedKey(["pnpm-lock.yaml"], new Map()).key, "absent ⇒ empty content, deterministically");
+  assert.notEqual(missing.key, Repo.deriveSharedKey(["pnpm-lock.yaml"], new Map([["pnpm-lock.yaml", "oid-lock"]])).key);
+
+  // S10: an empty declaration is the explicit choice "every workspace shares one cache".
+  // Dangerous, and the user's to make — so it is allowed, named, and flagged.
+  const unkeyed = Repo.deriveSharedKey([], new Map([["pnpm-lock.yaml", "oid-lock"]]));
+  assert.equal(unkeyed.key, "unkeyed");
+  assert.equal(unkeyed.unkeyed, true);
+  assert.equal(Repo.deriveSharedKey(undefined, new Map([["x", "y"]])).key, "unkeyed", "no keyFrom at all reads the same way");
+});
+
 test("`avcs shared` lists, adds and removes", async () => {
   const dir = await mk();
   try {

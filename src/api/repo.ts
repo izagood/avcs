@@ -2672,6 +2672,42 @@ export class Repo {
   }
 
   /**
+   * Derive a cache key from the PROJECTED content of the declared files (docs/21 §3.2):
+   *
+   *   key = sha256( canonical( [[path, blobOidOfProjectedContent] for path in sorted(keyFrom)] ) )[:32]
+   *
+   * Projected content, not what is on disk. A tree entry is `path → blobOid`, and a blob
+   * object is `{type,data,encoding}` — content and nothing else — so the oid IS the content
+   * hash. Two workspaces that project the same view therefore get the SAME key by
+   * construction, with no disk read and no clock in the way: determinism buys cache
+   * correctness for free (S15). Conversely a declared file whose content changes moves the
+   * key (S4), and an undeclared file cannot move it however much it changes.
+   *
+   * Pure and static: a key that decides which cache a workspace links to must be checkable
+   * without a store, a projection, or a filesystem.
+   *
+   *  - A declared file ABSENT from the view (a lockfile nobody has written yet) participates
+   *    as EMPTY content and is reported in `missing` — never silently keyed differently,
+   *    which would split the cache and leave nobody able to explain the extra install (S9).
+   *  - `keyFrom: []` (or absent) is the named constant `"unkeyed"`: the explicit choice that
+   *    every workspace shares one cache. Dangerous, and the user's to make (S10).
+   */
+  static deriveSharedKey(
+    keyFrom: string[] | undefined,
+    tree: Map<string, string>,
+  ): { key: string; missing: string[]; unkeyed: boolean } {
+    const declared = [...new Set(keyFrom ?? [])].sort();
+    if (!declared.length) return { key: "unkeyed", missing: [], unkeyed: true };
+    const missing: string[] = [];
+    const entries = declared.map((p) => {
+      const oid = tree.get(p);
+      if (oid === undefined) missing.push(p);
+      return [p, oid ?? ""];
+    });
+    return { key: sha256hex(canonicalize(entries)).slice(0, 32), missing, unkeyed: false };
+  }
+
+  /**
    * Root of the store-local shared-cache tree (docs/21 §3.3).
    *
    * Store-local, not `$HOME`: cleanup is then one `.avcs` away, the home directory stays
