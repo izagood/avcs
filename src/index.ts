@@ -51,3 +51,15 @@ export { Logger, consoleLogger, silentLogger } from "./observe/logger.ts";
 export type { LogEntry, LogLevel } from "./observe/logger.ts";
 export { Metrics } from "./observe/metrics.ts";
 export type { Timing } from "./observe/metrics.ts";
+
+// Programmatic git-history import (issue #63) — also at `@izagood/avcs/importer`.
+export {
+  importGitHistory,
+  gitCliSource,
+  type GitHistorySource,
+  type GitCommitRecord,
+  type GitFileChange,
+  type GitCliTarget,
+  type ImportGitHistoryOptions,
+  type ImportGitHistoryResult,
+} from "./importer/gitHistory.ts";
