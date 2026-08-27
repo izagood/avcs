@@ -314,3 +314,42 @@ test("issue #33: an exceeded hook deadline fails open — git commit still compl
   const log = execFileSync("git", ["log", "--oneline"], { cwd: dir }).toString();
   assert.match(log, /first/, "the commit landed despite the hook timing out");
 });
+
+test(
+  "issue #64: a timed-out hook exits promptly instead of finishing the abandoned ingest",
+  { skip: !hasGit },
+  async () => {
+    const dir = await mkrepo();
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "Tester"], { cwd: dir });
+    avcs(dir, "init");
+
+    // Enough files that a full ingest (read tree + author ops + reproject) takes
+    // materially longer than the deadline below. `withDeadline` cannot cancel it,
+    // so the hook must abandon it by exiting — not by waiting it out.
+    for (let i = 0; i < 150; i++) {
+      await writeFile(join(dir, `f${i}.txt`), `content ${i}\n`.repeat(40), "utf8");
+    }
+    execFileSync("git", ["add", "-A"], { cwd: dir });
+
+    const deadlineMs = 300;
+    const started = Date.now();
+    const res = spawnSync("git", ["commit", "-m", "bulk"], {
+      cwd: dir,
+      env: { ...process.env, AVCS_HOOK_TIMEOUT_MS: String(deadlineMs) },
+      encoding: "utf8",
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.status, 0, `commit must succeed (fail open): ${res.stderr}`);
+    assert.match(res.stderr, /exceeded|proceeding without/i, "warns that capture was skipped");
+    // Generous headroom for process spawn + git's own work; the point is that the
+    // commit does not wait for the abandoned ingest to run to completion.
+    const budget = deadlineMs + 4000;
+    assert.ok(
+      elapsed < budget,
+      `commit should return shortly after the deadline, took ${elapsed}ms (budget ${budget}ms)`,
+    );
+  },
+);
