@@ -5,9 +5,9 @@
 // agent workflow: intent → session → propose op → attach evidence → materialize →
 // decide → checkpoint.
 
-import { mkdir, writeFile, rm, readdir, readFile } from "node:fs/promises";
+import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname, resolve, relative } from "node:path";
+import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
@@ -142,6 +142,63 @@ export interface RemoteConfig {
 }
 
 /**
+ * One shared build-environment path (docs/21 §3.1), persisted in `.avcs/shared-paths.json`.
+ *
+ * The core treats `path` as a PATH RULE and nothing else — it does not know that
+ * `node_modules` is a dependency tree, or that `pnpm-lock.yaml` is a lockfile, exactly as
+ * `.avcsignore` (#10) knows nothing about what it excludes. That ignorance is docs/16 §2-2,
+ * and it is what keeps the core out of every build ecosystem.
+ *
+ *  - `path`    — relative to the projection root, forward slashes, no `..`, not absolute.
+ *  - `keyFrom` — the files whose PROJECTED content derives the cache key (§3.2). This is the
+ *                declarative answer to docs/16 §10 question 1 ("who names the shared key"):
+ *                the user declares *which files decide the environment*, and the core only
+ *                hashes their content, never reads their meaning. `[]` means one cache for
+ *                every workspace — allowed, because the user said so, and warned about.
+ *  - `mode`    — `symlink` (default, cost 0) or `copy` for toolchains that refuse a symlinked
+ *                dependency tree (§R1). `copy` is the DANGEROUS one for capture: it puts a
+ *                real directory in the tree, so the ignore composition (§3.5) is its only
+ *                defence.
+ */
+export interface SharedPathEntry {
+  path: string;
+  keyFrom?: string[];
+  mode?: SharedPathMode;
+}
+
+export type SharedPathMode = "symlink" | "copy";
+
+/**
+ * What {@link Repo.linkSharedPaths} did for one entry (docs/21 §3.4).
+ *
+ * `populated` — whether the cache directory is non-empty — is the WHOLE interface for "does
+ * this need an install?". The core creates the place and connects it; filling it belongs to
+ * the caller (human/agent/CI). The moment the core knew how to install anything, docs/21 §2
+ * principle 2 would be broken, so there is deliberately no hook, no command template and no
+ * package-manager guess anywhere near this type.
+ */
+export interface SharedPathLink {
+  path: string;
+  key: string;
+  /** Absolute path of the store-local cache directory (`<store>/shared/<key>/<slug>`). */
+  cache: string;
+  /** Absolute path inside the projection that should resolve to `cache`. */
+  target: string;
+  mode: SharedPathMode;
+  /** Whether the projection now reaches the cache (false ⇒ `warning` says why not). */
+  linked: boolean;
+  /** Cache directory is non-empty. The caller's only signal for "an install is needed". */
+  populated: boolean;
+  warning?: string;
+}
+
+/** The `.avcs/shared-paths.json` aux file (docs/21 §3.1). Not an object: never gossiped. */
+interface SharedPathsFile {
+  version: number;
+  shared: SharedPathEntry[];
+}
+
+/**
  * Early conflict warning for one contended entity key (Phase 15.3, docs/17 §15.3).
  * `theirs` are operations by OTHER actors that (a) are outside the caller's causal
  * closure — concurrent work the caller has not built on, (b) have not been rejected by
@@ -179,9 +236,13 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /oplog
 /objlog
 /pending/
+/shared/
 *.lock
 *.tmp*
 `;
+
+/** The committed-mode ignore entry for the shared-path cache tree (docs/21 §3.3). */
+const SHARED_IGNORE_LINE = "/shared/";
 
 export class Repo {
   readonly dir: string;
@@ -2484,7 +2545,18 @@ export class Repo {
     const root = resolve(workDir);
     const out2 = out; // keep the closure below reading naturally
     const avcsIgnore = await this.#loadAvcsIgnore(root);
-    const ignored = (rel: string): boolean => avcsIgnore(rel) || (ignorePredicate?.(rel) ?? false);
+    // Shared paths are folded in HERE, in the core, and not left to the user's `.avcsignore`
+    // (docs/21 §3.5). If listing `node_modules` in an ignore file were the defence, forgetting
+    // to list it would capture 50k files — so contamination is made structurally impossible
+    // instead of merely configurable. Listing a shared path in `.avcsignore` too is harmless.
+    //
+    // A symlinked shared path is already safe without this: the walk below branches on
+    // `Dirent`, whose predicates are lstat-based, so a symlink is neither isDirectory() nor
+    // isFile() and is never entered or read (pinned by docs/21 S8). `mode: "copy"` is the
+    // dangerous one — a real directory the walk CAN descend — and this composition is its
+    // only defence (S8b).
+    const sharedIgnore = await this.#loadSharedIgnore();
+    const ignored = (rel: string): boolean => avcsIgnore(rel) || sharedIgnore(rel) || (ignorePredicate?.(rel) ?? false);
     const walk = async (dir: string): Promise<void> => {
       for (const ent of await readdir(dir, { withFileTypes: true })) {
         const rel = relative(root, join(dir, ent.name)).split("\\").join("/");
@@ -2499,6 +2571,23 @@ export class Repo {
     };
     await walk(root);
     return out;
+  }
+
+  /**
+   * Build an ignore predicate from the configured shared paths (docs/21 §3.5).
+   *
+   * A shared path matches itself and everything under it, and nothing else — it is a path
+   * PREFIX rule, deliberately narrower than `.avcsignore`'s basename and `*.ext` matching,
+   * because a shared path names one place in the projection rather than a family of files.
+   *
+   * Unconfigured ⇒ `() => false`, the same object shape `#loadAvcsIgnore` returns for a
+   * missing file, so capture is byte-identical to before this existed (S1).
+   */
+  async #loadSharedIgnore(): Promise<(rel: string) => boolean> {
+    const entries = await this.readSharedPaths();
+    if (!entries.length) return () => false;
+    const paths = entries.map((e) => e.path);
+    return (rel: string): boolean => paths.some((p) => rel === p || rel.startsWith(p + "/"));
   }
 
   /**
@@ -2526,11 +2615,274 @@ export class Repo {
     };
   }
 
-  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
-  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+  // ── shared paths (docs/21) ─────────────────────────────────────────────────
+  // The other half of "ignore". `.avcsignore` says "do not record this as an op";
+  // a shared path says "do not record it AND still have it in the directory". Without
+  // the second half a projected workspace has no dependency tree, so it cannot build,
+  // so real projects keep git worktrees for physical isolation — and docs/16 §2-1
+  // ("물리 격리도 avcs가 제공한다") does not hold where it matters.
+  //
+  // Persisted in `.avcs/shared-paths.json`: an aux file like `remotes.json`, not an
+  // object — where your build cache lives is per-replica configuration, not shared
+  // history, and being under `.avcs/` keeps sidecar mode from exposing it to git.
+
+  /**
+   * Reject a `path` that could not be resolved under a projection root, or slugged into a
+   * store-local directory name, without ambiguity or escape. Called on WRITE so a bad entry
+   * never reaches the file, and again on USE so a hand-edited file cannot escape either.
+   */
+  static #assertSharedPath(path: string): void {
+    const bad =
+      !path ||
+      path !== path.trim() ||
+      isAbsolute(path) ||
+      path.startsWith("/") ||
+      /(^|\/)\.\.(\/|$)/.test(path) ||
+      path.split("/").some((seg) => seg === "" || seg === ".") ||
+      path.startsWith(".avcs");
+    if (bad) throw new Error(`shared path must be a relative path inside the projection, with no '..': ${JSON.stringify(path)}`);
+  }
+
+  /** Normalize one entry: forward slashes, no trailing slash, mode defaulted, keyFrom copied. */
+  static #normalizeSharedEntry(entry: SharedPathEntry): SharedPathEntry {
+    const path = entry.path.replace(/\\/g, "/").replace(/\/+$/, "");
+    Repo.#assertSharedPath(path);
+    const mode: SharedPathMode = entry.mode === "copy" ? "copy" : "symlink";
+    return { path, keyFrom: [...(entry.keyFrom ?? [])], mode };
+  }
+
+  /**
+   * The configured shared paths, or `[]` when nothing is configured. A torn/undecodable
+   * file reads as empty, exactly like `remotes.json` and `config.json`: an unreadable
+   * cache configuration must never make a projection fail.
+   *
+   * Reading must not CREATE the file — "no `shared-paths.json`" is the backward-compatible
+   * state (docs/21 S1) and the absence of the file is itself the signal.
+   */
+  async readSharedPaths(): Promise<SharedPathEntry[]> {
+    const raw = await this.store.readAux("shared-paths.json");
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw.toString("utf8")) as SharedPathsFile;
+      if (!Array.isArray(parsed?.shared)) return [];
+      const out: SharedPathEntry[] = [];
+      for (const e of parsed.shared) {
+        if (!e || typeof e.path !== "string") continue;
+        try { out.push(Repo.#normalizeSharedEntry(e)); } catch { /* a hand-edited escape: drop it, never honour it */ }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /** Replace the shared-path configuration wholesale. */
+  async setSharedPaths(entries: SharedPathEntry[]): Promise<void> {
+    const shared = entries.map((e) => Repo.#normalizeSharedEntry(e));
+    const file: SharedPathsFile = { version: 1, shared };
+    await this.store.writeAux("shared-paths.json", JSON.stringify(file, null, 2) + "\n");
+    this.logger.info("shared.set", { count: shared.length });
+  }
+
+  /** Add (or replace, by `path`) one shared path. Read-modify-write, like `setTrunk`. */
+  async addSharedPath(entry: SharedPathEntry): Promise<void> {
+    const normalized = Repo.#normalizeSharedEntry(entry);
+    const entries = (await this.readSharedPaths()).filter((e) => e.path !== normalized.path);
+    entries.push(normalized);
+    await this.setSharedPaths(entries);
+  }
+
+  /** Remove one shared path. Returns whether it existed. The CACHE is left alone — that is
+   *  `gc --shared`'s call to make, because re-installing is expensive (docs/21 §3.6). */
+  async removeSharedPath(path: string): Promise<boolean> {
+    const want = path.replace(/\\/g, "/").replace(/\/+$/, "");
+    const entries = await this.readSharedPaths();
+    const kept = entries.filter((e) => e.path !== want);
+    if (kept.length === entries.length) return false;
+    await this.setSharedPaths(kept);
+    return true;
+  }
+
+  /**
+   * Derive a cache key from the PROJECTED content of the declared files (docs/21 §3.2):
+   *
+   *   key = sha256( canonical( [[path, blobOidOfProjectedContent] for path in sorted(keyFrom)] ) )[:32]
+   *
+   * Projected content, not what is on disk. A tree entry is `path → blobOid`, and a blob
+   * object is `{type,data,encoding}` — content and nothing else — so the oid IS the content
+   * hash. Two workspaces that project the same view therefore get the SAME key by
+   * construction, with no disk read and no clock in the way: determinism buys cache
+   * correctness for free (S15). Conversely a declared file whose content changes moves the
+   * key (S4), and an undeclared file cannot move it however much it changes.
+   *
+   * Pure and static: a key that decides which cache a workspace links to must be checkable
+   * without a store, a projection, or a filesystem.
+   *
+   *  - A declared file ABSENT from the view (a lockfile nobody has written yet) participates
+   *    as EMPTY content and is reported in `missing` — never silently keyed differently,
+   *    which would split the cache and leave nobody able to explain the extra install (S9).
+   *  - `keyFrom: []` (or absent) is the named constant `"unkeyed"`: the explicit choice that
+   *    every workspace shares one cache. Dangerous, and the user's to make (S10).
+   */
+  static deriveSharedKey(
+    keyFrom: string[] | undefined,
+    tree: Map<string, string>,
+  ): { key: string; missing: string[]; unkeyed: boolean } {
+    const declared = [...new Set(keyFrom ?? [])].sort();
+    if (!declared.length) return { key: "unkeyed", missing: [], unkeyed: true };
+    const missing: string[] = [];
+    const entries = declared.map((p) => {
+      const oid = tree.get(p);
+      if (oid === undefined) missing.push(p);
+      return [p, oid ?? ""];
+    });
+    return { key: sha256hex(canonicalize(entries)).slice(0, 32), missing, unkeyed: false };
+  }
+
+  /**
+   * Keep the cache tree out of git in COMMITTED mode.
+   *
+   * Sidecar mode ignores all of `.avcs/` (its `*` covers this), but committed mode
+   * deliberately TRACKS `.avcs/` except for a named list of rebuildable caches — and a build
+   * environment is emphatically one of those. Without the entry, `git add` would sweep tens
+   * of thousands of dependency files into the history AVCS exists to keep clean.
+   *
+   * A repo that flipped to committed mode before shared paths existed has the older file, so
+   * this repairs it at the moment the cache tree first comes into being. Cheap: it reads the
+   * small ignore file and writes only when the entry is genuinely missing, and it never
+   * touches a sidecar repo (nothing there needs it).
+   */
+  async #ensureSharedCacheIgnored(): Promise<void> {
+    if ((await this.getGitMode()) !== "committed") return;
+    const raw = (await this.store.readAux(".gitignore"))?.toString("utf8") ?? "";
+    if (raw.split(/\r?\n/).some((l) => l.trim() === SHARED_IGNORE_LINE)) return;
+    await this.#writeGitignore("committed");
+  }
+
+  /**
+   * Root of the store-local shared-cache tree (docs/21 §3.3).
+   *
+   * Store-local, not `$HOME`: cleanup is then one `.avcs` away, the home directory stays
+   * clean, and two unrelated projects can never collide on a lock hash. `store.root` already
+   * follows a linked working tree's `.avcs` POINTER file, so a linked worktree shares the
+   * MAIN store's caches for free — which is exactly where sharing across workspaces starts
+   * to pay (docs/21 S12, homomorphic to docs/14's one-store model).
+   */
+  #sharedRoot(): string {
+    return join(this.store.root, "shared");
+  }
+
+  /**
+   * Throw away one cache directory by key (docs/21 R2). The core reports only "non-empty",
+   * so a cache left broken by a half-finished install is not something it can detect — this
+   * is the escape hatch for the caller who can.
+   */
+  async dropSharedCache(key: string): Promise<boolean> {
+    if (!/^[a-z0-9]{1,64}$/.test(key)) throw new Error(`not a shared cache key: ${JSON.stringify(key)}`);
+    const dir = join(this.#sharedRoot(), key);
+    if (!existsSync(dir)) return false;
+    await rm(dir, { recursive: true, force: true });
+    this.logger.info("shared.cache.dropped", { key });
+    return true;
+  }
+
+  /**
+   * Connect every configured shared path to its store-local cache (docs/21 §3.4). Runs
+   * AFTER the tree has been written, because writing the tree can create directories.
+   *
+   * What the core does: derive the key, create the cache directory, connect it, and report
+   * `populated`. What the core does NOT do: run an install. It does not know what
+   * `node_modules` is, which package manager owns it, or whether the network is up — and the
+   * moment it did, docs/21 §2 principle 1 would be gone. `populated` is the entire interface
+   * between "the core made a place" and "somebody has to fill it".
+   *
+   * Existing content at a shared path is never destroyed. A real directory there is the
+   * user's data and the core cannot recreate it (it does not know how to install), so it is
+   * left alone with a warning. The one thing that IS re-pointed is a symlink the core itself
+   * put inside this store's own cache tree, which is how a key change (S4) takes effect
+   * instead of leaving the workspace wired to a stale environment.
+   *
+   * With `mode: "copy"`, a directory already at the target counts as materialized and is not
+   * copied over — local edits inside it survive (S11). Re-materializing after a key change
+   * therefore means removing that directory by hand; the core will not delete user data to
+   * refresh a cache.
+   */
+  async linkSharedPaths(workDir: string, tree: Map<string, string>): Promise<SharedPathLink[]> {
+    const entries = await this.readSharedPaths();
+    if (!entries.length) return []; // S1: unconfigured ⇒ not even a mkdir
+    const root = resolve(workDir);
+    const sharedRoot = resolve(this.#sharedRoot());
+    await this.#ensureSharedCacheIgnored(); // the cache tree is about to exist
+    const out: SharedPathLink[] = [];
+    for (const entry of entries) {
+      const mode: SharedPathMode = entry.mode === "copy" ? "copy" : "symlink";
+      const { key, missing, unkeyed } = Repo.deriveSharedKey(entry.keyFrom, tree);
+      // One key may hold several shared paths, so the leaf is the path slugged `/`→`__`.
+      const cache = join(sharedRoot, key, entry.path.split("/").join("__"));
+      const target = join(root, entry.path);
+      const notes: string[] = [];
+      if (unkeyed) notes.push("no keyFrom, so every workspace shares this one cache");
+      if (missing.length) notes.push(`keyFrom absent from the view, hashed as empty: ${missing.join(", ")}`);
+
+      // R4: the LOCK covers only creating the directory, so two concurrent projections cannot
+      // race it. Coordinating concurrent INSTALLS is outside the core's reach by construction
+      // — it does not run them.
+      await this.store.withLock(`shared:${key}`, async () => { await mkdir(cache, { recursive: true }); });
+      const populated = (await readdir(cache)).length > 0;
+
+      let linked = false;
+      const st = await lstat(target).catch(() => null);
+      if (st?.isSymbolicLink()) {
+        const dest = resolve(dirname(target), await readlink(target));
+        if (dest === cache) {
+          linked = true; // S5: already correct — no-op, and nothing to say about it
+        } else if (dest === sharedRoot || dest.startsWith(sharedRoot + sep)) {
+          await rm(target, { force: true }); // our own cache tree: the key moved (S4)
+          await symlink(cache, target, "dir");
+          linked = true;
+        } else {
+          notes.push(`${entry.path} is a symlink to ${dest}, outside this store's cache — left alone`);
+        }
+      } else if (st) {
+        if (mode === "copy" && st.isDirectory()) linked = true; // already materialized (S11)
+        else notes.push(`${entry.path} exists and is not a link to the cache — left alone (your data)`);
+      } else {
+        await mkdir(dirname(target), { recursive: true });
+        if (mode === "copy") await cp(cache, target, { recursive: true });
+        else await symlink(cache, target, "dir");
+        linked = true;
+      }
+
+      const link: SharedPathLink = { path: entry.path, key, cache, target, mode, linked, populated };
+      if (notes.length) link.warning = notes.join("; ");
+      if (link.warning) this.logger.warn("shared.link", { path: entry.path, key, warning: link.warning });
+      out.push(link);
+    }
+    return out;
+  }
+
+  /**
+   * Project a view into `workDir` AND connect its shared paths (docs/21 §3.4) — the full
+   * physical checkout `avcs workspace project` performs. `checkoutInto` is this without the
+   * shared report, kept as-is for every existing caller.
+   *
+   * `skipped` are tree entries that live INSIDE a shared path. Normally there are none —
+   * capture cannot produce them (§3.5) — but a history contaminated before shared paths
+   * existed can still be opened, and writing those files would spill recorded content over a
+   * live build environment. So they are skipped and named rather than written.
+   */
+  async projectInto(
+    workDir: string,
+    view = "main",
+    opts?: { workspace?: string },
+  ): Promise<{ written: string[]; shared: SharedPathLink[]; skipped: string[] }> {
     const res = await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
+    const shared = await this.readSharedPaths();
+    const inShared = (rel: string): boolean => shared.some((e) => rel === e.path || rel.startsWith(e.path + "/"));
     const written: string[] = [];
+    const skipped: string[] = [];
     for (const [path, blobOid] of res.tree) {
+      if (shared.length && inShared(path)) { skipped.push(path); continue; }
       const full = join(workDir, path);
       const synth = res.synthBlobs.get(blobOid);
       const want = synth ?? (await this.readBlob(blobOid));
@@ -2551,7 +2903,13 @@ export class Repo {
       }
       written.push(path);
     }
-    return written.sort();
+    if (skipped.length) this.logger.warn("shared.projection.skipped", { count: skipped.length, sample: skipped.slice(0, 5) });
+    return { written: written.sort(), shared: await this.linkSharedPaths(workDir, res.tree), skipped: skipped.sort() };
+  }
+
+  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
+  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+    return (await this.projectInto(workDir, view, opts)).written;
   }
 
   /**
@@ -3104,8 +3462,12 @@ export class Repo {
    *    past `quarantineTtlMs`, that nothing else builds on — the one place append-only
    *    yields (abandoned/spam contributions, docs/09 G5).
    * `dryRun` reports without deleting.
+   *
+   * `shared` opts IN to collecting shared-path caches (docs/21 §3.6). Plain `gc` never
+   * touches them: re-installing a build environment is expensive, so the routine reclaim of
+   * orphan blobs must not be able to cost somebody an install.
    */
-  async gc(opts: { quarantineTtlMs?: number; dryRun?: boolean } = {}): Promise<{ blobs: string[]; quarantinedOps: string[] }> {
+  async gc(opts: { quarantineTtlMs?: number; dryRun?: boolean; shared?: boolean } = {}): Promise<{ blobs: string[]; quarantinedOps: string[]; sharedKeys: string[] }> {
     const ops = await this.store.collect<Operation>("operation");
     const ttl = opts.quarantineTtlMs ?? 7 * 24 * 3600_000;
     const now = Date.now();
@@ -3150,8 +3512,47 @@ export class Repo {
       for (const oid of quarantinedOps) this.#opCache.delete(oid);
       for (const oid of blobs) this.#blobCache.delete(oid);
     }
-    this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length });
-    return { blobs, quarantinedOps };
+    const sharedKeys = opts.shared ? await this.#collectSharedCaches(opts.dryRun ?? false) : [];
+    this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length, sharedKeys: sharedKeys.length });
+    return { blobs, quarantinedOps, sharedKeys };
+  }
+
+  /**
+   * Every shared cache key that some current scope still derives (docs/21 §3.6).
+   *
+   * "Some current scope" is deliberately generous — the base view, every line, and every one
+   * of those crossed with every known workspace. Deriving a key extra times only costs a
+   * reduce; failing to derive one costs a re-install, so over-approximating live keys is the
+   * cheap mistake and the one to make.
+   */
+  async #derivedSharedKeys(): Promise<Set<string>> {
+    const entries = await this.readSharedPaths();
+    const keys = new Set<string>();
+    if (!entries.length) return keys;
+    const views = ["main", ...(await this.listLines()).map((l) => l.name).filter((n) => n !== "main")];
+    const workspaces = [undefined, ...(await this.workspaceNames())];
+    for (const view of views) {
+      for (const ws of workspaces) {
+        const res = await this.materialize(view, ws ? { workspace: ws } : undefined);
+        for (const e of entries) keys.add(Repo.deriveSharedKey(e.keyFrom, res.tree).key);
+      }
+    }
+    return keys;
+  }
+
+  /** Delete the shared caches no scope derives any more. Returns the keys (sorted). */
+  async #collectSharedCaches(dryRun: boolean): Promise<string[]> {
+    const root = this.#sharedRoot();
+    if (!existsSync(root)) return [];
+    const live = await this.#derivedSharedKeys();
+    const dead: string[] = [];
+    for (const ent of await readdir(root, { withFileTypes: true })) {
+      if (!ent.isDirectory() || live.has(ent.name)) continue;
+      dead.push(ent.name);
+    }
+    dead.sort();
+    if (!dryRun) for (const key of dead) await rm(join(root, key), { recursive: true, force: true });
+    return dead;
   }
 
   /**
