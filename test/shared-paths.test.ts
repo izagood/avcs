@@ -553,6 +553,40 @@ test("`avcs shared rm --cache <key>` throws one cache away (docs/21 R2)", async 
   }
 });
 
+test("avcs.workspace.project tells an AGENT whether the cache needs filling, and nothing more", async () => {
+  // docs/18's primary interface is MCP, so the one fact the core can supply about a build
+  // environment has to reach an agent too. What it must NOT reach it with is an install
+  // command — the core has none to give (docs/21 §2 principle 2).
+  const { TOOLS, runTool } = await import("../src/mcp/server.ts");
+  const tool = TOOLS.find((t) => t.name === "avcs.workspace.project")!;
+  const { dir, repo } = await projectable();
+  const out = await mkdtemp(join(tmpdir(), "avcs-mcp-"));
+  try {
+    const first = JSON.parse((await runTool(tool, repo, { out, name: "feat-x" })).content[0]!.text);
+    assert.equal(first.fileCount, 2);
+    assert.equal(first.shared.length, 1);
+    assert.equal(first.shared[0].path, "node_modules");
+    assert.equal(first.shared[0].populated, false);
+    assert.equal(first.shared[0].linked, true);
+    assert.equal(Object.keys(first.shared[0]).includes("install"), false, "no install command is offered, because the core has none");
+
+    await writeFile(join(first.shared[0].cache, "dep.js"), "x");
+    const second = JSON.parse((await runTool(tool, repo, { out, name: "feat-x" })).content[0]!.text);
+    assert.equal(second.shared[0].populated, true);
+
+    // Unconfigured repos get the response they always got — no `shared` field at all.
+    const plain = await mk();
+    const plainRepo = await Repo.init(plain);
+    await put(plainRepo, "a.ts", "x\n");
+    const bare = JSON.parse((await runTool(tool, plainRepo, { out: await mkdtemp(join(tmpdir(), "avcs-mcp2-")) })).content[0]!.text);
+    assert.deepEqual(Object.keys(bare).sort(), ["dir", "fileCount", "treeHash"], "S1 holds on the MCP surface too");
+    await rm(plain, { recursive: true, force: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(out, { recursive: true, force: true });
+  }
+});
+
 test("`avcs shared` lists, adds and removes", async () => {
   const dir = await mk();
   try {
