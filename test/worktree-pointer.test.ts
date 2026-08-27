@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ObjectStore } from "../src/store/objectStore.ts";
 import { Repo } from "../src/api/repo.ts";
@@ -98,4 +99,36 @@ test("MCP repo resolution follows a pointer, and its miss message names the fix"
     /avcs worktree attach/,
     "a linked working tree is the likeliest cause, so the message must name the fix",
   );
+});
+
+test("repo-local state under .avcs is read through the pointer, not rebuilt beside it", async () => {
+  const main = await tmp();
+  const mainRepo = await Repo.init(main);
+  await mainRepo.setGitMode("committed");
+
+  const linked = await tmp();
+  await writeFile(join(linked, ".avcs"), `avcsdir: ${join(main, ".avcs")}\n`);
+  const viaPointer = await Repo.open(linked);
+
+  // config.json lives in the shared store. Reading it by gluing ".avcs" onto the working
+  // tree instead would silently hand back the default, so a linked tree would disagree
+  // with its own repo about how git and AVCS relate.
+  assert.equal(await viaPointer.getGitMode(), "committed");
+
+  // ...and a write from the linked tree lands in the shared store, not in a new one.
+  await viaPointer.setGitMode("sidecar");
+  assert.equal(await (await Repo.open(main)).getGitMode(), "sidecar");
+  assert.equal(existsSync(join(linked, ".avcs", "config.json")), false, "no store grew beside the pointer");
+});
+
+test("the git-hook provenance handoff round-trips through a pointer", async () => {
+  const main = await tmp();
+  await Repo.init(main);
+  const linked = await tmp();
+  await writeFile(join(linked, ".avcs"), `avcsdir: ${join(main, ".avcs")}\n`);
+  const repo = await Repo.open(linked);
+
+  await repo.writeGitPending({ checkpoint: "checkpoint_deadbeef", treeHash: "abc123" }, linked);
+  const back = await repo.readGitPending(linked);
+  assert.equal(back?.checkpoint, "checkpoint_deadbeef", "the writer and the reader agree on where it lives");
 });
