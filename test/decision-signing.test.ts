@@ -31,9 +31,15 @@ test("with a keyring, only a validly-signed human decision resolves a conflict",
       declaredPurpose: "break api", effects: { breaksPublicApi: true, changesBehavior: true },
     });
 
-    // Keyring on: register ci + human keys. Trust now requires valid signatures.
+    // Register ci + human keys, then require signatures through the POLICY
+    // (issue #66: the requirement must be replicated state, not a local keyring).
     const ciKey = await repo.generateActorKey(ci);
     const humanKey = await repo.generateActorKey(human);
+    await repo.setPolicy({
+      ...(await repo.policy()),
+      requireSignedEvidence: true,
+      requireSignedDecisions: true,
+    });
 
     // Clear the test gate with validly-signed ci evidence → op reaches needs_decision.
     await repo.attachEvidence({
