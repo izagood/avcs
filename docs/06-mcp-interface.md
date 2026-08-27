@@ -137,6 +137,7 @@ intent.read → context.build → lease.request → operation.propose
 | tool | 역할 |
 |------|------|
 | `avcs.blame` | 엔티티의 현재 소유 op — 누가/왜 |
+| `avcs.blame.lines` | **줄 단위** provenance — 각 줄을 마지막에 쓴 op(actor·intent·purpose). "이 줄이 왜 여기 있나" |
 | `avcs.history` | 엔티티 인과 순서 히스토리 (entity index, O(ops-on-entity)). 페이지: `limit`(20) + `cursor`, 짧은 페이지 = 끝 |
 | `avcs.diff` | 두 view의 added/removed/modified 경로 |
 | `avcs.object.show` | oid로 임의 객체/blob 읽기 (타 에이전트 내용·base blob 조회) |
