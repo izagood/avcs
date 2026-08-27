@@ -35,9 +35,13 @@ async function behaviorRepo() {
   return { dir, repo, op };
 }
 
-test("with a keyring, only signed ci evidence is trusted", async () => {
+test("when the policy requires signatures, only signed ci evidence is trusted", async () => {
   const { dir, repo, op } = await behaviorRepo();
-  const key = await repo.generateActorKey(ci); // registers ci public key → keyring non-empty
+  const key = await repo.generateActorKey(ci); // registers ci's public key
+  // The requirement lives in the policy, not in "a keyring exists" (issue #66):
+  // a keyring is local and unreplicated, so gating on it made the same graph
+  // reduce differently per replica.
+  await repo.setPolicy({ ...(await repo.policy()), requireSignedEvidence: true });
 
   // (a) unsigned ci evidence is dropped → still gated.
   await repo.attachEvidence({ forOps: [op], kind: "unit_test", result: "pass", producedBy: ci });

@@ -345,6 +345,18 @@ export interface Policy extends BaseObject {
   /** Ordered actor trust ladder (higher index = more trusted). */
   actorTrust: ActorKind[];
   rules: PolicyRule[];
+  /**
+   * Require evidence to carry a valid signature from its claimed producer
+   * (issue #66). Default (absent/false) keeps the Phase-1 producedBy heuristic.
+   *
+   * This lives in the POLICY, not in "does a local keyring exist", because a
+   * keyring is per-machine and never replicated: gating on it made the same
+   * object graph reduce to different trees on different replicas. A policy is a
+   * replicated governance object, so every replica agrees.
+   */
+  requireSignedEvidence?: boolean;
+  /** Same requirement for decisions (issue #66). Default (absent/false) = off. */
+  requireSignedDecisions?: boolean;
   /** Code ownership: who must sign off on changes to which scopes. */
   owners?: OwnerRule[];
   createdAt: string;
