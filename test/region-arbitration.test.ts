@@ -112,3 +112,247 @@ test("R7: two variants with identical text arrive as a single option listing bot
   const agreed = regions[0]!.options.find((o) => o.text.includes("B WINS"))!;
   assert.deepEqual(agreed.sides, [1, 2], "the agreeing variants share one option");
 });
+
+// ── reduce()-level matrix: the policy engine now decides region CONTENT ───────
+//
+// These build ReduceInputs directly (full control over trust/evidence/effects) and assert
+// the materialized text, which is the thing docs/22 changes. Before this track the winner
+// of a contended region was whichever op the canonical (lamport, oid) order applied first.
+
+import { reduce, type ReduceInput } from "../src/reducer/reducer.ts";
+import { defaultPolicy } from "../src/reducer/policy.ts";
+import { sha256hex } from "../src/core/canonical.ts";
+import type { Actor, Evidence, Intent, Operation } from "../src/objects/types.ts";
+import { Buffer } from "node:buffer";
+
+const HUMAN: Actor = { kind: "human", id: "human:h" };
+const AI_A: Actor = { kind: "ai_agent", id: "ai:a" };
+const AI_B: Actor = { kind: "ai_agent", id: "ai:b" };
+const AI_C: Actor = { kind: "ai_agent", id: "ai:c" };
+const CI: Actor = { kind: "ci_bot", id: "ci:runner" };
+
+const FILE = "hot.ts";
+const SCAFFOLD = "keep\nCONTESTED\ntail\n";
+const say = (who: string) => `keep\n${who}\ntail\n`;
+
+/** One concurrent edit in a scenario. */
+interface Edit {
+  actor: Actor;
+  text: string;
+  /** lamport; also the canonical order (all oids are derived from it). */
+  at: number;
+  /** attach a trusted passing unit_test (produced by CI, never the author) */
+  verified?: boolean;
+  effects?: Operation["effects"];
+}
+
+interface Built {
+  input: ReduceInput;
+  /** materialized text at FILE, or undefined when the path is absent */
+  text(): string | undefined;
+  result: ReturnType<typeof reduce>;
+}
+
+/** A scaffold `put_file` plus N concurrent `edit_file`s over it, all sharing one base. */
+function scenario(edits: Edit[], materializeStatuses?: ReduceInput["materializeStatuses"]): Built {
+  const blobContent = new Map<string, Buffer>();
+  const blob = (content: string): string => {
+    const oid = `blob_${sha256hex(content).slice(0, 24)}`;
+    blobContent.set(oid, Buffer.from(content, "utf8"));
+    return oid;
+  };
+  const baseBlob = blob(SCAFFOLD);
+  const scaffold: Operation = {
+    type: "operation", oid: "operation_scaffold", sessionOid: "session_s", intentOid: "intent_0",
+    actor: HUMAN, target: { entityKind: "file", entityId: FILE },
+    body: { kind: "put_file", path: FILE, blobOid: baseBlob },
+    causalDeps: [], declaredPurpose: "scaffold", lamport: 0, createdAt: "2026-01-01T00:00:00.000Z",
+  } as unknown as Operation;
+  const ops: Operation[] = [scaffold];
+  const evidence: Evidence[] = [];
+  for (const e of edits) {
+    const oid = `operation_${String(e.at).padStart(3, "0")}`;
+    ops.push({
+      type: "operation", oid, sessionOid: "session_s", intentOid: "intent_0", actor: e.actor,
+      target: { entityKind: "file", entityId: FILE },
+      body: { kind: "edit_file", path: FILE, blobOid: blob(e.text), baseBlobOid: baseBlob },
+      causalDeps: ["operation_scaffold"], declaredPurpose: `edit by ${e.actor.id}`, lamport: e.at,
+      createdAt: `2026-02-01T00:00:${String(e.at).padStart(2, "0")}.000Z`,
+      effects: e.effects,
+    } as unknown as Operation);
+    if (e.verified)
+      evidence.push({
+        type: "evidence", oid: `evidence_${oid}`, forOps: [oid], kind: "unit_test", result: "pass",
+        producedBy: CI, createdAt: "2026-03-01T00:00:00.000Z",
+      } as unknown as Evidence);
+  }
+  const input: ReduceInput = {
+    ops, evidence, decisions: [], intents: new Map<string, Intent>(),
+    policy: defaultPolicy(), blobContent, materializeStatuses,
+  };
+  const result = reduce(input);
+  return {
+    input,
+    result,
+    text: () => {
+      const oid = result.tree.get(FILE);
+      if (oid === undefined) return undefined;
+      return (result.synthBlobs.get(oid) ?? blobContent.get(oid))?.toString("utf8");
+    },
+  };
+}
+
+// ── R3: trust ladder decides the region, in EITHER authoring order ────────────
+test("R3: a human's change takes the contested region from an ai_agent's, either order", () => {
+  const humanFirst = scenario([
+    { actor: HUMAN, text: say("HUMAN"), at: 1 },
+    { actor: AI_A, text: say("AGENT"), at: 2 },
+  ]);
+  const agentFirst = scenario([
+    { actor: AI_A, text: say("AGENT"), at: 1 },
+    { actor: HUMAN, text: say("HUMAN"), at: 2 },
+  ]);
+  assert.equal(humanFirst.text(), say("HUMAN"), "higher trust wins the region");
+  assert.equal(
+    agentFirst.text(),
+    say("HUMAN"),
+    "…and still wins when it was written SECOND — order no longer decides (docs/22 §1.1)",
+  );
+  // Both ops stay accepted: the loser's non-overlapping work must never be dropped.
+  for (const b of [humanFirst, agentFirst]) {
+    assert.equal(b.result.statuses.get("operation_001"), "accepted");
+    assert.equal(b.result.statuses.get("operation_002"), "accepted");
+  }
+});
+
+// ── R2: evidence decides the region between two equally-trusted actors ───────
+test("R2: the verified change takes the region from the unverified one", () => {
+  const verifiedLast = scenario([
+    { actor: AI_A, text: say("UNVERIFIED"), at: 1 },
+    { actor: AI_B, text: say("VERIFIED"), at: 2, verified: true },
+  ]);
+  const verifiedFirst = scenario([
+    { actor: AI_A, text: say("VERIFIED"), at: 1, verified: true },
+    { actor: AI_B, text: say("UNVERIFIED"), at: 2 },
+  ]);
+  assert.equal(verifiedLast.text(), say("VERIFIED"), "a passing test outranks nothing at all");
+  assert.equal(verifiedFirst.text(), say("VERIFIED"), "…in either order");
+});
+
+// ── R5: a score tie goes to a human — never broken by recency ────────────────
+test("R5: tied scores leave the region undecided; the tree keeps the deterministic fallback", () => {
+  const a = scenario([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2 },
+  ]);
+  const b = scenario([
+    { actor: AI_B, text: say("B"), at: 1 },
+    { actor: AI_A, text: say("A"), at: 2 },
+  ]);
+  // Provisional content + an open conflict (docs/22 Q1): the incumbent stays, and the
+  // region is reported (asserted through the authoritative pass in the repo-level cases).
+  assert.equal(a.text(), say("A"), "no policy winner ⇒ the onConflict fallback content");
+  assert.equal(b.text(), say("B"), "…which is the canonical-first option, as before");
+});
+
+// ── R6: an op that failed its evidence gate cannot take the region ───────────
+test("R6: an unverified behaviour change is excluded — its content never reaches the tree", () => {
+  const b = scenario([
+    { actor: AI_A, text: say("VERIFIED"), at: 1, verified: true, effects: { changesBehavior: true } },
+    { actor: AI_B, text: say("UNVERIFIED"), at: 2, effects: { changesBehavior: true } },
+  ]);
+  assert.equal(b.result.statuses.get("operation_002"), "rejected", "the gate rejects it upstream");
+  assert.equal(b.text(), say("VERIFIED"), "and the verified change owns the region");
+});
+
+test("R6b: when EVERY option requires a human, arbitration abstains and the fallback stands", () => {
+  // breaksPublicApi ⇒ require_human for both ops. Projecting needs_decision puts both in
+  // the tree merge anyway, which is exactly the case the arbiter must refuse to decide.
+  const b = scenario(
+    [
+      { actor: HUMAN, text: say("HUMAN"), at: 1, effects: { breaksPublicApi: true } },
+      { actor: AI_A, text: say("AGENT"), at: 2, effects: { breaksPublicApi: true } },
+    ],
+    ["accepted", "needs_decision"],
+  );
+  assert.equal(b.result.statuses.get("operation_001"), "needs_decision");
+  assert.equal(b.result.statuses.get("operation_002"), "needs_decision");
+  assert.equal(b.text(), say("HUMAN"), "the fallback incumbent, NOT a policy pick");
+});
+
+// ── R14: three-way region ────────────────────────────────────────────────────
+test("R14: a 3-way region goes to the unique top score, and is held when the top is shared", () => {
+  const unique = scenario([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2, verified: true },
+    { actor: AI_C, text: say("C"), at: 3 },
+  ]);
+  assert.equal(unique.text(), say("B"), "the only verified option takes it");
+
+  const shared = scenario([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("B"), at: 2, verified: true },
+    { actor: AI_C, text: say("C"), at: 3, verified: true },
+  ]);
+  // Two verified options share the top ⇒ undecided ⇒ the deterministic fallback, which is
+  // whatever the accumulated content already held. `applyOp` composes pairwise, so by the
+  // time C arrives B has already taken the region from A on merit; the tie between B and C
+  // leaves B in place. The region still reaches a human (asserted through the authoritative
+  // pass below) — this is "provisional content + an open conflict", not a silent decision.
+  assert.equal(shared.text(), say("B"), "shared top ⇒ the incumbent stands, and it is a top option");
+});
+
+// ── R7 (reduce level): agreement is represented by its strongest backer ──────
+test("R7: an option two ops agree on is represented by the highest-scoring of them", () => {
+  // A(unverified) vs B+C who wrote the SAME text; C is verified. The agreement option must
+  // compete with C's score, not with B's — an averaged option could be diluted by B.
+  const b = scenario([
+    { actor: AI_A, text: say("A"), at: 1 },
+    { actor: AI_B, text: say("AGREED"), at: 2 },
+    { actor: AI_C, text: say("AGREED"), at: 3, verified: true },
+  ]);
+  assert.equal(b.text(), say("AGREED"));
+});
+
+// ── R1: an op set with NO overlapping region is byte-identically unaffected ──
+test("R1: disjoint concurrent edits produce the same tree as before arbitration existed", () => {
+  const long = "l1\nl2\nl3\nl4\nl5\nl6\nl7\n";
+  const blobContent = new Map<string, Buffer>();
+  const blob = (content: string): string => {
+    const oid = `blob_${sha256hex(content).slice(0, 24)}`;
+    blobContent.set(oid, Buffer.from(content, "utf8"));
+    return oid;
+  };
+  const baseBlob = blob(long);
+  const mk = (oid: string, actor: Actor, text: string, lamport: number): Operation =>
+    ({
+      type: "operation", oid, sessionOid: "session_s", intentOid: "intent_0", actor,
+      target: { entityKind: "file", entityId: FILE },
+      body: { kind: "edit_file", path: FILE, blobOid: blob(text), baseBlobOid: baseBlob },
+      causalDeps: ["operation_scaffold"], declaredPurpose: oid, lamport,
+      createdAt: `2026-02-01T00:00:0${lamport}.000Z`,
+    }) as unknown as Operation;
+  const ops: Operation[] = [
+    {
+      type: "operation", oid: "operation_scaffold", sessionOid: "session_s", intentOid: "intent_0",
+      actor: HUMAN, target: { entityKind: "file", entityId: FILE },
+      body: { kind: "put_file", path: FILE, blobOid: baseBlob },
+      causalDeps: [], declaredPurpose: "scaffold", lamport: 0, createdAt: "2026-01-01T00:00:00.000Z",
+    } as unknown as Operation,
+    // A rewrites line 1, B rewrites line 7 — different clusters, so no ConflictRegion and
+    // no arbitration. A human vs an ai_agent, i.e. scores that WOULD differ if it ran.
+    mk("operation_001", HUMAN, long.replace("l1", "L1"), 1),
+    mk("operation_002", AI_A, long.replace("l7", "L7"), 2),
+  ];
+  const r = reduce({
+    ops, evidence: [], decisions: [], intents: new Map<string, Intent>(),
+    policy: defaultPolicy(), blobContent,
+  });
+  const text = r.synthBlobs.get(r.tree.get(FILE)!)!.toString("utf8");
+  assert.equal(text, "L1\nl2\nl3\nl4\nl5\nl6\nL7\n", "both disjoint edits still compose");
+  assert.equal(r.conflicts.length, 0);
+  // Golden treeHash captured from the pre-arbitration reducer (docs/22 §4.1 / R1): an op
+  // set without an overlapping region must materialize byte-identically across the
+  // MERGE3_VERSION bump. If this changes, arbitration leaked outside its scope.
+  assert.equal(r.treeHash, "aa5f5c936fa9fbfd62ccf2d3ec02b677b1675d739059bfbdc14191ffcf5179f7");
+});

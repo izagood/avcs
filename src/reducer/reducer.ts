@@ -21,7 +21,7 @@ import type {
 } from "../objects/types.ts";
 import { evaluateOp, type OpEvaluation } from "./policy.ts";
 import { buildAliasMap, resolvePath, type AliasMap } from "./aliases.ts";
-import { merge3, type ConflictRegion } from "../merge/merge3.ts";
+import { merge3, diffHunks, type ConflictRegion } from "../merge/merge3.ts";
 import { ownersFor } from "../policy/owners.ts";
 import { isBinary } from "../core/bytes.ts";
 import { Buffer } from "node:buffer";
@@ -432,13 +432,15 @@ function materializeProjection(
   anc: Map<string, Set<string>>,
   materializeStatuses: Set<OperationStatus>,
   blobContent: Map<string, Buffer>,
+  scoreOf?: OpScorer,
 ): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
   const alias = aliasCtxFor(projected, anc);
   const tree = new Map<string, string>();
   const synthBlobs = new Map<string, Buffer>();
-  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs, alias);
+  const arb = scoreOf ? { scoreOf, prov: new Map<string, Operation[]>() } : undefined;
+  for (const op of ordered) applyOp(tree, op, blobContent, synthBlobs, alias, arb);
   return { tree, treeHash: treeHashOf(tree), headOps: frontier(ops, statuses, anc), synthBlobs: pruneSynth(tree, synthBlobs) };
 }
 
@@ -460,6 +462,7 @@ function materializeIncremental(
   blobContent: Map<string, Buffer>,
   base: ReductionResult,
   dirtyPaths: Set<string>,
+  scoreOf?: OpScorer,
 ): { tree: Map<string, string>; treeHash: string; headOps: string[]; synthBlobs: Map<string, Buffer> } {
   const projected = ops.filter((o) => materializeStatuses.has(statuses.get(o.oid as string)!));
   const ordered = kahnOrder(projected, anc);
@@ -474,8 +477,9 @@ function materializeIncremental(
   // dropped as dirty. `AVCS_VERIFY_INCREMENTAL=1` and the C22 cases gate it.
   const replayTree = new Map<string, string>();
   const replaySynth = new Map<string, Buffer>();
+  const arb = scoreOf ? { scoreOf, prov: new Map<string, Operation[]>() } : undefined;
   for (const op of ordered) {
-    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth, alias);
+    if (pathsOf(op).some((p) => dirtyPaths.has(p))) applyOp(replayTree, op, blobContent, replaySynth, alias, arb);
   }
   // Final tree = clean base paths (not dirty) + replayed dirty paths.
   const tree = new Map<string, string>();
@@ -552,6 +556,7 @@ export function snapshotReduce(input: ReduceInput): ReduceSnapshot {
     anc,
     materializeStatuses,
     input.blobContent ?? new Map<string, Buffer>(),
+    scorerFrom(ops, evalOf),
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs, blockedReasons, untrustedEvidence: 0 };
@@ -767,6 +772,7 @@ export function reduceIncremental(snap: ReduceSnapshot, next: ReduceInput): Redu
     next.blobContent ?? new Map<string, Buffer>(),
     snap.result,
     dirtyPaths,
+    scorerFrom(ops, evalOf),
   );
 
   const result: ReductionResult = { tree, treeHash, statuses, conflicts, autoDecisions, fileConflicts: [], headOps, synthBlobs, blockedReasons, untrustedEvidence: 0 };
@@ -1097,6 +1103,168 @@ function kahnOrder(ops: Operation[], anc: Map<string, Set<string>>): Operation[]
   return order;
 }
 
+// ── region arbitration (docs/22): policy, not order, decides a contended region ──
+
+/** One op's policy verdict, as region arbitration needs it (docs/22 §3.2). */
+export interface OpScore {
+  score: number;
+  /** Out of candidacy: a failed evidence gate, or a rule that reserves the call for a
+   *  human. An excluded op's content must never take a region — that exclusion is the
+   *  real effect of this whole track (docs/22 §3.2-3). */
+  excluded: boolean;
+}
+
+/** opOid → verdict. `undefined` for an op the scorer does not know, which makes
+ *  arbitration abstain rather than guess. */
+export type OpScorer = (opOid: string) => OpScore | undefined;
+
+/** What arbitration decided for one region, with the audit trail docs/22 §3.3 records. */
+interface RegionVerdict {
+  /** index into `region.options` */
+  option: number;
+  /** representative op of the winning option */
+  chosen: string;
+  /** representative op of each losing option */
+  rejected: string[];
+  /** per-option breakdown, in option order — which score decided it */
+  optionScores: { opOid: string; score: number; excluded: boolean }[];
+}
+
+/**
+ * The arbitration rule (docs/22 §3.2) — the one place it is written down.
+ *
+ * `opsForSide` maps a variant index back to the op(s) that produced it. The caller owns
+ * that mapping because it differs between the pairwise merge inside `applyOp` and the
+ * authoritative N-way merge in `detectFileConflicts`.
+ *
+ *   - An option several ops agree on is represented by its HIGHEST-scoring op. An average
+ *     would let a low-trust actor dilute an option merely by co-signing it.
+ *   - Any excluded op excludes its whole option: conservative on blocking, generous on
+ *     score. An option that cannot be auto-accepted cannot win a region either.
+ *   - A tie is never broken by recency. It returns `null`, the region stays a conflict and
+ *     a human decides. docs/00 principle 6 allows recency as a last tie-break for op
+ *     PROMOTION; region content is where meaning diverges, so deciding it quietly is worse
+ *     than raising it.
+ */
+function judgeRegion(
+  region: ConflictRegion,
+  opsForSide: (side: number) => string[],
+  scoreOf: OpScorer,
+): RegionVerdict | null {
+  const cands: { i: number; excluded: boolean; opOid: string; score: number }[] = [];
+  for (const [i, opt] of region.options.entries()) {
+    const oids = [...new Set(opt.sides.flatMap(opsForSide))];
+    if (oids.length === 0) return null; // no op behind an option ⇒ nothing to weigh
+    let excluded = false;
+    let rep: { opOid: string; score: number } | undefined;
+    for (const oid of oids) {
+      const v = scoreOf(oid);
+      if (!v) return null; // an op the policy cannot speak about ⇒ abstain, never guess
+      if (v.excluded) excluded = true;
+      if (!rep || v.score > rep.score || (v.score === rep.score && oid < rep.opOid)) rep = { opOid: oid, score: v.score };
+    }
+    cands.push({ i, excluded, opOid: rep!.opOid, score: rep!.score });
+  }
+  const live = cands.filter((c) => !c.excluded);
+  if (live.length === 0) return null; // every option blocked ⇒ a human, and no unverified
+  const topScore = Math.max(...live.map((c) => c.score)); //     content takes the region
+  const top = live.filter((c) => c.score === topScore);
+  if (top.length !== 1) return null; // tie ⇒ a human
+  const win = top[0]!;
+  return {
+    option: win.i,
+    chosen: win.opOid,
+    rejected: cands.filter((c) => c.i !== win.i).map((c) => c.opOid),
+    optionScores: cands.map((c) => ({ opOid: c.opOid, score: c.score, excluded: c.excluded })),
+  };
+}
+
+/** Materialization-scoped state the arbiter needs. Absent ⇒ no arbitration at all, and
+ *  `applyOp` behaves exactly as it did before this track (docs/22 R8). */
+interface ArbCtx {
+  scoreOf: OpScorer;
+  /** path → the content ops whose text composed the current tree entry, in application
+   *  order. Side 0 of the pairwise merge below is their composition. */
+  prov: Map<string, Operation[]>;
+}
+
+/**
+ * side → op for `applyOp`'s PAIRWISE merge, which is not the clean mapping docs/22 §3.2
+ * assumed. Side 1 is the op being applied, but side 0 is the ACCUMULATED tree content —
+ * the composition of every content op already applied at that path.
+ *
+ * So the incumbent side is attributed per REGION: only the contributors whose own change
+ * (measured against this merge's base, so the coordinates match the region's) touches the
+ * contested span may speak for it, and among those the strongest represents the option —
+ * the same rule agreement uses. Without the span filter, a high-trust edit to an unrelated
+ * part of the file would defend a low-trust edit's region, and the tree would disagree with
+ * the authoritative N-way pass, which sees every op separately.
+ *
+ * The per-contributor diff is lazy and memoized: a file with no contended region pays
+ * nothing, and a contended one pays once per contributor (docs/22 R-c).
+ */
+function pairwiseArbiter(
+  baseText: string,
+  incumbents: Operation[],
+  self: Operation,
+  contentOf: (op: Operation) => string,
+  scoreOf: OpScorer,
+): (region: ConflictRegion) => number | null {
+  const baseLines = baseText.split("\n");
+  const spans = new Map<string, { start: number; end: number }[]>();
+  const spansOf = (op: Operation): { start: number; end: number }[] => {
+    const oid = op.oid as string;
+    let s = spans.get(oid);
+    if (!s) {
+      s = diffHunks(baseLines, contentOf(op).split("\n"));
+      spans.set(oid, s);
+    }
+    return s;
+  };
+  const touches = (op: Operation, start: number, end: number): boolean =>
+    spansOf(op).some((h) => (h.start === h.end ? h.start >= start && h.start <= end : h.start < end && h.end > start));
+  const selfOid = self.oid as string;
+  return (region) => {
+    const opsForSide = (side: number): string[] => {
+      if (side !== 0) return [selfOid];
+      const hit = incumbents.filter((o) => touches(o, region.baseStart, region.baseEnd));
+      // No contributor claims the span (a composition whose hunks shifted): fall back to
+      // the whole trail rather than inventing an attribution.
+      return (hit.length ? hit : incumbents).map((o) => o.oid as string);
+    };
+    return judgeRegion(region, opsForSide, scoreOf)?.option ?? null;
+  };
+}
+
+/** Wrap a reduce's memoized `evalOf` as an {@link OpScorer}. Arbitration REUSES the scores
+ *  the group decision already computed — never a recomputation per region (docs/22 R-c). A
+ *  contended region IS a conflict, so ops are evaluated with `inConflict = true`, the same
+ *  flag their contended group used. */
+function scorerFrom(
+  ops: Operation[],
+  evalOf: (op: Operation, inConflict: boolean) => OpEvaluation,
+): OpScorer {
+  const byId = new Map(ops.map((o) => [o.oid as string, o]));
+  return (oid) => {
+    const op = byId.get(oid);
+    if (!op) return undefined;
+    const ev = evalOf(op, true);
+    return { score: ev.score, excluded: ev.blocked || ev.requiresHuman };
+  };
+}
+
+/**
+ * Build an {@link OpScorer} from a bare `ReduceInput`, for a caller outside `reduce` — the
+ * authoritative post-reduce pass (`detectFileConflicts` → {@link arbitrateFileConflicts}).
+ * Evaluation is lazy and memoized per op, so only the ops of a file that actually contended
+ * are ever scored.
+ */
+export function buildOpScorer(input: ReduceInput): OpScorer {
+  const evidence = [...input.evidence].sort((a, b) => cmp(a.createdAt, b.createdAt) || cmp(a.oid, b.oid));
+  const evalOf = makeEvalOf(input.policy, input.intents, buildEvByOp(evidence), input.reliability ?? new Map<string, number>());
+  return scorerFrom(input.ops, evalOf);
+}
+
 /**
  * Apply one projected op to the tree.
  *
@@ -1112,13 +1280,17 @@ function applyOp(
   blobContent: Map<string, Buffer>,
   synthBlobs: Map<string, Buffer>,
   alias?: AliasCtx,
+  arb?: ArbCtx,
 ): void {
   const b = op.body;
   const resolve = (oid: string): Buffer => synthBlobs.get(oid) ?? blobContent.get(oid) ?? Buffer.alloc(0);
   const at = (declared: string): string => resolvedPath(op, declared, alias);
   switch (b.kind) {
     case "put_file":
-      if (b.path && b.blobOid) tree.set(at(b.path), b.blobOid);
+      if (b.path && b.blobOid) {
+        tree.set(at(b.path), b.blobOid);
+        arb?.prov.set(at(b.path), [op]); // a whole-content write restarts the trail
+      }
       break;
     case "edit_file": {
       if (!b.path || !b.blobOid) break;
@@ -1135,21 +1307,38 @@ function applyOp(
         const synthOid = `blob_${sha256hex(opNew).slice(0, 32)}`;
         synthBlobs.set(synthOid, opNew);
         tree.set(path, synthOid);
+        arb?.prov.set(path, [op]);
         break;
       }
       // Apply this op's patch (opBase→opNew) onto the accumulated content. Disjoint
       // line changes compose (order-independent); an overlap with a prior concurrent op
       // keeps `current` (deterministic incumbent) — the overlap is reported separately
       // by detectFileConflicts over the full op set. Language-neutral: pure text.
-      const m = merge3(opBase.toString("utf8"), [current.toString("utf8"), opNew.toString("utf8")], { onConflict: "first" });
+      // An overlap is no longer settled by which op got here first: the injected arbiter
+      // asks the policy which option wins the region (docs/22 §3.2). It abstains — leaving
+      // the incumbent and the conflict — whenever policy cannot separate the options.
+      const incumbents = arb?.prov.get(path) ?? [];
+      const arbitrate =
+        arb && incumbents.length
+          ? pairwiseArbiter(
+              opBase.toString("utf8"),
+              incumbents,
+              op,
+              (o) => resolve(o.body.blobOid ?? "").toString("utf8"),
+              arb.scoreOf,
+            )
+          : undefined;
+      const m = merge3(opBase.toString("utf8"), [current.toString("utf8"), opNew.toString("utf8")], { onConflict: "first", arbitrate });
       const mergedBuf = Buffer.from(m.merged, "utf8");
       const synthOid = `blob_${sha256hex(mergedBuf).slice(0, 32)}`;
       synthBlobs.set(synthOid, mergedBuf);
       tree.set(path, synthOid);
+      if (arb) arb.prov.set(path, [...incumbents, op]);
       break;
     }
     case "delete_file":
       tree.delete(at(b.path ?? op.target.entityId));
+      arb?.prov.delete(at(b.path ?? op.target.entityId));
       break;
     case "rename_file": {
       if (!b.fromPath || !b.path) break;
@@ -1167,6 +1356,11 @@ function applyOp(
       if (blob !== undefined) {
         tree.delete(b.fromPath);
         tree.set(b.path, blob);
+        if (arb) {
+          const trail = arb.prov.get(b.fromPath);
+          arb.prov.delete(b.fromPath);
+          if (trail) arb.prov.set(b.path, trail); // the content moved, and so does its trail
+        }
       }
       break;
     }
