@@ -2643,7 +2643,7 @@ export class Repo {
     if (bad) throw new Error(`shared path must be a relative path inside the projection, with no '..': ${JSON.stringify(path)}`);
   }
 
-  /** Normalize one entry: trim the trailing slash, default the mode, drop an empty keyFrom. */
+  /** Normalize one entry: forward slashes, no trailing slash, mode defaulted, keyFrom copied. */
   static #normalizeSharedEntry(entry: SharedPathEntry): SharedPathEntry {
     const path = entry.path.replace(/\\/g, "/").replace(/\/+$/, "");
     Repo.#assertSharedPath(path);
@@ -2812,6 +2812,7 @@ export class Repo {
     if (!entries.length) return []; // S1: unconfigured ⇒ not even a mkdir
     const root = resolve(workDir);
     const sharedRoot = resolve(this.#sharedRoot());
+    await this.#ensureSharedCacheIgnored(); // the cache tree is about to exist
     const out: SharedPathLink[] = [];
     for (const entry of entries) {
       const mode: SharedPathMode = entry.mode === "copy" ? "copy" : "symlink";
@@ -2826,7 +2827,6 @@ export class Repo {
       // R4: the LOCK covers only creating the directory, so two concurrent projections cannot
       // race it. Coordinating concurrent INSTALLS is outside the core's reach by construction
       // — it does not run them.
-      await this.#ensureSharedCacheIgnored();
       await this.store.withLock(`shared:${key}`, async () => { await mkdir(cache, { recursive: true }); });
       const populated = (await readdir(cache)).length > 0;
 
