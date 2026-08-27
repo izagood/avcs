@@ -1295,8 +1295,11 @@ interface ArbCtx {
  * part of the file would defend a low-trust edit's region, and the tree would disagree with
  * the authoritative N-way pass, which sees every op separately.
  *
- * The per-contributor diff is lazy and memoized: a file with no contended region pays
- * nothing, and a contended one pays once per contributor (docs/22 R-c).
+ * The per-contributor diff is lazy and memoized per merge, so a file with no contended
+ * region pays nothing at all and a contended one pays at most one line-diff per contributor
+ * that a region actually asks about (docs/22 R-c). The trail only ever holds the ops still
+ * projected at that path — a sequential edit chain is superseded before it gets here — so it
+ * is the concurrent frontier's size, not the file's history, that bounds this.
  */
 function pairwiseArbiter(
   baseText: string,
