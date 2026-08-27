@@ -17,7 +17,13 @@
 // correct) tree than it did at 0.1.0. A rename-free op set is byte-identical either way.
 // The stamp moves so a replica still on the older substrate cannot silently disagree about
 // a rename-bearing one — `Checkpoint.materializerVersion` makes the mismatch explicit.
-export const MERGE3_VERSION = "text3/0.2.0";
+// 0.3.0 — region arbitration (docs/22). The line merge itself is unchanged; what changed is
+// who wins a CONTENDED region. It used to be the lowest side index, i.e. whichever op the
+// canonical order applied first (first-write-wins). The reducer now injects an `arbitrate`
+// callback that answers from the policy engine's score, so a verified change can no longer
+// lose a region to an unverified one. An op set whose hunks never overlap produces no
+// ConflictRegion, never calls the arbiter, and materializes byte-identically.
+export const MERGE3_VERSION = "text3/0.3.0";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
@@ -73,6 +79,21 @@ export interface Merge3Opts {
    *             applying one op's patch onto current). `clean` is still false.
    */
   onConflict?: "base" | "first";
+  /**
+   * Pick the winner of a contended region (docs/22 §3.1). Returns an index into
+   * `region.options`, or `null` when it cannot decide.
+   *
+   * A decided region is NOT a conflict: its chosen text goes into `merged` and it is left
+   * out of `conflicts`. `null` — or anything that is not a valid option index — falls back
+   * to `onConflict` and keeps the region in `conflicts`, so "policy could not decide
+   * either" stays a first-class outcome that reaches a human.
+   *
+   * This module never computes what to pick and never learns why: variant indices are the
+   * only thing it hands over. Injecting the choice is what keeps a trust ladder, evidence
+   * and code ownership out of a text merger while still letting them decide region
+   * content — the same discipline that keeps this file blind to what language it merges.
+   */
+  arbitrate?: (region: ConflictRegion) => number | null;
 }
 
 /**
@@ -92,6 +113,9 @@ export function merge3(base: string, variants: string[], opts: Merge3Opts = {}):
     distinct.some((v) => splitLines(v).length > MAX_LINES);
   if (unsafe) {
     if (distinct.length === 1) return { clean: true, merged: distinct[0]!, conflicts: [], atomic: true };
+    // Deliberately NOT arbitrated (docs/22 §3.1): `sides` below index the DISTINCT-content
+    // list, not the caller's variant order, so side → op is not recoverable here. An opaque
+    // atomic contest stays a conflict for a human.
     return {
       clean: false,
       merged: base,
@@ -176,20 +200,28 @@ export function merge3(base: string, variants: string[], opts: Merge3Opts = {}):
       // Agreement (or a single contributing variant): apply the change.
       out.push(...splitLines(distinctRenders[0]![0]));
     } else {
-      // Genuine conflict: record options; emit either base or the first option.
+      // Genuine contention: offer the options and let the caller's arbiter decide. Undecided
+      // ⇒ record a conflict and emit either base or the first option.
       const mergedStart = out.length;
       const options = distinctRenders
         .map(([text, sides]) => ({ sides: sides.sort((a, b) => a - b), text }))
         .sort((a, b) => Math.min(...a.sides) - Math.min(...b.sides));
-      const emit = onConflict === "first" ? options[0]!.text : joinLines(baseLines.slice(cl.start, cl.end));
-      out.push(...splitLines(emit));
-      conflicts.push({
+      const region: ConflictRegion = {
         baseStart: cl.start,
         baseEnd: cl.end,
         base: joinLines(baseLines.slice(cl.start, cl.end)),
         mergedStart,
         options,
-      });
+      };
+      const pick = opts.arbitrate?.(region) ?? null;
+      const decided = pick !== null && Number.isInteger(pick) && pick >= 0 && pick < options.length;
+      if (decided) {
+        out.push(...splitLines(options[pick]!.text));
+      } else {
+        const emit = onConflict === "first" ? options[0]!.text : joinLines(baseLines.slice(cl.start, cl.end));
+        out.push(...splitLines(emit));
+        conflicts.push(region);
+      }
     }
     cursor = cl.end;
   }

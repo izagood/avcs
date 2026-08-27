@@ -17,7 +17,7 @@ export type { GitMode, RemoteConfig, ContentionWarning } from "./api/repo.ts";
 export { canonicalize, computeOid, sha256hex } from "./core/canonical.ts";
 
 // Deterministic reduce/materialize core (also `@izagood/avcs/reducer`)
-export { reduce, snapshotReduce, reduceIncremental, keysOf, conflictIdFor, detectFileConflicts } from "./reducer/reducer.ts";
+export { reduce, snapshotReduce, reduceIncremental, keysOf, conflictIdFor, detectFileConflicts, arbitrateFileConflicts, buildOpScorer } from "./reducer/reducer.ts";
 export type { ReduceInput, ReductionResult, ReduceSnapshot, Conflict, AutoDecision } from "./reducer/reducer.ts";
 
 // Policy engine + materializer algorithm identity (also `@izagood/avcs/policy`).

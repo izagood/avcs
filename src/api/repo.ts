@@ -12,7 +12,7 @@ import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex, canonicalize } from "../core/canonical.ts";
-import { reduce, conflictIdFor, keysOf, detectFileConflicts, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
+import { reduce, conflictIdFor, keysOf, detectFileConflicts, arbitrateFileConflicts, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
 import { reduceIncremental, snapshotReduce, NonIncrementalError, serializeSnapshot, deserializeSnapshot, type ReduceSnapshot } from "../reducer/incremental.ts";
 import { encodeCbor, decodeCbor } from "../core/cbor.ts";
 import { computeReliability } from "../policy/reliability.ts";
@@ -2429,11 +2429,22 @@ export class Repo {
     // Disjoint changes stay merged in the tree (the design goal); the contested region
     // defaults to the deterministic incumbent (applyOp onConflict:"first") and is
     // surfaced as a Conflict so the release gate blocks until policy/human resolves it.
-    const fileConflicts = detectFileConflicts(ops, pass1, blobContent);
-    if (fileConflicts.length === 0) return pass1;
+    // …unless POLICY can decide the region (docs/22 §3.4): a region whose winner the trust
+    // ladder / evidence / owner rules pick is not a question for a human, so it drops out of
+    // the conflict set and is recorded as an AutoDecision instead.
+    const { remaining: fileConflicts, decisions: regionDecisions } = arbitrateFileConflicts(
+      detectFileConflicts(ops, pass1, blobContent),
+      base,
+    );
+    if (fileConflicts.length === 0 && regionDecisions.length === 0) return pass1;
 
     // Clone before annotating — pass1 may be a cached snapshot result.
-    const result: ReductionResult = { ...pass1, conflicts: [...pass1.conflicts], fileConflicts };
+    const result: ReductionResult = {
+      ...pass1,
+      conflicts: [...pass1.conflicts],
+      autoDecisions: [...pass1.autoDecisions, ...regionDecisions],
+      fileConflicts,
+    };
     for (const fc of fileConflicts) {
       result.conflicts.push({
         id: conflictIdFor(`file:${fc.file}`),
