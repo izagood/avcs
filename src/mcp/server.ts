@@ -97,6 +97,45 @@ const actorSchema = {
   required: ["id"],
 };
 
+/**
+ * Watch for the installed package version drifting away from the one this process booted
+ * with, and report it ONCE when no call is in flight. Dependencies are injected so the
+ * decision is testable without mutating a real package.json.
+ *
+ * Returns null when watching is disabled (no boot version, or a non-positive/NaN interval).
+ */
+/**
+ * Append the stale-server notice to an error message. A server running older code fails in
+ * ways that point at the wrong culprit — it cannot read a newer on-disk layout and says
+ * "not an AVCS repo" about a directory the upgraded CLI reads fine. Naming the real cause
+ * on the error itself is what turns that from an hour of debugging into a reconnect.
+ */
+export function appendStaleNote(message: string, notice: string | null): string {
+  return notice ? `${message}\n\nnote: ${notice}` : message;
+}
+
+export function watchVersionDrift(opts: {
+  bootVersion: string | null;
+  readVersion: () => string | null;
+  intervalMs: number;
+  isBusy: () => boolean;
+  onDrift: (from: string, to: string) => void;
+}): { stop: () => void } | null {
+  const { bootVersion, readVersion, intervalMs, isBusy, onDrift } = opts;
+  if (!bootVersion || !Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  const timer = setInterval(() => {
+    if (isBusy()) return; // never interrupt work in progress; check again next tick
+    const current = readVersion();
+    // A null read means "couldn't tell" — the package directory is mid-replacement during an
+    // upgrade — not "changed". Treating it as drift would fire a bogus notice every upgrade.
+    if (!current || current === bootVersion) return;
+    clearInterval(timer); // say it once; repeating every interval is noise, not information
+    onDrift(bootVersion, current);
+  }, intervalMs);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer) };
+}
+
 /** Optional per-call repo target. A single long-lived MCP server can serve many repos: a
  *  tool call may carry `cwd` to say "operate on the repo owning this directory". Injected
  *  into every advertised tool schema so it's discoverable without bloating each ToolDef. */
@@ -1052,7 +1091,11 @@ export async function startMcpServer(opts: { profile?: string } = {}): Promise<v
   // moved instead of polling for it; prompts carry their facts pre-inlined.
   const server = new sdk.Server(
     { name: "avcs", version: bootVersion ?? "0.0.0" },
-    { capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} } },
+    // `logging` is not decoration: the SDK refuses to send `notifications/message` unless it
+    // is declared (`assertNotificationCapability`), and every such send here is wrapped in a
+    // `.catch(() => {})`. Omitting it silently dropped every watch event and every notice —
+    // the code looked like it was reporting and nothing ever arrived.
+    { capabilities: { tools: {}, resources: { subscribe: true }, prompts: {}, logging: {} } },
   );
 
   // M5: the advertised SET is profile-controlled, but every registered tool stays callable —
@@ -1105,12 +1148,24 @@ export async function startMcpServer(opts: { profile?: string } = {}): Promise<v
   // is zero, so an update never interrupts in-progress work — including a call parked
   // on a human elicitation prompt (the await keeps it counted as in-flight).
   let inFlight = 0;
+  // Set once the installed version drifts past ours; appended to errors so a stale server's
+  // failures name their own cause instead of looking like a fault in the caller's repo.
+  let staleNotice: string | null = null;
   server.setRequestHandler(typesMod.CallToolRequestSchema, async (req) => {
     const tool = TOOLS.find((t) => t.name === req.params.name);
     if (!tool) throw new Error(`unknown tool: ${req.params.name}`);
     const argsIn = (req.params.arguments ?? {}) as Record<string, unknown>;
     const callCwd = typeof argsIn.cwd === "string" ? argsIn.cwd : undefined;
-    const repo = await openRepo(callCwd);
+    let repo: Repo;
+    try {
+      repo = await openRepo(callCwd);
+    } catch (e) {
+      // Repo resolution runs before the tool does, so its failures never reach the tool's
+      // error envelope — they surface as a bare transport error. That is exactly the failure
+      // a stale server produces, so it is exactly where the notice has to land.
+      (e as Error).message = appendStaleNote((e as Error).message, staleNotice);
+      throw e;
+    }
     inFlight++;
     const ctx: ToolCtx = {
       // Bridge to MCP elicitation; surface a friendly error if the client lacks support.
@@ -1132,6 +1187,7 @@ export async function startMcpServer(opts: { profile?: string } = {}): Promise<v
       if (!out.isError && tool.name === "avcs.operation.propose" && typeof argsIn.path === "string") {
         watchers.get(await resolveRepoDir(callCwd, clientRoots))?.trackKeys([`file:${argsIn.path}`]);
       }
+      if (out.isError && staleNotice) out.content.push({ type: "text", text: `note: ${staleNotice}` });
       return out;
     } finally {
       inFlight--;
@@ -1180,27 +1236,45 @@ export async function startMcpServer(opts: { profile?: string } = {}): Promise<v
     tick.unref?.();
   }
 
-  // Reload-on-update: a long-lived stdio server holds the code it was spawned with, so
-  // an `npm i -g @izagood/avcs@latest` (or any update) does not reach a running process.
-  // We can't hot-swap the loaded module, so instead we watch the installed package
-  // version and, once it differs from what we booted with AND no tool call is in flight,
-  // exit cleanly so the MCP client respawns us on the new code. Set the interval to 0 to
-  // disable. `unref()` keeps the timer from holding the process alive on its own.
+  // Update-in-place: a long-lived stdio server holds the code it was spawned with, so
+  // `npm i -g @izagood/avcs@latest` never reaches a running process. We cannot hot-swap the
+  // loaded module, so the only question is what to do once we notice.
+  //
+  // Exiting is right ONLY if the client respawns us. The common client, Claude Code, does
+  // not: it marks the server disconnected and waits for a manual `/mcp`. Exiting there strips
+  // every AVCS tool out of a live session with no visible cause — worse than serving code one
+  // version behind, which still works. So the default is to SAY so and keep serving, and the
+  // notice is also appended to later errors, because a stale server's failures are otherwise
+  // baffling: an old server that cannot read a newer on-disk layout reports "not an AVCS
+  // repo" while the freshly-upgraded CLI reads the very same directory fine.
+  //
+  // Clients that DO respawn get the old behaviour with AVCS_MCP_RELOAD=exit.
+  // AVCS_MCP_RELOAD_CHECK_MS=0 turns the check off entirely.
   const reloadCheckMs = Number(process.env.AVCS_MCP_RELOAD_CHECK_MS ?? "10000");
-  if (bootVersion && Number.isFinite(reloadCheckMs) && reloadCheckMs > 0) {
-    const watcher = setInterval(() => {
-      if (inFlight > 0) return;
-      const current = readPackageVersion();
-      if (!current || current === bootVersion) return;
-      clearInterval(watcher);
-      console.error(
-        `[avcs-mcp] installed version changed ${bootVersion} -> ${current}; no calls in flight, ` +
-          `exiting so the MCP client respawns on the new code.`,
-      );
-      server.close().catch(() => {}).finally(() => process.exit(0));
-    }, reloadCheckMs);
-    watcher.unref?.();
-  }
+  const exitOnDrift = process.env.AVCS_MCP_RELOAD === "exit";
+  watchVersionDrift({
+    bootVersion,
+    readVersion: readPackageVersion,
+    intervalMs: reloadCheckMs,
+    isBusy: () => inFlight > 0,
+    onDrift: (from, to) => {
+      const advice =
+        `avcs was updated ${from} -> ${to}, but this MCP server is still running ${from}. ` +
+        `Reconnect it to pick up the new version (in Claude Code: /mcp).`;
+      staleNotice = advice;
+      console.error(`[avcs-mcp] ${advice}`);
+      if (exitOnDrift) {
+        console.error("[avcs-mcp] AVCS_MCP_RELOAD=exit — exiting so the client respawns us.");
+        server.close().catch(() => {}).finally(() => process.exit(0));
+        return;
+      }
+      // Surface it where a human actually looks. Best-effort: a client that drops
+      // notifications still gets the hint appended to any subsequent error.
+      server
+        .notification({ method: "notifications/message", params: { level: "warning", logger: "avcs", data: advice } })
+        .catch(() => {});
+    },
+  });
 
   await server.connect(new stdio.StdioServerTransport());
   const target = ENV_REPO
