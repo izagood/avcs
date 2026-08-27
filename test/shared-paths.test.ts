@@ -553,6 +553,30 @@ test("`avcs shared rm --cache <key>` throws one cache away (docs/21 R2)", async 
   }
 });
 
+test("a history contaminated BEFORE the rule existed is not written over the live cache", async () => {
+  // §3.5's symmetric defence. Capture can no longer produce such ops, but an existing repo
+  // can already hold them — and writing them would spill recorded bytes straight through the
+  // symlink into somebody's build cache.
+  const dir = await mk();
+  const out = await mkdtemp(join(tmpdir(), "avcs-ws-"));
+  try {
+    const repo = await Repo.init(dir);
+    await put(repo, "pnpm-lock.yaml", "lockfileVersion: 1\n");
+    await put(repo, "node_modules/dep/index.js", "captured back when nothing stopped it");
+    await repo.addSharedPath({ path: "node_modules", keyFrom: ["pnpm-lock.yaml"] });
+
+    const projected = await repo.projectInto(out, "main");
+    assert.deepEqual(projected.written, ["pnpm-lock.yaml"]);
+    assert.deepEqual(projected.skipped, ["node_modules/dep/index.js"], "named, not written");
+    const link = projected.shared[0]!;
+    assert.equal(link.populated, false, "the cache stayed empty — nothing leaked into it");
+    assert.equal(existsSync(join(link.cache, "dep", "index.js")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(out, { recursive: true, force: true });
+  }
+});
+
 test("avcs.workspace.project tells an AGENT whether the cache needs filling, and nothing more", async () => {
   // docs/18's primary interface is MCP, so the one fact the core can supply about a build
   // environment has to reach an agent too. What it must NOT reach it with is an install
