@@ -262,3 +262,45 @@ test("§3.2: rename(A→C) ∥ edit(C) stays a conflict — C is the DESTINATION
     await rm(c.dir, { recursive: true, force: true });
   }
 });
+
+// ── §3.2 — line-level conflict detection has to see across the alias boundary ──
+// Two concurrent edits can reach the SAME file by two different names: one names the old
+// path and is routed by the alias, the other names the new path directly. Bucketing the
+// line-overlap check by the DECLARED path would put them in separate buckets and never
+// compare them — and the loser's overlapping change would be dropped in silence, which is
+// the one failure mode the whole file-conflict pass exists to prevent.
+test("§3.2: concurrent edits reaching one file by two names — overlap is reported", async () => {
+  const c = await freshRepo("alias-overlap");
+  try {
+    const scaffold = await c.repo.proposeFileWrite({ sessionOid: c.sess, intentOid: c.intent, actor: A, path: "P.ts", content: BASE, declaredPurpose: "scaffold" });
+    const rn = await rename(c, { actor: A, from: "P.ts", to: "Q.ts", deps: [scaffold] });
+    // Names the NEW path, causally after the move.
+    await c.repo.proposeEdit({ sessionOid: c.sess, intentOid: c.intent, actor: A, path: "Q.ts", baseText: BASE, newText: "alpha\nbeta ONE\ngamma\ndelta\n", declaredPurpose: "edit Q", causalDeps: [rn] });
+    // Names the OLD path, concurrent with the move, and touches the same line.
+    await c.repo.proposeEdit({ sessionOid: c.sess, intentOid: c.intent, actor: B, path: "P.ts", baseText: BASE, newText: "alpha\nbeta TWO\ngamma\ndelta\n", declaredPurpose: "edit P", causalDeps: [scaffold] });
+    const { res } = await tree(c);
+    assert.equal(res.fileConflicts.length, 1, "the overlap must be found even across the rename");
+    assert.equal(res.fileConflicts[0]!.file, "Q.ts", "reported at the path the file actually lives at");
+    assert.ok(res.fileConflicts[0]!.regions[0]!.options.length >= 2, "both renderings offered");
+    assert.ok(res.conflicts.length >= 1, "and surfaced for the release gate");
+  } finally {
+    await rm(c.dir, { recursive: true, force: true });
+  }
+});
+
+test("§3.2: concurrent DISJOINT edits reaching one file by two names both survive", async () => {
+  const c = await freshRepo("alias-disjoint");
+  try {
+    const scaffold = await c.repo.proposeFileWrite({ sessionOid: c.sess, intentOid: c.intent, actor: A, path: "P.ts", content: BASE, declaredPurpose: "scaffold" });
+    const rn = await rename(c, { actor: A, from: "P.ts", to: "Q.ts", deps: [scaffold] });
+    await c.repo.proposeEdit({ sessionOid: c.sess, intentOid: c.intent, actor: A, path: "Q.ts", baseText: BASE, newText: "alpha\nbeta ONE\ngamma\ndelta\n", declaredPurpose: "edit Q", causalDeps: [rn] });
+    await c.repo.proposeEdit({ sessionOid: c.sess, intentOid: c.intent, actor: B, path: "P.ts", baseText: BASE, newText: "alpha\nbeta\ngamma\ndelta TWO\n", declaredPurpose: "edit P", causalDeps: [scaffold] });
+    const { files, res } = await tree(c);
+    assert.equal(res.conflicts.length, 0);
+    assert.equal(res.fileConflicts.length, 0);
+    assert.equal(files.get("Q.ts"), "alpha\nbeta ONE\ngamma\ndelta TWO\n", "both disjoint edits compose at the final path");
+    assert.equal(files.size, 1);
+  } finally {
+    await rm(c.dir, { recursive: true, force: true });
+  }
+});

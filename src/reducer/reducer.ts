@@ -215,6 +215,13 @@ export interface FileConflict {
  *
  * No language knowledge — merge3 compares lines. Ancestor relations (an edit built on a
  * prior edit) are not concurrent and never flagged. Deterministic over canonical order.
+ *
+ * "The same file" means the same ALIAS-RESOLVED path, not the same declared one (docs/19
+ * §3.2). Two concurrent edits can reach one file by two names — one naming the path from
+ * before a move, the other naming it after — and bucketing them by whichever name each op
+ * happened to use would put them in separate buckets, never compare them, and let the
+ * loser's overlapping change disappear without a word. With no renames in the op set,
+ * resolution is the identity and the buckets are exactly the declared paths, as before.
  */
 export function detectFileConflicts(
   ops: Operation[],
@@ -222,12 +229,15 @@ export function detectFileConflicts(
   blobContent: Map<string, Buffer>,
 ): FileConflict[] {
   const anc = ancestry(ops);
+  // Built from the same status filter the bucket loop below uses, so the aliases describe
+  // exactly the ops being bucketed.
+  const alias = aliasCtxFor(ops.filter((o) => result.statuses.get(o.oid as string) === "accepted"), anc);
   const resolve = (oid: string | undefined): Buffer => (oid ? blobContent.get(oid) ?? Buffer.alloc(0) : Buffer.alloc(0));
   const byFile = new Map<string, Operation[]>();
   for (const o of ops) {
     if (o.body.kind !== "edit_file") continue;
     if (result.statuses.get(o.oid as string) !== "accepted") continue;
-    const f = o.body.path ?? o.target.entityId;
+    const f = resolvedPath(o, o.body.path ?? o.target.entityId, alias);
     (byFile.get(f) ?? byFile.set(f, []).get(f)!).push(o);
   }
   const out: FileConflict[] = [];
