@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { decodeCbor } from "../src/core/cbor.ts";
@@ -23,6 +23,9 @@ const dev: Actor = { kind: "human", id: "human:dev" };
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const avcs = (cwd: string, ...a: string[]): string =>
   execFileSync(process.execPath, ["--experimental-strip-types", CLI, ...a], { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
+const git = (cwd: string, ...a: string[]): string =>
+  execFileSync("git", a, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
+const hasGit = (() => { try { execFileSync("git", ["--version"], { stdio: "ignore" }); return true; } catch { return false; } })();
 const SECRET = "AWS_SECRET_ACCESS_KEY=SUPERSECRET123\n";
 
 /** The issue's repro: one legitimate commit, then one that slipped `.env` in. */
@@ -237,6 +240,9 @@ test("avcs undo --last --purge: the whole repro from the command line", async ()
   assert.equal((await fresh.listUndos()).length, 1, "the CLI path records the undo too");
   assert.equal((await fresh.listUndos())[0]?.reason, "committed .env by mistake");
 
+  // The standalone message must stay clean: no caution about a tool that is not here.
+  assert.doesNotMatch(out, /git/i, "no git bridge ⇒ nothing to say about git");
+
   // `--reason <text>` must not be mistaken for an op oid.
   assert.match(avcs(dir, "undo", "--last", "--reason", "nope"), /undid 1 op/);
   await rm(dir, { recursive: true, force: true });
@@ -309,5 +315,42 @@ test("--purge also scrubs the derived copies: a persisted snapshot holds merged 
   assert.equal(await snapshotBytes(dir), null, "the snapshot the eviction invalidated is gone, plaintext with it");
   // …and the repo still works: the cache was rebuildable, that was the whole point.
   assert.equal((await repo.materialize()).tree.size, 0);
+  await rm(dir, { recursive: true, force: true });
+});
+
+// The git bridge is the third tier: `undo --purge` evicts the AVCS copy, and git keeps its
+// own. That is correct — rewriting git history is not an avcs command's business — but
+// "bytes evicted, not recoverable" reads as "handled" to someone who just leaked a
+// credential, so the CLI has to name what it did NOT do.
+test("in a git repo, --purge says the git object still holds the bytes", { skip: !hasGit }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-git-"));
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "t@example.com");
+  git(dir, "config", "user.name", "Tester");
+  avcs(dir, "init", "."); // installs the bridge hooks, so `git commit` ingests into AVCS too
+
+  // NOT `.env`: a global gitignore commonly ignores it, which would make git stage nothing
+  // and this test silently prove nothing. An ordinary source filename is always tracked.
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(join(dir, "src/config.ts"), 'export const TOKEN = "GITMODE456SECRET"\n', "utf8");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-m", "oops");
+  assert.match(avcs(dir, "log"), /src\/config\.ts/, "the hook ingested the commit into AVCS");
+  const sha = git(dir, "log", "--all", "-n", "1", "--pretty=%h", "--", "src/config.ts");
+  assert.ok(sha, "git holds a commit touching the path");
+
+  const out = avcs(dir, "undo", "--last", "--purge", "--reason", "hardcoded token");
+  assert.match(out, /purged 1 blob/);
+  assert.match(out, /gone from AVCS only/i, "names what the eviction did not reach");
+  assert.match(out, new RegExp(`git ${sha}`), "and names the commit that still contains it");
+  assert.match(out, /src\/config\.ts/);
+  assert.doesNotMatch(out, /run `?git (reset|filter-repo|rebase)/, "does not offer to rewrite their git history");
+
+  // The claim is true: AVCS evicted its copy, git kept its own.
+  const repo = await Repo.open(dir);
+  const purged = (await repo.listUndos()).at(-1)?.purged ?? [];
+  assert.equal(purged.length, 1);
+  assert.doesNotMatch((await repo.readBlob(purged[0] as string)).toString("utf8"), /GITMODE456SECRET/);
+  assert.match(git(dir, "log", "--all", "-S", "GITMODE456SECRET", "--oneline"), /oops/);
   await rm(dir, { recursive: true, force: true });
 });

@@ -286,6 +286,41 @@ async function installHooks(hooksDir: string, avcsCmd: string, force: boolean): 
   return { installed, skipped };
 }
 
+/**
+ * After `undo --purge`, name the copy the eviction could NOT reach: git's.
+ *
+ * `undo` is an AVCS command and has no business rewriting git history — the correct fix
+ * differs by whether the commit was pushed, so it is the user's call and no avcs command
+ * should make it for them. But silence is worse than useless here: to somebody who just
+ * leaked a credential, "bytes evicted, not recoverable" reads as *handled*, and in bridge
+ * mode it is not — git still holds its own object.
+ *
+ * Only speaks when git is actually present (same silent probe as everywhere else in this
+ * file). No git, no extra line: the standalone message is already accurate and stays clean.
+ * Names a concrete commit when git can point at one, and states a CONDITION when it can't,
+ * rather than asserting something it did not check.
+ */
+async function warnGitStillHolds(repo: Repo, undoneOps: string[]): Promise<void> {
+  if (!gitCmd(cwd, ["rev-parse", "--git-dir"])) return;
+  const paths: string[] = [];
+  for (const oid of undoneOps) {
+    const op = await repo.store.get<Operation>(oid).catch(() => null);
+    const path = op?.body.path ?? op?.target.entityId;
+    if (path && !paths.includes(path)) paths.push(path);
+  }
+  console.log("note: those bytes are gone from AVCS only — git keeps its own copy of what it committed.");
+  const SHOWN = 5;
+  const named: string[] = [];
+  for (const p of paths) {
+    const sha = gitCmd(cwd, ["log", "--all", "-n", "1", "--pretty=%h", "--", p]);
+    if (sha) named.push(`  git ${sha} still contains ${p}`);
+  }
+  for (const line of named.slice(0, SHOWN)) console.log(line);
+  if (named.length > SHOWN) console.log(`  …and ${named.length - SHOWN} more path(s) in git history`);
+  if (!named.length) console.log("  if these files were committed to git, that history still holds them");
+  console.log("  clearing them from git is a separate step, and differs once pushed — avcs will not do it for you");
+}
+
 async function main(): Promise<void> {
   switch (cmd) {
     case "version": {
@@ -765,7 +800,10 @@ async function main(): Promise<void> {
       }
       console.log(`undid ${r.excluded.length} op(s) in ${scopeLabel(scope)}`);
       for (const o of r.excluded) console.log(`  - ${o}`);
-      if (r.purged.length) console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
+      if (r.purged.length) {
+        console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
+        await warnGitStillHolds(repo, [...r.excluded, ...r.alreadyExcluded]);
+      }
       if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
       if (!args.includes("--purge")) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
       console.log(`recorded as ${r.undoOid}`);
