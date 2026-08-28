@@ -496,8 +496,12 @@ function reachableFrom(dir: string, sha: string, from: string[]): boolean {
  * reflog entries that would otherwise hand the commit back (and only those — the user's
  * reflog for still-reachable work survives), `ORIG_HEAD` is removed because `reset` had just
  * written it, and `gc --prune=now` collects what is left.
+ *
+ * Returns whether it delivered the "the leaked file is still on disk" warning: the git plane
+ * only gets to say that when it actually pruned, and the standalone path has to say it
+ * otherwise (issue #97).
  */
-function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): void {
+function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): boolean {
   const shorts = plan.commits.map((c) => `${shortSha(dir, c)} ${gitCmd(dir, ["log", "-1", "--pretty=%s", c]) ?? ""}`.trim());
   // `gitCmd` swallows failures by design (it is a probe), so the ref move — the one step
   // whose failure would make every line below a lie — is checked rather than assumed.
@@ -507,7 +511,7 @@ function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): 
   if (moved === null) {
     console.log(`git: could NOT move \`${plan.branch}\` off those commits, so git still holds the bytes.`);
     console.log("  Nothing was pruned. Check `git status` and `git log`, then re-run once git is happy.");
-    return;
+    return false;
   }
   if (!plan.resetTo) gitCmd(dir, ["rm", "-r", "--cached", "-q", "--", "."]);
   gitCmd(dir, ["update-ref", "-d", "ORIG_HEAD"]);
@@ -523,23 +527,39 @@ function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): 
     console.log(`  WARNING: git can still read ${survivors.map((c) => shortSha(dir, c)).join(", ")} — something else holds it.`);
     console.log("  Check `git fsck --lost-found`, other worktrees, and `git reflog --all`, then re-check with `git log --all -S '<the secret>'`.");
   }
+  return true;
 }
 
 /** The git half of `undo --purge`: do it where it is provably safe, and where it is not, say
  *  precisely what is left and the one command that fits that situation. */
-async function settleGitAfterPurge(repo: Repo, ops: string[], noGit: boolean): Promise<void> {
+async function settleGitAfterPurge(repo: Repo, ops: string[], noGit: boolean): Promise<boolean> {
   const paths = await pathsOfOps(repo, ops);
   const plan = planGitPurge(cwd, paths, ops);
-  if (plan.do === "nothing") return;
+  if (plan.do === "nothing") return false;
   if (noGit) {
     console.log("git: --no-git — git still holds its own copy of those bytes, and clearing it is on you.");
     console.log(`  When you want avcs to try:  ${retryCommand(ops)}`);
-    return;
+    return false;
   }
   if (plan.do === "remove") return applyGitPurge(cwd, plan);
   console.log(`git: those bytes are in git too, and avcs did NOT remove them — ${plan.because}.`);
   for (const d of plan.detail) console.log(d);
   for (const r of plan.remedy) console.log(r);
+  return false;
+}
+
+/**
+ * The warning `--purge` owes the user (issue #97): the eviction deliberately leaves the leaked
+ * file in the working tree, so the very next commit re-adds it — and, blobs being
+ * content-addressed, re-adds it AT the tombstoned oid. `commit` and `materialize` now refuse
+ * that, but a refusal the user could have avoided is still a worse outcome than a warning here.
+ *
+ * The git plane has printed this since 0.35.0; a repo with no git never saw it. So it is
+ * printed exactly when the git plane did not — and without naming git, which a standalone repo
+ * has nothing to say about.
+ */
+function warnLeakStillOnDisk(): void {
+  console.log("  The working tree is untouched, so the leaked file is still on disk and no longer in the view — fix or delete it before you commit again.");
 }
 
 /** Surface machine-keystore notices (issue #98: a key adopted out of a checkout, or two
@@ -1090,7 +1110,10 @@ async function main(): Promise<void> {
       console.log(`undid ${r.excluded.length} op(s) in ${scopeLabel(scope)}`);
       for (const o of r.excluded) console.log(`  - ${o}`);
       if (r.purged.length) console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
-      if (purging) await settleGitAfterPurge(repo, targeted, args.includes("--no-git"));
+      const gitWarned = purging ? await settleGitAfterPurge(repo, targeted, args.includes("--no-git")) : false;
+      // Only when the git plane did not already say it — and only when bytes actually went,
+      // since a plain undo leaves nothing on disk to warn about.
+      if (r.purged.length && !gitWarned) warnLeakStillOnDisk();
       if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
       if (!purging) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
       console.log(`recorded as ${r.undoOid}`);
