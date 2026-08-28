@@ -77,6 +77,9 @@ export interface Blob extends BaseObject {
   /** Phase 12: set once a Redaction evicted the original bytes (oid preserved). */
   redacted?: boolean;
   redactionOid?: string;
+  /** Issue #91: set instead of `redactionOid` when a local `undo --purge` did the eviction.
+   *  Same mechanism, different provenance — one is a governed act, the other pre-share. */
+  undoOid?: string;
 }
 
 // ── intent ──────────────────────────────────────────────────────────────────

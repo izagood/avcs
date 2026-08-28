@@ -1765,28 +1765,91 @@ export class Repo {
       const already = new Set(view.query.excludeOps ?? []);
       const fresh = targets.filter((o) => !already.has(o));
       const alreadyExcluded = targets.filter((o) => already.has(o));
+      const { evictable, retained } = args.purge
+        ? await this.#purgeableBlobs(targets)
+        : { evictable: [], retained: [] };
 
-      if (!fresh.length) {
-        return { undoOid: null, view: viewName, excluded: [], alreadyExcluded, purged: [], retained: [] };
+      // A repeat of an undo that already happened converges instead of erroring: nothing
+      // left to exclude AND nothing left to evict ⇒ no new view, no new record.
+      if (!fresh.length && !evictable.length) {
+        return { undoOid: null, view: viewName, excluded: [], alreadyExcluded, purged: [], retained };
       }
-      const viewOid = await this.createView(
-        viewName,
-        { ...view.query, excludeOps: [...already, ...fresh] },
-        (view.oid as string) ?? null,
-      );
+      const viewOid = fresh.length
+        ? await this.createView(viewName, { ...view.query, excludeOps: [...already, ...fresh] }, (view.oid as string) ?? null)
+        : (view.oid as string);
       const undo: Undo = {
         type: "undo",
         view: viewName,
         ops: fresh,
         viewOid,
+        ...(evictable.length ? { purged: evictable } : {}),
         ...(args.reason ? { reason: args.reason } : {}),
         by: args.by,
         createdAt: new Date().toISOString(),
       };
+      // Record BEFORE evicting: a crash between the two leaves a record naming bytes that
+      // are still there, and re-running finishes the job. The reverse order would evict
+      // bytes nothing accounts for.
       const undoOid = await this.store.put(undo);
-      this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: 0, by: args.by, reason: args.reason });
-      return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: [], retained: [] };
+      if (evictable.length) {
+        const { purgedStub } = await import("../store/applyRedactions.ts");
+        const reason = args.reason ?? "local undo --purge";
+        for (const blobOid of evictable) {
+          await this.store.overwriteAt(blobOid, purgedStub(reason, undoOid));
+          this.#blobCache.delete(blobOid); // bytes changed under a stable oid
+        }
+      }
+      this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: evictable.length, by: args.by, reason: args.reason });
+      return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: evictable, retained };
     });
+  }
+
+  /**
+   * Split the blobs the undone ops reference into what `--purge` may evict and what it
+   * must spare.
+   *
+   * "Uniquely referenced" is decided against EVERY operation in the store other than the
+   * ones being undone — not merely the ops the target view currently selects. Content
+   * addressing means identical content is one blob, and an op on another line (or in a
+   * workspace, or one a previous undo excluded but did not purge) can hold the only other
+   * reference to it. Both `blobOid` and `baseBlobOid` count: a remaining `edit_file` needs
+   * its 3-way merge base as much as its content. Ref targets are spared too, since a ref
+   * can point at a blob (the landed-workspace set) that no op mentions.
+   *
+   * The asymmetry is deliberate. Sparing one blob too many leaves bytes the user must undo
+   * a second op to be rid of — annoying, and reported as `retained`. Evicting one too many
+   * silently breaks a projection nobody asked to change, irreversibly.
+   */
+  async #purgeableBlobs(targets: string[]): Promise<{ evictable: string[]; retained: string[] }> {
+    const withChunks = async (oid: string, into: Set<string>): Promise<void> => {
+      into.add(oid);
+      const blob = await this.store.get<Blob>(oid).catch(() => null);
+      if (blob?.chunked && blob.chunks) for (const c of blob.chunks) into.add(c);
+    };
+    const targetSet = new Set(targets);
+    const wanted = new Set<string>();
+    const spared = new Set<string>();
+    for (const op of await this.store.collect<Operation>("operation")) {
+      const mine = targetSet.has(op.oid as string);
+      // An undone op's own merge BASE is the previous content, which belongs to the op that
+      // wrote it — undoing this op is no statement about that. Only its own content goes.
+      if (mine) {
+        if (op.body.blobOid) await withChunks(op.body.blobOid, wanted);
+        continue;
+      }
+      for (const b of [op.body.blobOid, op.body.baseBlobOid]) if (b) await withChunks(b, spared);
+    }
+    for (const oid of (await this.store.listRefs()).values()) spared.add(oid);
+
+    const evictable: string[] = [];
+    const retained: string[] = [];
+    for (const oid of [...wanted].sort()) {
+      if (spared.has(oid)) { retained.push(oid); continue; }
+      const blob = await this.store.get<Blob>(oid).catch(() => null);
+      if (!blob || blob.redacted) continue; // already gone (gc) or already evicted — idempotent
+      evictable.push(oid);
+    }
+    return { evictable, retained };
   }
 
   /** Every recorded local undo, oldest first. */

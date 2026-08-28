@@ -76,3 +76,75 @@ test("the undo is recorded as a first-class, queryable object", async () => {
   assert.ok(u.createdAt);
   await rm(dir, { recursive: true, force: true });
 });
+
+test("undo --purge evicts the leaked bytes; the earlier commit still projects (issue #91 repro)", async () => {
+  const { dir, repo, bad, secretBlob } = await repoWithLeak();
+
+  const r = await repo.undo({ ops: bad, purge: true, by: dev.id, reason: "leaked AWS key" });
+  assert.deepEqual(r.purged, [secretBlob], "the blob the bad op uniquely referenced");
+  assert.deepEqual(r.retained, []);
+
+  // The bytes are gone — this is the assertion the issue is about.
+  assert.doesNotMatch((await repo.readBlob(secretBlob)).toString("utf8"), /SUPERSECRET123/);
+  assert.match((await repo.readBlob(secretBlob)).toString("utf8"), /PURGED/);
+
+  // …and the repo is still a working repo.
+  const after = await repo.materialize();
+  assert.ok(!after.tree.has(".env"));
+  assert.equal((await repo.materializedFiles(after)).find((f) => f.path === "app.ts")?.content, "export const v = 1\n");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("--purge spares a blob a still-selected op references (content-addressing shares blobs)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  // Same bytes committed twice ⇒ ONE blob, referenced by two ops.
+  await writeFile(join(dir, "keep.env"), SECRET, "utf8");
+  await repo.commitWorkingTree(dir, { message: "keep", actor: dev });
+  await writeFile(join(dir, ".env"), SECRET, "utf8");
+  const bad = await repo.commitWorkingTree(dir, { message: "oops", actor: dev });
+  const blob = (await repo.store.get<Operation>(bad.ops[0] as string)).body.blobOid as string;
+  assert.equal((await repo.materialize()).tree.get("keep.env"), blob, "one blob, two ops");
+
+  const r = await repo.undo({ ops: bad.ops, purge: true, by: dev.id });
+  assert.deepEqual(r.purged, [], "not uniquely referenced ⇒ not evicted");
+  assert.deepEqual(r.retained, [blob]);
+  assert.match((await repo.readBlob(blob)).toString("utf8"), /SUPERSECRET123/, "keep.env still needs it");
+  const after = await repo.materialize();
+  assert.ok(!after.tree.has(".env"));
+  assert.equal((await repo.materializedFiles(after)).find((f) => f.path === "keep.env")?.content, SECRET);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("--purge spares a blob a remaining edit still needs as its 3-way merge base", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  await writeFile(join(dir, "x.ts"), "v1\n", "utf8");
+  const first = await repo.commitWorkingTree(dir, { message: "one", actor: dev });
+  await writeFile(join(dir, "x.ts"), "v2\n", "utf8");
+  const second = await repo.commitWorkingTree(dir, { message: "two", actor: dev });
+  const v1 = (await repo.store.get<Operation>(first.ops[0] as string)).body.blobOid as string;
+  assert.equal((await repo.store.get<Operation>(second.ops[0] as string)).body.baseBlobOid, v1);
+
+  const r = await repo.undo({ ops: first.ops, purge: true, by: dev.id });
+  assert.deepEqual(r.purged, [], "the later edit's merge base must survive");
+  assert.deepEqual(r.retained, [v1]);
+  assert.equal((await repo.readBlob(v1)).toString("utf8"), "v1\n");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("--purge after a plain undo still evicts; a second --purge is a no-op", async () => {
+  const { dir, repo, bad, secretBlob } = await repoWithLeak();
+  await repo.undo({ ops: bad, by: dev.id });
+  const purged = await repo.undo({ ops: bad, purge: true, by: dev.id, reason: "on reflection, evict it" });
+  assert.deepEqual(purged.excluded, [], "already excluded");
+  assert.deepEqual(purged.purged, [secretBlob], "but the bytes had not been evicted yet");
+  assert.ok(purged.undoOid, "an eviction is always recorded");
+  const rec = (await repo.listUndos()).find((u) => u.oid === purged.undoOid)!;
+  assert.deepEqual(rec.purged, [secretBlob]);
+
+  const again = await repo.undo({ ops: bad, purge: true, by: dev.id });
+  assert.deepEqual(again.purged, []);
+  assert.equal(again.undoOid, null, "nothing left to do ⇒ no record");
+  await rm(dir, { recursive: true, force: true });
+});
