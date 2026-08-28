@@ -40,6 +40,29 @@ import {
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
 import { isBinary } from "../core/bytes.ts";
 import { PurgedBlobError, purgeTombstoneOf } from "../store/applyRedactions.ts";
+
+/**
+ * Thresholds for the mass-delete guard (issue #96).
+ *
+ * `MIN_FILES` keeps small repos usable: deleting both files of a two-file repo is not a
+ * catastrophe worth a flag. `RATIO` is deliberately high — the guard exists to catch a tree
+ * that VANISHED, not a large but intentional cleanup, and a false refusal on ordinary work
+ * would be worse than the bug it prevents.
+ */
+const MASS_DELETE_MIN_FILES = 5;
+const MASS_DELETE_RATIO = 0.9;
+
+/** A capture whose only effect would be to remove (almost) every tracked file. */
+export class MassDeleteError extends Error {
+  readonly removed: string[];
+  readonly tracked: number;
+  constructor(message: string, info: { removed: string[]; tracked: number }) {
+    super(message);
+    this.name = "MassDeleteError";
+    this.removed = info.removed;
+    this.tracked = info.tracked;
+  }
+}
 import { lcsLineLength } from "../merge/merge3.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
@@ -3586,7 +3609,16 @@ export class Repo {
    */
   async commitWorkingTree(
     workDir: string,
-    opts: { message: string; actor: Actor; line?: string; workspace?: string; ignorePredicate?: (rel: string) => boolean },
+    opts: {
+      message: string;
+      actor: Actor;
+      line?: string;
+      workspace?: string;
+      ignorePredicate?: (rel: string) => boolean;
+      /** Author a deletion that covers (almost) the whole tree. Off by default — see
+       *  {@link MassDeleteError} for why that is not paranoia. */
+      allowMassDelete?: boolean;
+    },
   ): Promise<{
     ops: string[];
     added: string[];
@@ -3627,6 +3659,34 @@ export class Repo {
     const contention: ContentionWarning[] = [];
     if (!added.length && !modified.length && !removed.length && !renamed.length)
       return { ops, added, modified, removed, renamed, intent: "", contention };
+
+    // Same place, same reason: a capture that would wipe the tree is refused BEFORE anything
+    // is authored (issue #96).
+    //
+    // The reported route was `clone`, which used to leave the working tree empty; the very
+    // next `commit` then read that emptiness as "every tracked file was deleted" and, on a
+    // ~360-file repo, authored ~360 deletions. `clone` now materializes, but the trap is
+    // reachable without it — a tree moved aside, a directory emptied by a build script, a
+    // repo cloned by an older avcs — so the guard earns its place independently.
+    //
+    // The test is not a ratio alone. Deleting most of a tree is a real operation, and a
+    // refactor that replaces one deletes nearly all of it too. What is never ordinary work is
+    // a commit whose ONLY effect is to remove almost everything: nothing added, nothing
+    // modified, nothing moved. That shape is what an empty directory produces, and what a
+    // deliberate teardown has no reason to be silent about.
+    if (
+      !opts.allowMassDelete &&
+      !added.length && !modified.length && !renamed.length &&
+      removed.length >= MASS_DELETE_MIN_FILES &&
+      removed.length >= current.size * MASS_DELETE_RATIO
+    ) {
+      throw new MassDeleteError(
+        `commit refuses: this would delete ${removed.length} of ${current.size} tracked file(s) and change nothing else.\n` +
+          `  If the working tree is empty or stale, write the view to it first:  avcs materialize --out .\n` +
+          `  If you really mean to remove them, say so:  avcs commit -m <msg> --allow-mass-delete`,
+        { removed, tracked: current.size },
+      );
+    }
 
     // Before ANY object is authored: a path whose content resolves to a purged blob is refused
     // outright (issue #97), so a refusal costs the user nothing — no intent, no session, no
