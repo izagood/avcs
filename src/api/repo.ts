@@ -1744,18 +1744,23 @@ export class Repo {
    * act itself is recorded as an {@link Undo}.
    */
   async undo(args: {
-    /** Ops to undo. */
+    /** Ops to undo. Mutually exclusive with `last`. */
     ops?: string[];
+    /** Undo the ops of the most recent commit on this scope instead. */
+    last?: boolean;
     /** The view (line) to undo on. Default "main". */
     view?: string;
+    /** Resolve `last` inside a workspace's projection rather than the base view. */
+    workspace?: string;
     /** Also evict the bytes the undone ops uniquely reference. Irreversible. */
     purge?: boolean;
     by: string;
     reason?: string;
   }): Promise<UndoResult> {
     const viewName = args.view ?? "main";
-    const targets = [...(args.ops ?? [])];
-    if (!targets.length) throw new Error("undo: nothing to undo (name the op oids)");
+    if (args.last && args.ops?.length) throw new Error("undo: pass either --last or explicit op oids, not both");
+    const targets = args.last ? await this.#lastCommitOps(viewName, args.workspace) : [...(args.ops ?? [])];
+    if (!targets.length) throw new Error("undo: nothing to undo (name the op oids, or pass --last)");
     for (const oid of targets) {
       const obj = await this.store.get(oid).catch(() => null);
       if (obj?.type !== "operation") throw new Error(`undo: not an operation: ${oid}`);
@@ -1814,6 +1819,31 @@ export class Repo {
       this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: evictable.length, by: args.by, reason: args.reason });
       return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: evictable, retained };
     });
+  }
+
+  /**
+   * The ops of the most recent commit on a scope (`undo --last`).
+   *
+   * "One commit" is already a first-class grouping: `commitWorkingTree` opens ONE session
+   * and authors every op of that capture against it, so the session is the commit and no new
+   * bookkeeping is needed. The newest op is picked in the reducer's own canonical order
+   * (lamport, then oid), and its whole session comes with it — a two-file commit undoes as
+   * two files, never half of one.
+   *
+   * Resolved against what the view currently SELECTS, so a repeat walks back one commit at a
+   * time: the ops a previous undo excluded are no longer candidates.
+   */
+  async #lastCommitOps(viewName: string, workspace?: string): Promise<string[]> {
+    const res = await this.materialize(viewName, workspace ? { workspace } : undefined);
+    const ops: Operation[] = [];
+    for (const oid of res.statuses.keys()) {
+      const op = await this.store.get<Operation>(oid).catch(() => null);
+      if (op?.type === "operation") ops.push(op);
+    }
+    if (!ops.length) throw new Error(`undo --last: ${viewName} has no ops left to undo`);
+    ops.sort((a, b) => a.lamport - b.lamport || (a.oid as string).localeCompare(b.oid as string));
+    const newest = ops[ops.length - 1] as Operation;
+    return ops.filter((o) => o.sessionOid === newest.sessionOid).map((o) => o.oid as string);
   }
 
   /**

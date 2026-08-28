@@ -180,3 +180,30 @@ test("undo refuses ops that have already been pushed, and names redact as the an
   await rm(dir, { recursive: true, force: true });
   await rm(hubDir, { recursive: true, force: true });
 });
+
+test("--last targets exactly the ops of the most recent commit, and walks back on repeat", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  await writeFile(join(dir, "a.ts"), "a\n", "utf8");
+  const c1 = await repo.commitWorkingTree(dir, { message: "one", actor: dev });
+  await writeFile(join(dir, "b.ts"), "b\n", "utf8");
+  await writeFile(join(dir, "c.ts"), "c\n", "utf8");
+  const c2 = await repo.commitWorkingTree(dir, { message: "two", actor: dev });
+  assert.equal(c2.ops.length, 2, "a commit of two files is two ops in one session");
+
+  const r = await repo.undo({ last: true, by: dev.id });
+  assert.deepEqual([...r.excluded].sort(), [...c2.ops].sort(), "both ops of the last commit, no more");
+  assert.deepEqual([...(await repo.materialize()).tree.keys()].sort(), ["a.ts"]);
+
+  // Repeating walks back to the commit before it — the last one is no longer selected.
+  const r2 = await repo.undo({ last: true, by: dev.id });
+  assert.deepEqual([...r2.excluded].sort(), [...c1.ops].sort());
+  assert.equal((await repo.materialize()).tree.size, 0);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("--last and explicit oids are mutually exclusive", async () => {
+  const { dir, repo, bad } = await repoWithLeak();
+  await assert.rejects(() => repo.undo({ last: true, ops: bad, by: dev.id }), /either --last or explicit op oids/);
+  await rm(dir, { recursive: true, force: true });
+});
