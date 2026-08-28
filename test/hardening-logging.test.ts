@@ -117,15 +117,20 @@ test("hub logs each request with method, path, status and latency", async () => 
     const intent = await dev.createIntent({ title: "t", owner: "human:admin" });
     const sess = await dev.startSession({ intentOid: intent, actor: ai });
     await dev.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "a.txt", content: "hi\n", declaredPurpose: "x" });
-    await pushToHub(devDir, hub.url); // GET /have + POST /objects ...
+    await pushToHub(devDir, hub.url); // GET /have + GET /version + the object write
 
     const reqs = entries.filter((e) => e.event === "hub.request");
     assert.ok(reqs.length >= 2, `expected several hub.request entries, got ${reqs.length}`);
     const haveReq = reqs.find((e) => e.path === "/have" && e.method === "GET")!;
     assert.equal(haveReq.status, 200);
     assert.equal(typeof haveReq.ms, "number");
-    const postReq = reqs.find((e) => e.path === "/objects" && e.method === "POST")!;
+    // Issue #99: the push sends the delta as one batched POST /objects/batch, and drops to
+    // per-object POST /objects only against a hub that does not advertise batching. What this
+    // test is about is that the write is LOGGED with status and latency, whichever it chose.
+    const postReq = reqs.find((e) => e.method === "POST" && String(e.path).startsWith("/objects"))!;
+    assert.ok(postReq, `the object write was logged: ${JSON.stringify(reqs.map((e) => `${e.method} ${e.path}`))}`);
     assert.equal(postReq.status, 200);
+    assert.equal(typeof postReq.ms, "number");
   } finally {
     await hub.close();
     await rm(dir, { recursive: true, force: true });

@@ -1,13 +1,20 @@
 // A self-contained HTTP hub for object-gossip over the network (M2 / docs/10 WS-B).
 //
-// The hub is just an ObjectStore behind three minimal endpoints. Because objects are
+// The hub is just an ObjectStore behind a few minimal endpoints. Because objects are
 // content-addressed and append-only, sync is a conflict-free union: clients diff their
 // local oid set against the hub's "have" set and transfer only what's missing, in
 // either direction. The hub never mutates an existing object (idempotent put).
 //
-//   GET  /have          → JSON array of every oid the hub holds (the "have" set)
-//   GET  /objects/:oid  → the stored object JSON (404 if absent)
-//   POST /objects       → store an object (body = object JSON), returns { oid }
+//   GET  /have           → JSON array of every oid the hub holds (the "have" set)
+//   GET  /objects/:oid   → the stored object JSON (404 if absent)
+//   POST /objects        → store an object (body = object JSON), returns { oid }
+//   POST /objects/batch  → store MANY objects in one request, with a per-oid verdict each
+//   POST /objects/fetch  → return MANY objects for one wanted-oid list
+//
+// The two batched endpoints are the whole point of the negotiation (issue #99): moving N
+// objects used to take N requests, which made any per-request budget a throughput ceiling.
+// They are additive — `GET /version` advertises `batch: true` and a client without it keeps
+// the per-object endpoints, which are unchanged.
 //
 // Node builtins only: node:http + the existing ObjectStore.
 
@@ -31,8 +38,13 @@ import type {
  *  `integrate: true` so a client can capability-detect before falling back to legacy
  *  POST /finalize (which is unchanged). v4 (additive) adds live convergence (Phase 15):
  *  GET /events long-poll sharing the objlog cursor with /sync; `GET /version` advertises
- *  `events: true` — a client without it falls back to periodic polling. */
-export const HUB_PROTOCOL_VERSION = 4;
+ *  `events: true` — a client without it falls back to periodic polling. v5 (additive) adds
+ *  BATCHED object transfer (issue #99): POST /objects/batch moves many objects in one signed
+ *  request with per-oid verdicts, POST /objects/fetch returns many objects for one wanted-oid
+ *  list; `GET /version` advertises `batch: true` plus `batchMaxBytes` (the largest body this
+ *  hub accepts) — a client without it keeps the per-object POST /objects and GET /objects/:oid
+ *  protocol, which is unchanged. */
+export const HUB_PROTOCOL_VERSION = 5;
 
 export interface HubHandle {
   url: string;
@@ -252,12 +264,20 @@ export async function startHub(opts: {
     hits.set(key, arr);
     return true;
   };
+  // How long until the oldest recorded hit leaves the window — i.e. when a token actually
+  // frees up (issue #99). Sent as `Retry-After` so a throttled client waits the real amount
+  // instead of guessing; at least 1, since a 0 would invite an immediate retry.
+  const retryAfterSeconds = (key: string): number => {
+    const arr = hits.get(key);
+    if (!rl || !arr?.length) return 1;
+    return Math.max(1, Math.ceil((windowMs - (Date.now() - arr[0]!)) / 1000));
+  };
   const audit = async (rec: Record<string, unknown>): Promise<void> => {
     try { await store.appendAux("hub-audit.log", `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`); }
     catch (e) { logger.warn("hub.audit.fail", { error: String((e as Error).message) }); }
   };
   const events = new EventHub(store, metrics, opts.events?.maxWaiters ?? 256);
-  const ctx: HubOps = { audit, allow, events };
+  const ctx: HubOps = { audit, allow, retryAfterSeconds, events };
 
   const server: Server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
@@ -328,8 +348,84 @@ async function verifyIntegrateSig(store: ObjectStore, by: string, view: string, 
 interface HubOps {
   audit(rec: Record<string, unknown>): Promise<void>;
   allow(key: string): boolean;
+  /** Seconds until `allow(key)` could succeed again, for a `Retry-After` header (issue #99).
+   *  A throttled client should be told how long to wait rather than guess, and the client's
+   *  backoff honors the header when it is present. */
+  retryAfterSeconds(key: string): number;
   /** Parked GET /events waiters (Phase 15.1) — woken after every successful mutation. */
   events: EventHub;
+}
+
+/** Caps on one batched request, so a client cannot make the hub hold an unbounded amount in
+ *  memory. Bytes are already bounded by MAX_BODY on the way in; these bound the COUNT of
+ *  objects ingested per request and the SIZE of a fetch response the hub builds itself. */
+const MAX_BATCH_OBJECTS = 50_000;
+const MAX_FETCH_OIDS = 50_000;
+const MAX_FETCH_BYTES = 8 * 1024 * 1024;
+
+/** The oid an inbound object claims, for reporting a per-oid verdict on something that was
+ *  never stored (so the hub cannot compute its content address). Only ever echoed back — the
+ *  client cross-checks it against the oid IT computed and distrusts a mismatch. */
+function oidOf(obj: unknown): string | null {
+  const o = (obj as { oid?: unknown } | null)?.oid;
+  return typeof o === "string" ? o : null;
+}
+
+/** E7 per-actor push quota key: the object's signer, else the remote address. */
+function rateLimitKey(obj: unknown, req: IncomingMessage): string {
+  const actor = typeof (obj as { type?: unknown } | null)?.type === "string" ? attributedActor(obj as AnyObject) : null;
+  return actor ? `actor:${actor}` : `addr:${req.socket.remoteAddress ?? "?"}`;
+}
+
+/** The verdict on one inbound object: stored at its content address, refused by this hub, or
+ *  not an object at all. A single POST /objects maps these to 200/403/400; a batch reports
+ *  them per oid so one refusal never aborts the rest of the chunk (issue #99). */
+type PutVerdict = { status: "stored"; oid: string } | { status: "rejected"; reason: string } | { status: "invalid"; reason: string };
+
+/**
+ * Ingest ONE inbound object — the whole POST /objects pipeline, extracted verbatim so the
+ * batch endpoint cannot drift from it. Every gate that guarded the per-object protocol
+ * (type shape, E2 push authorization, the always-on redaction check, the Phase 14 integration
+ * refusal, oid recomputation, the redaction lock, the audit record, the /events wake) applies
+ * identically to a batched object: batching changes how many objects share a request, and
+ * nothing about what the hub will accept.
+ */
+async function ingestObject(store: ObjectStore, obj: unknown, gated: boolean, ops: HubOps): Promise<PutVerdict> {
+  if (typeof obj !== "object" || obj === null || typeof (obj as { type?: unknown }).type !== "string") {
+    return { status: "invalid", reason: "object must have a string `type`" };
+  }
+  // Authorize the push (E2). On a gated hub EVERY mutating governance object is
+  // checked. A `redaction` is checked ALWAYS — even on an ungated hub (E3): it
+  // overwrites blob bytes irrecoverably, so an unauthenticated redaction is a
+  // data-destruction DoS. authorizePush requires an admin-signed redaction; an open
+  // hub with no admin membership therefore rejects all redactions (no DoS) rather
+  // than the old trust-all behavior.
+  const isRedaction = (obj as AnyObject).type === "redaction";
+  if (gated || isRedaction) {
+    const verdict = await authorizePush(store, obj as AnyObject);
+    if (!verdict.ok) return { status: "rejected", reason: verdict.reason ?? "unauthorized push" };
+  }
+  // Phase 14: integration objects are queue-authored only — reject even on an
+  // ungated hub (a pushed one would forge queue history at its content address).
+  if ((obj as AnyObject).type === "integration") {
+    return { status: "rejected", reason: "integration objects are authored by the integration queue; they cannot be pushed" };
+  }
+  // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
+  // poison the store — it lands at its true content address (or is a no-op if present).
+  const oid = await store.put(obj as AnyObject);
+  // A pushed (now admin-authorized) redaction evicts the hub's own copy of the blob.
+  // Serialize the read-modify-write under a cross-process lock (E3): the scan +
+  // overwriteAt over shared blob files must not interleave with a concurrent push or
+  // a puller's applyRedactions, or two redactions could race on the same blob.
+  if (isRedaction) {
+    await store.withLock("redactions", async () => {
+      const { applyRedactions } = await import("../store/applyRedactions.ts");
+      await applyRedactions(store);
+    });
+  }
+  await ops.audit({ action: "put", type: (obj as AnyObject).type, oid, actor: attributedActor(obj as AnyObject) }); // E7 provenance
+  ops.events.wake(); // Phase 15.1: a new object (or re-put) is exactly what waiters wait for
+  return { status: "stored", oid };
 }
 
 /** Transport-auth context threaded into the request handler (SSH-style write-auth). */
@@ -393,7 +489,10 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // client without it falls back to legacy POST /finalize).
     // `events` advertises the Phase 15 live-convergence long-poll (a client without it
     // falls back to periodic polling).
-    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true, events: true });
+    // `batch` advertises the issue #99 batched object transfer (POST /objects/batch and
+    // POST /objects/fetch); `batchMaxBytes` is the largest request body this hub accepts, so
+    // a client can size its chunks instead of discovering the limit through a 413.
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true, events: true, batch: true, batchMaxBytes: MAX_BODY });
     return;
   }
 
@@ -489,54 +588,95 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 400, { error: "invalid JSON" });
       return;
     }
-    if (typeof obj !== "object" || obj === null || typeof (obj as { type?: unknown }).type !== "string") {
-      sendJson(res, 400, { error: "object must have a string `type`" });
-      return;
-    }
+
     // E7 per-actor push quota: key on the object's signer, else the remote address.
-    const actor = attributedActor(obj as AnyObject);
-    const rlKey = actor ? `actor:${actor}` : `addr:${req.socket.remoteAddress ?? "?"}`;
+    const rlKey = rateLimitKey(obj, req);
     if (!ops.allow(rlKey)) {
       metrics.inc("hub.ratelimited");
+      res.setHeader("retry-after", String(ops.retryAfterSeconds(rlKey)));
       sendJson(res, 429, { error: "rate limit exceeded" });
       return;
     }
-    // Authorize the push (E2). On a gated hub EVERY mutating governance object is
-    // checked. A `redaction` is checked ALWAYS — even on an ungated hub (E3): it
-    // overwrites blob bytes irrecoverably, so an unauthenticated redaction is a
-    // data-destruction DoS. authorizePush requires an admin-signed redaction; an open
-    // hub with no admin membership therefore rejects all redactions (no DoS) rather
-    // than the old trust-all behavior.
-    const isRedaction = (obj as AnyObject).type === "redaction";
-    if (gated || isRedaction) {
-      const auth = await authorizePush(store, obj as AnyObject);
-      if (!auth.ok) {
-        sendJson(res, 403, { error: auth.reason });
+    const v = await ingestObject(store, obj, gated, ops);
+    if (v.status === "invalid") { sendJson(res, 400, { error: v.reason }); return; }
+    if (v.status === "rejected") { sendJson(res, 403, { error: v.reason }); return; }
+    sendJson(res, 200, { oid: v.oid });
+    return;
+  }
+
+  // POST /objects/batch → store MANY objects in one signed request, with a per-oid verdict
+  // for each (issue #99). The delta is negotiated exactly as before (GET /have), so this is
+  // the bundle-shaped stream that follows the negotiation instead of N separate POSTs.
+  //
+  // The verdicts are the load-bearing part, not the transfer: the per-object loop
+  // distinguished 401 (transport auth → the client must abort) from 403 (this hub refuses
+  // this object → count it and keep going), and the client's push ledger — what `undo` must
+  // refuse to touch — is built from exactly the accepted operations. So a per-object refusal
+  // is reported IN the 200 response, positionally, and never fails the request.
+  if (method === "POST" && path === "/objects/batch") {
+    let raw: string;
+    try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    // Signed identically to POST /objects, over this request's own path and body.
+    if (!(await enforceTransportAuth(auth, req, res, "POST", "/objects/batch", raw, metrics))) return;
+    let body: unknown;
+    try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
+    const objects = (body as { objects?: unknown } | null)?.objects;
+    if (!Array.isArray(objects)) { sendJson(res, 400, { error: "batch requires { objects: [...] }" }); return; }
+    if (objects.length > MAX_BATCH_OBJECTS) { sendJson(res, 413, { error: `batch exceeds ${MAX_BATCH_OBJECTS} objects` }); return; }
+    // E7 quota, once per distinct actor in the batch rather than once per object: a
+    // content-addressed, deduplicated, idempotent write is not an expensive mutation, and
+    // charging per object is what made the limiter a throughput ceiling in the first place.
+    const keys = new Set(objects.map((o) => rateLimitKey(o, req)));
+    for (const k of keys) {
+      if (!ops.allow(k)) {
+        metrics.inc("hub.ratelimited");
+        res.setHeader("retry-after", String(ops.retryAfterSeconds(k)));
+        sendJson(res, 429, { error: "rate limit exceeded" });
         return;
       }
     }
-    // Phase 14: integration objects are queue-authored only — reject even on an
-    // ungated hub (a pushed one would forge queue history at its content address).
-    if ((obj as AnyObject).type === "integration") {
-      sendJson(res, 403, { error: "integration objects are authored by the integration queue; they cannot be pushed" });
-      return;
+    const results: { oid: string | null; status: "stored" | "rejected"; reason?: string }[] = [];
+    for (const o of objects) {
+      const v = await ingestObject(store, o, gated, ops);
+      if (v.status === "stored") results.push({ oid: v.oid, status: "stored" });
+      // `invalid` and `rejected` are both "this hub did not take it": a batch reports them
+      // per oid so the rest of the chunk still lands, where a single POST answers 400/403.
+      else results.push({ oid: oidOf(o), status: "rejected", reason: v.reason });
     }
-    // put() recomputes the oid from content, so a forged/incorrect inbound oid cannot
-    // poison the store — it lands at its true content address (or is a no-op if present).
-    const oid = await store.put(obj as AnyObject);
-    // A pushed (now admin-authorized) redaction evicts the hub's own copy of the blob.
-    // Serialize the read-modify-write under a cross-process lock (E3): the scan +
-    // overwriteAt over shared blob files must not interleave with a concurrent push or
-    // a puller's applyRedactions, or two redactions could race on the same blob.
-    if (isRedaction) {
-      await store.withLock("redactions", async () => {
-        const { applyRedactions } = await import("../store/applyRedactions.ts");
-        await applyRedactions(store);
-      });
+    metrics.inc("hub.batch.objects", objects.length);
+    sendJson(res, 200, { results });
+    return;
+  }
+
+  // POST /objects/fetch → return MANY objects for one wanted-oid list (issue #99), the read
+  // half of the same fix: `clone` used to make one GET per object (12,059 of them, ten
+  // minutes against a hub on localhost). POST rather than GET because a wanted set of
+  // hundreds of oids does not fit in a URL; read-public like GET /objects/:oid, and oids the
+  // hub does not hold are simply absent from the response (a raced eviction is not an error).
+  //
+  // The hub bounds its OWN response size and says `truncated` when it stopped early, so a
+  // client cannot make it materialize an unbounded payload by asking for everything at once.
+  if (method === "POST" && path === "/objects/fetch") {
+    let raw: string;
+    try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    let body: unknown;
+    try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
+    const asked = (body as { oids?: unknown } | null)?.oids;
+    if (!Array.isArray(asked)) { sendJson(res, 400, { error: "fetch requires { oids: [...] }" }); return; }
+    if (asked.length > MAX_FETCH_OIDS) { sendJson(res, 413, { error: `fetch exceeds ${MAX_FETCH_OIDS} oids` }); return; }
+    const objects: AnyObject[] = [];
+    let bytes = 0;
+    let truncated = false;
+    for (const oid of asked) {
+      if (typeof oid !== "string" || !oid) continue;
+      if (!(await store.has(oid))) continue;
+      const obj = await store.get(oid);
+      bytes += JSON.stringify(obj).length;
+      objects.push(obj);
+      if (bytes >= MAX_FETCH_BYTES) { truncated = true; break; }
     }
-    await ops.audit({ action: "put", type: (obj as AnyObject).type, oid, actor }); // E7 provenance
-    ops.events.wake(); // Phase 15.1: a new object (or re-put) is exactly what waiters wait for
-    sendJson(res, 200, { oid });
+    metrics.inc("hub.fetch.objects", objects.length);
+    sendJson(res, 200, { objects, truncated });
     return;
   }
 
@@ -561,7 +701,7 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 403, { error: "finalize not signed by the claimed member" });
       return;
     }
-    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
+    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); res.setHeader("retry-after", String(ops.retryAfterSeconds(`actor:${by}`))); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
     const { Repo } = await import("../api/repo.ts");
     const repo = await Repo.open(repoDir);
     const result = await repo.finalize({ view, newCheckpoint, parentHead, by });
@@ -595,7 +735,7 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
       sendJson(res, 403, { error: "integrate not signed by the claimed member" });
       return;
     }
-    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
+    if (!ops.allow(`actor:${by}`)) { metrics.inc("hub.ratelimited"); res.setHeader("retry-after", String(ops.retryAfterSeconds(`actor:${by}`))); sendJson(res, 429, { error: "rate limit exceeded" }); return; }
     if (!(await store.has(checkpoint))) {
       sendJson(res, 422, { verdict: "rejected", reason: `checkpoint ${checkpoint} not on the hub — push it first` });
       return;
