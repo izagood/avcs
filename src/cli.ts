@@ -19,7 +19,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
-import { Repo, type GitMode } from "./api/repo.ts";
+import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
+import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import type { Operation, Actor } from "./objects/types.ts";
@@ -541,6 +542,13 @@ async function settleGitAfterPurge(repo: Repo, ops: string[], noGit: boolean): P
   for (const r of plan.remedy) console.log(r);
 }
 
+/** Surface machine-keystore notices (issue #98: a key adopted out of a checkout, or two
+ *  keys for one actor). stderr, because they are asides to whatever the user actually ran —
+ *  a `key ls` piped into a script must not grow lines. Never contains key material. */
+function printKeystoreNotices(repo: Repo): void {
+  for (const n of repo.keystoreNotices) console.error(`avcs: ${n}`);
+}
+
 async function main(): Promise<void> {
   switch (cmd) {
     case "version": {
@@ -640,20 +648,56 @@ async function main(): Promise<void> {
       if (sub === "provision") {
         const id = args[2];
         if (!id) throw new Error("usage: avcs key provision <actor-id> [--kind human|ai_agent|ci_bot]");
-        const kind = (flag("--kind") ?? (id.startsWith("human:") ? "human" : id.startsWith("ci:") ? "ci_bot" : "ai_agent")) as Actor["kind"];
+        const kind = (flag("--kind") ?? kindOfActorId(id)) as Actor["kind"];
         const r = await repo.ensureOwnerKey({ kind, id });
-        console.log(r.created ? `provisioned signing key for ${id}` : `${id} already has a local signing key (unchanged)`);
+        // The key goes to the MACHINE keystore (issue #98) — an identity belongs to a person
+        // and a box, not to a checkout — so name the path rather than leave the user guessing
+        // which of their repos now holds a credential.
+        console.log(
+          r.created
+            ? `provisioned signing key for ${id} in the machine keystore (${machineKeyPath(id)})\n  every repo on this machine can now sign as ${id}`
+            : `${id} already has a local signing key (unchanged); this repo now trusts it`,
+        );
+        printKeystoreNotices(repo);
+        break;
+      }
+      if (sub === "import") {
+        // The normal way to put an existing identity on a NEW machine: `clone --key` is the
+        // escape hatch for one repo, this is the machine-wide adoption (issue #98).
+        const src = args[2];
+        if (!src) throw new Error("usage: avcs key import <repo-dir | key-file> [--as <actor-id>] [--repo]");
+        const scope = args.includes("--repo") ? "repo" : "machine";
+        const id = await repo.importLocalKey(src, flag("--as"), { scope });
+        console.log(
+          scope === "machine"
+            ? `imported signing key for ${id} into the machine keystore (${machineKeyPath(id)})`
+            : `imported signing key for ${id} into this repo only`,
+        );
+        printKeystoreNotices(repo);
         break;
       }
       if (sub === "ls" || sub === undefined) {
-        const [local, trusted] = await Promise.all([repo.listLocalKeys(), repo.listTrustedKeys()]);
+        const [local, trusted] = await Promise.all([repo.listLocalKeySources(), repo.listTrustedKeys()]);
+        // Two keystores now, so the listing has to say WHICH — "signable on this machine" and
+        // "signable only in this checkout" are different facts, and a user with a repo-local
+        // override needs to see that it is shadowing their machine identity.
         console.log(`signable on this machine (${local.length}):`);
-        for (const a of local) console.log(`  ${a}`);
+        for (const k of local) {
+          const where =
+            k.source === "machine"
+              ? "machine keystore"
+              : k.shadowed
+                ? "this repo's override — shadows the machine key for this actor"
+                : "this repo only — not in the machine keystore";
+          console.log(`  ${k.actorId}  (${where})`);
+        }
+        console.log(`  keystore: ${machineKeystoreDir()}`);
         console.log(`trusted by this repo (${trusted.length}):`);
         for (const a of trusted) console.log(`  ${a}`);
+        printKeystoreNotices(repo);
         break;
       }
-      throw new Error(`unknown key subcommand: ${sub} — use \`avcs key provision <actor-id>\` or \`avcs key ls\``);
+      throw new Error(`unknown key subcommand: ${sub} — use \`avcs key provision <actor-id>\`, \`avcs key import <src>\` or \`avcs key ls\``);
     }
     case "conflicts": {
       const repo = await Repo.open(cwd);
@@ -739,22 +783,35 @@ async function main(): Promise<void> {
     case "clone": {
       const url = args[1];
       const dir = args[2] ?? cwd;
-      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir] [--key <repo-dir|key-file>] [--as <actor-id>]");
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir] [--as <actor-id>] [--key <repo-dir|key-file>]\n  (no --key needed when this machine holds a signing key — see `avcs key ls`)");
       const repo = await Repo.init(dir);
-      // A hub that gates reads refuses an unsigned GET /have, and a just-created repo holds
-      // no key to sign it with (issue #58). `--key` brings one in from an existing repo dir
-      // or a key file; it is adopted into the new repo first, so later syncs work too.
+      // A hub that gates reads refuses an unsigned GET /have. Since #98 the MACHINE holds the
+      // identity, so a fresh repo can sign its first read with no flag at all — which is what
+      // dissolved #58's chicken-and-egg rather than working around it. `--key` remains as the
+      // escape hatch: a machine that does not hold the identity yet, or a repo that must sign
+      // as someone else. `avcs key import` is the machine-wide equivalent.
       const keySrc = flag("--key") ?? process.env.AVCS_KEY;
       const as = flag("--as");
       let signer: string | undefined = as;
       if (keySrc) signer = await repo.importLocalKey(keySrc, as);
+      const explicitIdentity = Boolean(as ?? keySrc);
+      signer ??= await repo.localActorId();
+      // `localActorId` resolves AVCS_ACTOR / config.json even when no key is held, and
+      // `pullHub` then sends the request unsigned. Report what actually happened rather than
+      // what was asked for — "[signing as X]" over an unsigned request sends a 401 hunt in
+      // the wrong direction.
+      const canSign = signer ? Boolean(await repo.loadLocalKey(signer)) : false;
       const r = await repo.pullHub(url, signer ? { as: signer } : undefined);
       // Phase 13.1: remember where we came from — `avcs sync` now works with no URL.
       await repo.addRemote("origin", url);
       console.log(
         `cloned ${r.pulled} object(s) from ${url} into ${dir}  [remote origin recorded]` +
-          (signer ? `  [signing as ${signer}]` : ""),
+          (canSign ? `  [signing as ${signer}]` : ""),
       );
+      if (explicitIdentity && !canSign) {
+        console.error(`avcs: no private key held for ${signer ?? "the requested actor"} — the clone was sent UNSIGNED (see \`avcs key ls\`)`);
+      }
+      printKeystoreNotices(repo);
       break;
     }
     case "remote": {
@@ -1583,7 +1640,8 @@ async function main(): Promise<void> {
         "avcs <command>\n\n" +
           "  init [dir] [--mode m]       create a repo (--mode sidecar|committed, default sidecar)\n" +
           "  status [view]               operation/conflict summary\n" +
-          "  key provision <actor-id> | key ls   local signing keys (decisions, hub writes)\n" +
+          "  key provision <actor-id> | key import <src> | key ls\n" +
+          "                              machine-level signing identity (~/.avcs/private; decisions, hub writes)\n" +
           "  conflicts [view] [--workspace w]  list decisions a human owes (defaults to this branch's scope)\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run] [--shared]   reclaim orphan blobs + expired quarantine ops (--shared: unused build caches)\n" +

@@ -51,7 +51,8 @@ MVP에서 가장 중요한 건 semantic merge를 완벽히 만드는 게 **아�
 - **RepairContext** (`src/validation/repair.ts`): 실패 시 전체 repo 재독 대신 최소 수리 패킷(실패 출력 + 관련 decision + 지시)
 - **WorkLease** (`src/concurrency/lease.ts`): 작업 시작 단계의 soft 충돌 예방. file scope가 그 안의 symbol scope를 덮음
 - MCP: `lease.request` · `validate.run` · `repair.context` 추가
-- 후속: MCP `resources`(ContextPack)/`prompts`(skill 템플릿), 개인키 보관소
+- 후속: MCP `resources`(ContextPack)/`prompts`(skill 템플릿)
+- ~~개인키 보관소~~ → **완료**: 머신 레벨 keystore(`~/.avcs/private`, 0600/0700). identity 는 체크아웃이 아니라 사람+머신에 속한다. 경로 해석·우선순위(repo override → machine)·마이그레이션은 [12 §개인키 보관소](12-local-production.md#개인키-보관소-machine-level-keystore) (issue #98)
 
 ## Phase 4 — 의미 충돌 & 결정 메모리 ✅
 - ~~**계약 분석** (`src/semantic/contract.ts`): exported 함수 시그니처 추출 + 참조 탐지. **선언 안 한** 계약 변경(시그니처 drift)을 호출부와 함께 잡아 L3로 자동 escalate — text 충돌이 없어도. `api_compat=pass` 증거가 있으면 면제~~ → **docs/15에서 삭제됨**(언어별 시그니처 정규식 = 언어 결합). **미선언 계약 변경 탐지는 현재 코어에 없다.** 남은 방어선은 선언 effects(`breaksPublicApi`)와 evidence 게이트(`api_compat` EvidenceKind는 유지)뿐이며, 이 갭은 docs/15 §10.4 **H2**로 기록돼 있다

@@ -115,6 +115,21 @@ avcs conflicts    # decisions a human still owes
 avcs log          # operation history
 ```
 
+### Signing identity
+
+An avcs identity belongs to you and this machine, not to one checkout — the same scope as
+`~/.ssh` or `~/.gnupg`. Provision it once and every repo on the box can sign with it:
+
+```bash
+avcs key provision human:you    # writes ~/.avcs/private/human:you.json (0600, dir 0700)
+avcs key ls                     # who this machine can sign as, and which keystore each came from
+avcs key import <key-file>      # put an existing identity on a NEW machine
+```
+
+The keystore is `$AVCS_CONFIG_HOME`, else `$XDG_CONFIG_HOME/avcs`, else `~/.avcs`. A repo may
+keep its own key in `<store>/private/` to sign as a *different* actor (a CI checkout, a second
+identity); that override is read first. See [12 — Local production](docs/12-local-production.md#개인키-보관소-machine-level-keystore).
+
 ### Connect agents (MCP)
 
 Agents drive AVCS through its MCP server. Once `avcs` is installed, register it with the Claude Code CLI:
@@ -241,6 +256,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/release/sbom.ts` | SBOM generation (Phase 6) |
 | `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
+| `src/api/keystore.ts` | Machine-level private keystore (`~/.avcs/private`) |
 | `src/mcp/server.ts` | Agent-facing MCP interface (36 tools) |
 | `src/cli.ts` | Human-facing inspection/release CLI |
 | `src/demo.ts` | End-to-end scenario |

@@ -76,7 +76,7 @@
   "scripts": {
     "avcs": "node --experimental-strip-types src/cli.ts",
     "demo": "node --experimental-strip-types src/demo.ts",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test": "node --experimental-strip-types --import ./test/_isolate-keystore.ts --test test/*.test.ts",
     "mcp": "node --experimental-strip-types src/mcp/server.ts",
     "typecheck": "tsc --noEmit",
     "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
