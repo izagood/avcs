@@ -28,6 +28,9 @@ export { defaultPolicy, evaluateOp, MATERIALIZER_VERSION } from "./reducer/polic
 // Object storage + integrity
 export { ObjectStore, CorruptObjectError } from "./store/objectStore.ts";
 export type { FsckReport } from "./store/objectStore.ts";
+// Raised when an `undo --purge` tombstone would be treated as file content (issue #97) —
+// exported for the same reason CorruptObjectError is: a caller has to be able to catch it.
+export { PurgedBlobError } from "./store/applyRedactions.ts";
 
 // Hub (server + client) — the replication / trust boundary avcshub productionizes
 export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
