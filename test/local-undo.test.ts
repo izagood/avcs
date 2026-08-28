@@ -248,3 +248,33 @@ test("avcs undo needs a target", () => {
   assert.match(r.stderr, /name the op oids, or pass --last/);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("a later op carrying the secret forward keeps it in the tree — undo both, and --purge says so", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  await writeFile(join(dir, ".env"), SECRET, "utf8");
+  const c1 = await repo.commitWorkingTree(dir, { message: "leak", actor: dev });
+  await writeFile(join(dir, ".env"), SECRET + "PORT=3000\n", "utf8");
+  const c2 = await repo.commitWorkingTree(dir, { message: "add port", actor: dev });
+
+  // Undoing only the op that INTRODUCED the secret is not enough: the later edit's own
+  // content still carries it, and that op is still selected.
+  const partial = await repo.undo({ ops: c1.ops, purge: true, by: dev.id });
+  assert.deepEqual(partial.purged, [], "nothing evicted — the later edit needs it as its base");
+  assert.equal(partial.retained.length, 1, "and --purge reports that it kept it");
+  const mid = await repo.materialize();
+  assert.ok(mid.tree.has(".env"));
+  assert.match((await repo.materializedFiles(mid)).find((f) => f.path === ".env")!.content, /SUPERSECRET123/);
+
+  // Naming EVERY op that carries the content does the job: with both in the target set,
+  // neither protects the other's blob any more. Naming only the later one would leave the
+  // earlier blob alive — purge is relative to the target set, deliberately and visibly.
+  assert.deepEqual((await repo.undo({ ops: c2.ops, purge: true, by: dev.id })).purged.length, 1);
+  const full = await repo.undo({ ops: [...c1.ops, ...c2.ops], purge: true, by: dev.id });
+  assert.equal(full.purged.length, 1, "the earlier blob, now that nothing else claims it");
+  assert.ok(!(await repo.materialize()).tree.has(".env"));
+  for (const b of [...full.purged, ...partial.retained]) {
+    assert.doesNotMatch((await repo.readBlob(b)).toString("utf8"), /SUPERSECRET123/, "every copy is gone");
+  }
+  await rm(dir, { recursive: true, force: true });
+});
