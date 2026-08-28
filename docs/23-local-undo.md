@@ -173,6 +173,11 @@ interface Undo extends BaseObject {
 
 조회: `repo.listUndos()`(오래된 순), 또는 `repo.store.collect("undo")`.
 
+hub에 대해서는 `blob`/`intent`/`session`/`checkpoint`와 같은 부류의 **inert content**다 —
+`hubServer`의 per-type push 인가에서 `default: allow`에 해당하고, 어떤 replica의 환원도 바꾸지
+않는다. 이후에 sync하면 다른 객체처럼 따라 나가지만, 이 undo가 제외한 op들은 애초에 push된 적이
+없으므로(§5) 설명해야 할 대상이 저쪽에는 없다.
+
 reducer에는 **inert**하다. checkpoint처럼 트리에 projection되지 않는다. projection을 실제로 바꾸는
 것은 undo가 함께 저작한 **새 view 객체**(`viewOid`)다. 즉 undo도 append-only다 — view를 수정하지
 않고 새로 쓴다.
