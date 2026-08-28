@@ -336,7 +336,12 @@ test("--purge also scrubs the derived copies: a persisted snapshot holds merged 
 /** A git repo with the avcs bridge hooks installed, so `git commit` ingests into AVCS. */
 async function bridged(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "avcs-undo-git-"));
-  git(dir, "init", "-q", ".");
+  // `-b main` pins the branch name instead of inheriting it. `git init` takes the default
+  // from `init.defaultBranch`, which is a machine setting: a dev box that set it to `main`
+  // and a CI runner that never set it produce `main` and `master` respectively. The
+  // assertions below quote the branch name back, so without this the suite passes locally
+  // and fails in CI on a difference that has nothing to do with the behaviour under test.
+  git(dir, "init", "-q", "-b", "main", ".");
   git(dir, "config", "user.email", "t@example.com");
   git(dir, "config", "user.name", "Tester");
   avcs(dir, "init", ".");
