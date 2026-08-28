@@ -19,6 +19,24 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Added — local `undo` ([docs/23](docs/23-local-undo.md), issue #91). New object type
+`"undo"`, new optional `Blob.undoOid`. Additive: existing stores open unchanged.**
+
+- `avcs undo [--last | <op-oid>…] [--purge]` / `repo.undo(...)`. Without `--purge` it only
+  grows the view's `excludeOps` (reversible); with `--purge` it also evicts the blob bytes
+  the named ops *uniquely* reference — same mechanism as `redact`, same preserved oid.
+- **Refuses ops that have already been pushed**, naming `redact` as the answer for that
+  case. `redact`'s admin gate is untouched: `undo` never operates on replicated history, so
+  it needs no role. New per-replica aux file `.avcs/pushed-ops.json` (op oid → hub URLs),
+  written by `pushToHub`; not gossiped.
+- Recorded as a first-class `Undo` object (`repo.listUndos()`), alongside the NEW `view`
+  object the exclusion authors — the act is append-only in both halves.
+- **Determinism unchanged.** Excluding ops is an already-supported reduce input, so
+  `MATERIALIZER_VERSION` / `MERGE3_VERSION` are NOT bumped. Verified under
+  `AVCS_VERIFY_INCREMENTAL=1`.
+- **Migration: none.** A store written before this version has no `undo` objects and no
+  ledger; both are created lazily on first use.
+
 **Fixed (determinism) — the signature trust gate no longer keys on local state.
 New optional `Policy` fields `requireSignedEvidence` / `requireSignedDecisions`.**
 
