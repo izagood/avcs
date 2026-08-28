@@ -7,6 +7,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/api/repo.ts";
@@ -15,6 +18,9 @@ import { pushToHub } from "../src/hub/hubClient.ts";
 import type { Actor, Operation } from "../src/objects/types.ts";
 
 const dev: Actor = { kind: "human", id: "human:dev" };
+const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const avcs = (cwd: string, ...a: string[]): string =>
+  execFileSync(process.execPath, ["--experimental-strip-types", CLI, ...a], { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
 const SECRET = "AWS_SECRET_ACCESS_KEY=SUPERSECRET123\n";
 
 /** The issue's repro: one legitimate commit, then one that slipped `.env` in. */
@@ -206,4 +212,39 @@ test("--last and explicit oids are mutually exclusive", async () => {
   const { dir, repo, bad } = await repoWithLeak();
   await assert.rejects(() => repo.undo({ last: true, ops: bad, by: dev.id }), /either --last or explicit op oids/);
   await rm(dir, { recursive: true, force: true });
+});
+
+test("avcs undo --last --purge: the whole repro from the command line", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  await writeFile(join(dir, "app.ts"), "export const v = 1\n", "utf8");
+  avcs(dir, "commit", "-m", "ok");
+  await writeFile(join(dir, ".env"), SECRET, "utf8");
+  avcs(dir, "commit", "-m", "wip");
+  const leaked = (await repo.materialize()).tree.get(".env") as string;
+  assert.match((await repo.readBlob(leaked)).toString("utf8"), /SUPERSECRET123/);
+
+  const out = avcs(dir, "undo", "--last", "--purge", "--reason", "committed .env by mistake");
+  assert.match(out, /purged 1 blob/);
+
+  // Re-open: the CLI ran in another process, so this process's warm caches know nothing.
+  const fresh = await Repo.open(dir);
+  assert.doesNotMatch((await fresh.readBlob(leaked)).toString("utf8"), /SUPERSECRET123/, "bytes evicted");
+  assert.ok(!(await fresh.materialize()).tree.has(".env"));
+  assert.ok((await fresh.materialize()).tree.has("app.ts"), "the earlier commit survives");
+  assert.equal((await fresh.listUndos()).length, 1, "the CLI path records the undo too");
+  assert.equal((await fresh.listUndos())[0]?.reason, "committed .env by mistake");
+
+  // `--reason <text>` must not be mistaken for an op oid.
+  assert.match(avcs(dir, "undo", "--last", "--reason", "nope"), /undid 1 op/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("avcs undo needs a target", () => {
+  const dir = mkdtempSync(join(tmpdir(), "avcs-undo-"));
+  avcs(dir, "init");
+  const r = spawnSync(process.execPath, ["--experimental-strip-types", CLI, "undo"], { cwd: dir, encoding: "utf8" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /name the op oids, or pass --last/);
+  rmSync(dir, { recursive: true, force: true });
 });

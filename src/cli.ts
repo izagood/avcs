@@ -738,6 +738,39 @@ async function main(): Promise<void> {
       console.log(`committed ${r.ops.length} change(s) into ${scopeLabel(scope)} as "${message}"`);
       break;
     }
+    case "undo": {
+      // `avcs undo [--last | <op-oid>…] [--purge]` — the pre-share escape hatch (issue #91).
+      // Same branch → scope mapping as `commit`, so `--last` names the commit this branch
+      // just made rather than whatever the base view happens to hold.
+      const repo = await Repo.open(cwd);
+      const VALUED = new Set(["--reason", "--author", "--line"]);
+      const oids: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const a = args[i] as string;
+        if (a.startsWith("--")) { if (VALUED.has(a)) i++; continue; }
+        oids.push(a);
+      }
+      const scope = await scopeFor(repo, cwd, flag("--line"));
+      const r = await repo.undo({
+        ...(args.includes("--last") ? { last: true } : { ops: oids }),
+        ...(scope.line ? { view: scope.line } : {}),
+        ...(scope.workspace ? { workspace: scope.workspace } : {}),
+        purge: args.includes("--purge"),
+        by: flag("--author") ?? "human:cli",
+        ...(flag("--reason") ? { reason: flag("--reason") as string } : {}),
+      });
+      if (!r.excluded.length && !r.purged.length) {
+        console.log(`nothing to undo — ${r.alreadyExcluded.length} op(s) were already undone in ${scopeLabel(scope)}`);
+        break;
+      }
+      console.log(`undid ${r.excluded.length} op(s) in ${scopeLabel(scope)}`);
+      for (const o of r.excluded) console.log(`  - ${o}`);
+      if (r.purged.length) console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
+      if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
+      if (!args.includes("--purge")) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
+      console.log(`recorded as ${r.undoOid}`);
+      break;
+    }
     case "worktree": {
       const sub = args[1];
       const pointer = join(cwd, ".avcs");
@@ -1291,6 +1324,9 @@ async function main(): Promise<void> {
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
+          "  undo [--last | <op-oid>…] [--purge] [--reason r]  drop local ops from the view;\n" +
+          "                              --purge also evicts the bytes they uniquely reference (irreversible).\n" +
+          "                              Refuses once the ops have been pushed — that case is `redact` (admin)\n" +
           "  git-sync -m <msg> [--commit]   capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
           "  git-mode [sidecar|committed]   show/set how AVCS history relates to git\n" +
           "  verify-git [<commit>]       check a git commit is a faithful projection of its AVCS checkpoint\n" +
