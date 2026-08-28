@@ -121,8 +121,13 @@ test("redaction also scrubs the derived copies: a persisted snapshot holds merge
   const snap = join(dir, ".avcs", "snapshot", "main.cbor");
   const synth = async (): Promise<Buffer[] | null> => {
     if (!existsSync(snap)) return null;
-    const raw = decodeCbor(await readFile(snap)) as { snapshot: { result: { synthBlobs: [string, Record<string, number>][] } } };
-    return raw.snapshot.result.synthBlobs.map(([, b]) => Buffer.from(Object.values(b)));
+    // Synth blob bytes travel as base64 since #101: the CBOR encoder has no byte-string type,
+    // so before that they were written as an index→byte map — the shape this helper used to
+    // decode, and the artefact of the bug itself. base64 is an ENCODING, not protection: the
+    // plaintext is still recoverable from the snapshot, which is exactly why the scrub below
+    // still has to reach it.
+    const raw = decodeCbor(await readFile(snap)) as { snapshot: { result: { synthBlobs: [string, string][] } } };
+    return raw.snapshot.result.synthBlobs.map(([, b64]) => Buffer.from(b64, "base64"));
   };
   assert.ok((await synth())?.some((b) => b.includes("AKIA_leaked")), "the hazard: merged plaintext on disk");
 

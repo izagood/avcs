@@ -885,11 +885,29 @@ type Entries<V> = [string, V][];
 const mapToEntries = <V>(m: Map<string, V>): Entries<V> => [...m];
 const entriesToMap = <V>(e: Entries<V>): Map<string, V> => new Map(e);
 
+/**
+ * Snapshot serialization format (issue #101). Bumped whenever the ON-DISK shape changes.
+ *
+ * `#loadPersistedSnapshot` validates `materializerVersion` and `policyOid`, and neither
+ * moves when only the serialization changes — so v1 snapshots (which stored synth blob
+ * BYTES in a form the CBOR encoder could not represent) were read back rather than
+ * discarded. Checking this version is what makes a bad snapshot self-healing: the load
+ * throws, the caller falls back to a full reduce, and nobody has to find and delete a
+ * cache file by hand.
+ */
+const SNAPSHOT_FORMAT = 2;
+
+/** Synth blob bytes travel as base64: the CBOR encoder has no byte-string type. */
+const bytesToEntries = (m: Map<string, Buffer>): Entries<string> =>
+  [...m].map(([oid, b]) => [oid, b.toString("base64")]);
+const entriesToBytes = (e: Entries<string>): Map<string, Buffer> =>
+  new Map(e.map(([oid, b64]) => [oid, Buffer.from(b64, "base64")]));
+
 export function serializeSnapshot(snap: ReduceSnapshot): unknown {
   const inp = snap.input;
   const r = snap.result;
   return {
-    v: 1,
+    v: SNAPSHOT_FORMAT,
     input: {
       ops: inp.ops.map((o) => o.oid as string),
       decisions: inp.decisions.map((d) => d.oid as string),
@@ -907,7 +925,7 @@ export function serializeSnapshot(snap: ReduceSnapshot): unknown {
       autoDecisions: r.autoDecisions,
       fileConflicts: r.fileConflicts,
       headOps: r.headOps,
-      synthBlobs: mapToEntries(r.synthBlobs),
+      synthBlobs: bytesToEntries(r.synthBlobs),
     },
     perKey: [...snap.perKey].map(([k, d]) => [k, { local: mapToEntries(d.local), conflicts: d.conflicts, autoDecisions: d.autoDecisions }]),
     groupOrder: snap.groupOrder,
@@ -917,6 +935,12 @@ export function serializeSnapshot(snap: ReduceSnapshot): unknown {
 
 export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
   const s = raw as ReturnType<typeof serializeSnapshot> & Record<string, any>;
+  // Refuse any other on-disk shape (issue #101). The caller treats a throw as a cold
+  // start, so an old or unrecognised snapshot costs one full reduce instead of yielding a
+  // structurally wrong result.
+  if (s.v !== SNAPSHOT_FORMAT) {
+    throw new Error(`unsupported reduce snapshot format ${String(s.v)} (expected ${SNAPSHOT_FORMAT})`);
+  }
   const inp = s.input;
   // Stub ops/decisions/evidence: reduceIncremental only reads their `.oid`.
   const stub = (oid: string) => ({ oid }) as unknown as Operation;
@@ -939,7 +963,7 @@ export function deserializeSnapshot(raw: unknown): ReduceSnapshot {
     autoDecisions: r.autoDecisions as AutoDecision[],
     fileConflicts: r.fileConflicts as ReductionResult["fileConflicts"],
     headOps: r.headOps as string[],
-    synthBlobs: entriesToMap(r.synthBlobs as Entries<Buffer>),
+    synthBlobs: entriesToBytes(r.synthBlobs as Entries<string>),
     blockedReasons: entriesToMap((r.blockedReasons ?? []) as Entries<string>),
     untrustedEvidence: (r.untrustedEvidence as number | undefined) ?? 0,
   };

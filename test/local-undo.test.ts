@@ -298,8 +298,13 @@ test("a later op carrying the secret forward keeps it in the tree — undo both,
 async function snapshotBytes(dir: string, view = "main"): Promise<Buffer[] | null> {
   const p = join(dir, ".avcs", "snapshot", `${view}.cbor`);
   if (!existsSync(p)) return null;
-  const raw = decodeCbor(await readFile(p)) as { snapshot: { result: { synthBlobs: [string, Record<string, number>][] } } };
-  return raw.snapshot.result.synthBlobs.map(([, bytes]) => Buffer.from(Object.values(bytes)));
+  // Synth blob bytes travel as base64 since #101: the CBOR encoder has no byte-string type,
+  // so before that they were written as an index→byte map — the shape this helper used to
+  // decode, and the artefact of the bug itself. base64 is an ENCODING, not protection: the
+  // plaintext is still recoverable from the snapshot, which is exactly why the scrub below
+  // still has to reach it.
+  const raw = decodeCbor(await readFile(p)) as { snapshot: { result: { synthBlobs: [string, string][] } } };
+  return raw.snapshot.result.synthBlobs.map(([, b64]) => Buffer.from(b64, "base64"));
 }
 
 test("--purge also scrubs the derived copies: a persisted snapshot holds merged CONTENT", async () => {
