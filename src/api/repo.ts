@@ -1722,6 +1722,9 @@ export class Repo {
     const { redactedStub } = await import("../store/applyRedactions.ts");
     await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
     this.#blobCache.delete(blobOid); // bytes changed under a stable oid — evict the cache
+    // …and the derived copies: a merge result lives as bytes in the compaction snapshot, so
+    // the object-store eviction alone would leave the plaintext readable there.
+    await this.#scrubDerivedCaches();
     this.logger.warn("redact.applied", { blobOid, redactionOid, by, reason, length: original.length });
     return redactionOid;
   }

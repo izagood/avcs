@@ -102,6 +102,21 @@ content-addressing 때문에 **같은 내용은 하나의 blob**이다. 그래�
 store와 `fsck`가 이미 이해하는 "인가된 oid≠content 불일치" 표시다. 다른 것은 출처 포인터뿐:
 `redactionOid` 대신 `undoOid`.
 
+### 4.3 파생 복사본까지 지운다
+
+projection의 내용이 항상 저장된 blob인 것은 아니다. 3-way merge 결과는 reducer가 **바이트로**
+들고 있는 합성 blob(`ReductionResult.synthBlobs`)이고, 그 바이트는 warm reduce 캐시, 메모리
+증분 snapshot, 그리고 프로세스보다 오래 사는 **영속 compaction snapshot
+(`.avcs/snapshot/<view>.cbor`)** 에 들어간다. object store만 축출하면 평문이 그 파일에 그대로
+남는다.
+
+그래서 축출은 `Repo.#scrubDerivedCaches`로 이들을 함께 버린다. 전부 재생성 가능한 캐시이므로
+비용은 full reduce 한 번이고, 읽기 경로는 이 파일에 의존하지 않는다(`#loadPersistedSnapshot`은
+파일이 없으면 cold start로 취급).
+
+> 같은 구멍이 `redact`에도 있었다(Phase 12 이래). 축출 메커니즘이 같으므로 이 PR에서 함께
+> 고쳤다 — admin gate는 건드리지 않는다.
+
 기록 순서는 **먼저 `Undo`를 put하고 그다음 바이트를 축출**한다. 둘 사이에서 죽으면 "지워졌어야
 할 바이트"를 지목하는 기록이 남고, 다시 실행하면 마저 끝난다. 반대 순서였다면 아무도 설명하지
 못하는 축출이 남는다.

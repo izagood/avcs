@@ -37,6 +37,17 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 - **Migration: none.** A store written before this version has no `undo` objects and no
   ledger; both are created lazily on first use.
 
+**Fixed (security) — byte eviction now also scrubs the derived copies of the bytes.**
+
+- A 3-way merge result is a SYNTHETIC blob the reducer carries as bytes, so it is held by the
+  warm reduce cache and — outliving the process — by the persisted compaction snapshot at
+  `.avcs/snapshot/<view>.cbor`. `redact` evicted the stored blob and left those bytes intact,
+  so a redacted secret whose projected content was a merge result stayed readable on disk.
+  Present since Phase 12; found while building `undo --purge`, which had the same gap.
+- Both eviction paths now drop the persisted snapshot and the in-memory reduce/incremental
+  caches. Pure cache invalidation — rebuildable, costing one full reduce; `redact`'s admin
+  gate is unchanged.
+
 **Fixed (determinism) — the signature trust gate no longer keys on local state.
 New optional `Policy` fields `requireSignedEvidence` / `requireSignedDecisions`.**
 
