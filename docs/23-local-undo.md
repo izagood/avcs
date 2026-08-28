@@ -38,14 +38,15 @@ append-only는 **원장**에 대한 원칙이지 모든 바이트의 불멸성�
 ## 2. 명령
 
 ```
-avcs undo [--last | <op-oid>…] [--purge] [--reason <r>] [--author <id>] [--line <l>]
+avcs undo [--last | <op-oid>…] [--purge] [--no-git] [--reason <r>] [--author <id>] [--line <l>]
 ```
 
 | 형태 | 하는 일 | 되돌릴 수 있나 |
 |---|---|---|
 | `avcs undo <oid>…` | 그 op들을 현재 view에서 제외한다 | ✅ op도 바이트도 그대로 남는다 |
 | `avcs undo --last` | 가장 최근 커밋의 op 전부를 제외한다 | ✅ |
-| `avcs undo … --purge` | 추가로, 그 op들이 **유일하게** 참조하는 blob 바이트를 축출한다 | ❌ |
+| `avcs undo … --purge` | 추가로, 그 op들이 **유일하게** 참조하는 blob 바이트를 축출한다. git 브리지 저장소에서는 **그 바이트를 들고 있는 git 커밋까지** 제거한다 — 안전·로컬이 증명될 때만(§3.1) | ❌ |
+| `avcs undo … --purge --no-git` | avcs 쪽만 축출하고 git은 손대지 않는다 | ❌ |
 
 API는 `repo.undo({ ops \| last, view, workspace, purge, by, reason })` → `UndoResult`
 (`{ undoOid, view, excluded, alreadyExcluded, purged, retained }`).
@@ -54,18 +55,18 @@ API는 `repo.undo({ ops \| last, view, workspace, purge, by, reason })` → `Und
 그 경우 필요한 것은 projection에서 빼는 것뿐이다. 바이트를 지우는 쪽은 **따로 이름 붙여** 옵트인
 시킨다 — 되돌릴 수 없는 일은 실수로 일어나면 안 된다.
 
-## 3. 경계: undo ↔ redact ↔ (git은 avcs의 일이 아니다)
+## 3. 경계: undo ↔ redact ↔ git 평면
 
 이 기능의 핵심은 명령이 아니라 **경계**다. 그리고 경계는 둘이 아니라 **셋**이다.
 
 ```
   ① 공유 전 avcs 이력            ② 공유된 avcs 이력            ③ git 쪽 객체
   ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
-  │  avcs undo [--purge]     │  │  repo.redact(blob, …)    │  │  avcs의 일이 아니다        │
-  │  · 역할 요구 없음         │  │  · role admin 필요        │  │  · git reset / rebase     │
-  │  · 서명 없음              │  │  · admin 서명 필수        │  │  · git filter-repo        │
-  │  · 전파 없음              │  │  · 모든 replica에 전파     │  │  · push했다면 호스트 절차  │
-  │  · Undo 객체로 기록       │  │  · Redaction 객체로 기록   │  │  ↳ 사용자가 결정한다       │
+  │  avcs undo [--purge]     │  │  repo.redact(blob, …)    │  │  avcs undo --purge        │
+  │  · 역할 요구 없음         │  │  · role admin 필요        │  │  · 안전·로컬이 증명될 때만 │
+  │  · 서명 없음              │  │  · admin 서명 필수        │  │  · tip 커밋 제거 = reset   │
+  │  · 전파 없음              │  │  · 모든 replica에 전파     │  │  · 그 외에는 전부 거부     │
+  │  · Undo 객체로 기록       │  │  · Redaction 객체로 기록   │  │  · push되면 → 크리덴셜 교체 │
   └──────────────────────────┘  └──────────────────────────┘  └──────────────────────────┘
 ```
 
@@ -78,40 +79,151 @@ API는 `repo.undo({ ops \| last, view, workspace, purge, by, reason })` → `Und
 두 객체를 하나로 합치지 않은 것도 같은 이유다. `Undo`와 `Redaction`이 별개이기 때문에
 `applyRedactions`(전파)는 undo를 절대 집어 들지 않고, hub는 admin 서명 없는 축출을 계속 거부한다.
 
-### 3.1 ③ git 티어 — 축출이 닿지 않는 곳
+### 3.1 ③ git 티어 — `--purge`가 여기까지 끝낸다
 
-git 브리지 모드(docs/14)에서는 같은 파일이 **두 저장소에** 들어간다. `undo --purge`는 avcs
-쪽만 축출한다. git commit 객체는 그대로 남는다:
+git 브리지 모드(docs/14)에서는 같은 파일이 **두 저장소에** 들어간다. v0.34.1까지 `undo --purge`는
+avcs 쪽만 축출하고 git이 들고 있는 사본을 **말로만 지목**했다. 그 설계는 뒤집혔다.
+
+이유는 사용자 쪽에서 보면 분명하다. 방금 크리덴셜을 흘린 사람에게 `bytes evicted, not
+recoverable`은 *처리됐다*로 읽힌다. 그 순간 비밀이 git 객체 안에 그대로 앉아 있으면 그 문장은
+**함정**이고, "이제 `filter-repo`를 직접 돌리세요"는 일 중에서 가장 어려운 부분을 되돌려주는 것이다.
+그래서 `--purge`는 git 쪽까지 끝낸다.
+
+바뀌지 않은 것은 **위험 분석**이다. 그것은 거부가 아니라 **조건**으로 남았다.
 
 ```
 $ avcs undo --last --purge
+undid 1 op(s) in base view
+  - operation_558c1c18…
 purged 1 blob(s) — bytes evicted, not recoverable
+git: removed 1 commit(s) holding those bytes from `main`, and pruned the objects.
+  - 8a81259 oops
+  main is now at 0c46ef4.
+  The working tree is untouched, so the leaked file is still on disk and no longer tracked — fix it before you commit again.
 
-$ grep -rl "GITMODE456SECRET" .avcs/      → 없음                    ✅
-$ git log --all -S "GITMODE456SECRET"     → 8a81259 oops: …          ← 여전히 있다
+$ grep -rl "GITMODE456SECRET" .avcs/      → 없음   ✅
+$ git log --all -S "GITMODE456SECRET"     → 없음   ✅
+$ git cat-file -e 8a81259^{commit}        → 실패   ✅ (도달 불가가 아니라 객체 자체가 사라졌다)
 ```
 
-**이것은 올바른 동작이다.** git 이력을 재작성하는 것은 avcs 명령이 할 일이 아니다 — 올바른
-조치가 push 여부에 따라 달라지므로 그 판단은 사용자의 것이고, avcs가 대신 내려선 안 된다.
+#### 3.1.1 안전 조건 — 전부 성립해야 git을 건드린다
 
-하지만 **침묵은 그보다 나쁘다.** 방금 크리덴셜을 흘린 사람에게 `bytes evicted, not
-recoverable`은 *처리됐다*로 읽히고, 브리지 모드에서 그것은 사실이 아니다. 그래서
-`avcs undo --purge`는 **git이 실제로 있을 때만** 자기가 닿지 못한 곳을 말한다:
+가정하지 않는다. 조건은 **git 자신에게 물어서** 확인한다(`Repo` 코어는 여전히 git을 모른다 —
+판정과 실행은 전부 `src/cli.ts`의 조용한 probe `gitCmd`로 일어난다).
+
+| # | 조건 | 확인 방법 | 위반 시 |
+|---|---|---|---|
+| 1 | git 작업 트리 안이고 커밋이 있다 | `rev-parse --is-inside-work-tree` / `rev-parse HEAD` | 아무 말도 하지 않는다(독립 모드) |
+| 2 | git이 그 경로를 커밋한 적이 있다 | `log --pretty=%H HEAD -- <paths>` | 아무 말도 하지 않는다 |
+| 3 | **어떤 remote-tracking ref에서도 도달 불가** | `for-each-ref refs/remotes` + `rev-list -1 <c> --not <remotes>` | 거부 → **크리덴셜 교체** |
+| 4 | HEAD가 분리(detached)되지 않았다 | `symbolic-ref --quiet --short HEAD` | 거부 → 브랜치를 체크아웃하고 재실행 |
+| 5 | **대상 커밋이 tip이다** (그 위에 아무것도 없다) | `touching[0] === HEAD` | 거부 → `filter-repo` |
+| 6 | 제거해야 할 구간이 first-parent 선형이고 merge가 없다 | `rev-list --first-parent HEAD`, `rev-list --merges --no-walk` | 거부 → `filter-repo` |
+| 7 | **다른 로컬 ref(태그·다른 브랜치·stash)에서 도달 불가** | 우리 브랜치를 뺀 `for-each-ref` 전부에 대해 `rev-list -1 --not` | 거부 → 그 ref를 먼저 정리 |
+| 8 | **구간의 모든 커밋이 undo된 op의 경로만 건드린다** | 커밋별 `log -1 --root --name-only --no-renames -z` | 거부 → `filter-repo` 또는 그 op까지 undo |
+| 9 | **git 트리가 깨끗하다** | `status --porcelain`(untracked·`.avcs/` 제외) | 거부 → 커밋/치우고 재실행 |
+
+조건 8의 "경로만"에는 `.avcs/`가 **포함된다**. committed 모드(§docs/14)에서는 git이 avcs 스토어
+자체를 추적하므로 tip 커밋이 방금 덮어쓴 그 객체의 스냅샷을 들고 있다. 그건 avcs 자신의 부기이고
+사용자의 작업이 아니다.
+
+조건 3은 **§5의 push 원장과 독립**이다. hub에 push되지 않은 op의 git 커밋이 `origin`에 올라가
+있을 수 있고 그 반대도 가능하다. **둘 다** 성립해야 한다 — §5는 `repo.undo`가, 조건 3은 CLI가 막는다.
+
+#### 3.1.2 어떻게 지우는가 — 그리고 작업 트리는 어떻게 남는가
 
 ```
-purged 1 blob(s) — bytes evicted, not recoverable
-note: those bytes are gone from AVCS only — git keeps its own copy of what it committed.
-  git 8a81259 still contains src/config.ts
-  clearing them from git is a separate step, and differs once pushed — avcs will not do it for you
+git reset --mixed <구간의 부모>           # 브랜치와 인덱스만 이동. 작업 트리는 건드리지 않는다
+git update-ref -d ORIG_HEAD              # 방금 reset이 써 둔 되돌림 포인터
+git reflog expire --expire-unreachable=now --all
+git gc --prune=now --quiet
 ```
 
-- 탐지는 이 파일의 다른 곳과 같은 조용한 probe(`gitCmd(cwd, ["rev-parse", "--git-dir"])`)다.
-  **git이 없으면 아무 말도 하지 않는다** — 독립 모드 메시지는 이미 정확하고, 없는 도구에 대한
-  주의를 달아 어지럽히지 않는다(테스트가 이 절반도 함께 고정한다).
-- git이 커밋을 짚어 줄 수 있으면 **그 sha를 이름으로 부른다**(`git log --all -n 1 --pretty=%h
-  -- <path>`). 짚을 수 없으면 단정하지 않고 **조건으로** 말한다("if these files were committed
-  to git, …") — 확인하지 않은 것을 확인한 것처럼 말하지 않는다.
-- **git 명령을 대신 실행해 주겠다고 제안하지 않는다.**
+- **`--mixed`인 이유**: 작업 트리를 손대지 않는다. 유출된 파일은 **디스크에 그대로 남는다.**
+  그게 맞다 — 사용자는 그 파일을 아직 고쳐야 한다. 그리고 이 선택이 두 평면을 **일치**시킨다:
+  git은 그 파일을 untracked(또는 modified)라 하고, avcs view는 그 op을 더 이상 선택하지 않으므로
+  `avcs status`도 새 파일이라 한다. 둘 다 "이 내용은 디스크에 있고 어디에도 기록되지 않았다"고
+  말한다. `checkoutInto`로 트리를 다시 쓰지 **않는다** — 그러면 파일을 지워 문제를 숨기거나
+  사용자의 다른 디스크 상태를 망가뜨릴 수 있다.
+- **`--expire-unreachable`인 이유**: `--expire`는 사용자의 reflog를 통째로 날린다. 여기서 필요한
+  것은 방금 도달 불가가 된 항목뿐이다. 나머지 안전망은 살려 둔다.
+- **도달 불가로 끝내지 않는 이유**: `git log --all`은 reflog를 보지 않으므로 reset만으로도
+  pickaxe는 조용해진다. 하지만 `git reflog`와 `git fsck --lost-found`는 커밋을 그대로 돌려준다.
+  크리덴셜 유출에서 그건 정확히 우리가 고치려던 종류의 함정이다.
+- **구간이 브랜치의 전체 이력이면** (첫 커밋에서 유출) 부모가 없다. 이때는 브랜치 ref를 지우고
+  인덱스를 비워 **unborn 브랜치**로 남긴다. 조건 8이 이미 성립했으므로 그 브랜치가 들고 있던 것은
+  제거를 요청받은 그것뿐이다 — 추가로 잃는 것이 없다.
+- **끝나고 검증한다.** 각 커밋에 `cat-file -e`를 걸어 정말 사라졌는지 확인하고, 남아 있으면
+  단정하지 않고 `WARNING`으로 보고한다 — 확인하지 않은 것을 확인한 것처럼 말하지 않는다.
+
+#### 3.1.3 거부할 때 — 무엇이 남았고 무엇을 하라
+
+거부는 **avcs 쪽을 포기하지 않는다.** 바이트 축출은 이미 끝났고, 남은 것과 그 상황에 정확히 맞는
+명령을 말해 준다.
+
+**push되었다** — 유일한 실질적 조치는 교체다. 이력 재작성은 연극이다.
+
+```
+git: those bytes are in git too, and avcs did NOT remove them — the commit is already on a remote.
+  8a81259 is reachable from origin/main
+  ROTATE THE CREDENTIAL. It is published — anyone who fetched already has it, so rewriting
+  history now is theatre: it cannot un-publish what was already served. avcs will not
+  force-push for you, and there is no flag for it.
+  Cleaning the remote afterwards is your host's procedure, and costs every collaborator a re-clone.
+```
+
+**tip이 아니다** — reset이 아니라 진짜 이력 재작성이고, 그건 다른(더 어려운) 일이다.
+
+```
+git: those bytes are in git too, and avcs did NOT remove them — the commit is not at the tip.
+  8a81259 holds src/config.ts, and 1 later commit(s) sit on top of it
+  Removing it is a genuine history rewrite rather than a reset — a different, harder job:
+    git filter-repo --path src/config.ts --invert-paths
+    (no filter-repo? git filter-branch --index-filter 'git rm --cached --ignore-unmatch src/config.ts' -- --all)
+  Then confirm it worked:  git log --all -S '<the secret>'
+```
+
+**같은 커밋에 다른 작업이 있다** — 통째로 버리면 사용자가 지우라고 하지 않은 것이 함께 사라진다.
+
+```
+git: those bytes are in git too, and avcs did NOT remove them — 8a81259 also carries work you did not undo.
+  it changes lib.ts, which no undone op covers
+  Dropping that commit would drop that work with it, and you did not ask for that.
+  Either undo those ops too and re-run, or rewrite just the leaked path:
+    git filter-repo --path src/config.ts --invert-paths
+    …
+```
+
+**트리가 더럽다** — 커밋되지 않은 작업 아래에서 HEAD를 움직이는 것이 작업을 잃는 방식이다.
+
+```
+git: those bytes are in git too, and avcs did NOT remove them — the git tree is not clean.
+   M app.ts
+  Moving HEAD out from under uncommitted work is how work gets lost, so avcs stops here.
+  Commit those changes or set them aside, then re-run:  avcs undo --purge operation_558c1c18…
+```
+
+**다른 ref가 붙들고 있다** — 우리 브랜치만 움직이면 바이트는 여전히 도달 가능하다. 즉 purge가 아니다.
+
+```
+git: those bytes are in git too, and avcs did NOT remove them — another ref still points into that history.
+  8a81259 is also reachable from refs/tags/keepme
+  Moving `main` alone would leave the bytes reachable, so the purge would not be one.
+  Delete or move that ref yourself, then re-run:  avcs undo --purge operation_558c1c18…
+```
+
+재실행 명령이 **언제나 명시적 oid이고 절대 `--last`가 아닌 것**에 주의하라. undo가 끝난 뒤의
+`--last`는 **다른 커밋**을 가리킨다(§7). `--last`를 다시 돌리라고 안내하면 사용자를 한 커밋 더
+뒤로 걸어가게 만든다. 그리고 그 재실행은 avcs 쪽이 이미 수렴했으므로 git 쪽만 마무리한다 —
+`--purge`의 git 절반은 `purged 0`인 재실행에서도 동작한다.
+
+#### 3.1.4 하지 않는 것
+
+- **remote에 대한 `--force`는 없다.** 플래그로도 없다. push되었다면 답은 교체다.
+- **git이 없으면 아무 말도 하지 않는다.** 독립 모드 출력은 이미 정확하고, 없는 도구에 대한
+  주의로 어지럽히지 않는다(테스트가 이 절반도 같은 무게로 고정한다).
+- **git 절반을 끄고 싶으면 `--no-git`.** avcs 쪽만 축출하고, git이 여전히 사본을 들고 있다는
+  사실과 나중에 avcs에게 맡길 때 쓸 명령을 말해 준다.
 
 ## 4. `--purge`: 무엇이 "유일 참조"인가
 
@@ -285,8 +397,12 @@ capture마다 **session 하나**를 열고 그 capture의 모든 op을 거기에
 바이트가 **사라졌고** 앞선 정상 커밋은 멀쩡하며 트리가 계속 projection된다). 그 외:
 `--purge` 없는 undo(바이트 보존·파일만 사라짐), 여전히 선택된 op과 공유하는 blob은 축출되지 않음,
 남은 edit의 merge base 보호, §4.1의 "뒤 op이 내용을 물고 간" 경우(부분 지목은 `retained`로 보고되고
-전부 지목하면 축출된다), git 브리지 티어(§3.1 — git 저장소에서는 출력이 그 commit을 짚고, 독립
-저장소에서는 git을 **언급하지 않는다**. 뒤 절반도 같은 무게로 고정한다),
+전부 지목하면 축출된다), git 평면(§3.1 — 표제 증명은 `grep -r .avcs/` **와** `git log --all -S`가 **둘 다** 비고 앞선
+정상 커밋은 두 평면에서 살아남는 것이다. 그리고 거부 6종이 각각 "avcs 쪽은 끝났다 + 그 상황에 맞는
+명령을 지목한다"를 함께 고정한다: remote에 push됨→교체, 뒤 커밋에 묻힘→`filter-repo`,
+같은 커밋의 다른 작업, 더러운 트리(+안내된 재실행이 git 절반을 마무리한다), 다른 로컬 ref가 붙듦,
+`--no-git`. 첫 커밋 유출은 unborn 브랜치로 끝난다. **독립 저장소에서는 git을 언급하지 않는다** —
+뒤 절반도 같은 무게로 고정한다),
 push된 op 거부(메시지가 `redact`를 지목), `--last`의 대상 해석과 반복 시
 뒤로 걸어가기, `Undo` 기록 조회, 이미 undo한 것을 다시 undo해도 오류가 아니라 멱등, 그리고 CLI
 경로 전체.
