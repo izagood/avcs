@@ -40,6 +40,9 @@ Local production is "possible" when a normal local workflow
   D5 changes only the materialized content of *unparseable* symbol splices, and
   its equivalence with the old behaviour on parseable input is property-tested.
 - **Append-only**: no stage deletes or mutates an object except the existing
-  redaction/GC exceptions.
+  redaction/GC exceptions — to which [23](23-local-undo.md) adds one more, on the same
+  terms: `undo --purge` evicts blob bytes while preserving the oid, exactly as `redact`
+  does. The *ledger* is untouched either way; the undone ops stay, and both the exclusion
+  and the eviction are recorded as new append-only objects (`view` + `Undo`).
 - **Default-safe**: durability is default-on (correct by default); the only flag
   is the `AVCS_NO_FSYNC` *opt-out* for throughput-bound bulk loads.
