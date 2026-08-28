@@ -498,12 +498,17 @@ function reachableFrom(dir: string, sha: string, from: string[]): boolean {
  */
 function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): void {
   const shorts = plan.commits.map((c) => `${shortSha(dir, c)} ${gitCmd(dir, ["log", "-1", "--pretty=%s", c]) ?? ""}`.trim());
-  if (plan.resetTo) {
-    gitCmd(dir, ["reset", "--mixed", plan.resetTo]);
-  } else {
-    gitCmd(dir, ["update-ref", "-d", `refs/heads/${plan.branch}`]);
-    gitCmd(dir, ["rm", "-r", "--cached", "-q", "--", "."]);
+  // `gitCmd` swallows failures by design (it is a probe), so the ref move — the one step
+  // whose failure would make every line below a lie — is checked rather than assumed.
+  const moved = plan.resetTo
+    ? gitCmd(dir, ["reset", "--mixed", plan.resetTo])
+    : gitCmd(dir, ["update-ref", "-d", `refs/heads/${plan.branch}`]);
+  if (moved === null) {
+    console.log(`git: could NOT move \`${plan.branch}\` off those commits, so git still holds the bytes.`);
+    console.log("  Nothing was pruned. Check `git status` and `git log`, then re-run once git is happy.");
+    return;
   }
+  if (!plan.resetTo) gitCmd(dir, ["rm", "-r", "--cached", "-q", "--", "."]);
   gitCmd(dir, ["update-ref", "-d", "ORIG_HEAD"]);
   gitCmd(dir, ["reflog", "expire", "--expire-unreachable=now", "--all"]);
   gitCmd(dir, ["gc", "--prune=now", "--quiet"]);
