@@ -56,6 +56,7 @@ import type {
   RoleName,
   ScopeRef,
   Session,
+  Undo,
   View,
   ViewQuery,
   WorkLease,
@@ -212,6 +213,25 @@ export interface ContentionWarning {
   /** `line` is populated for an `acrossLines` check, so the caller can name the branch. */
   theirs: { op: string; actor: string; lamport: number; purpose: string; createdAt: string; line?: string }[];
   leaseHolders: { actor: string; leaseOid: string; scope: string; expiresAt: string }[];
+}
+
+/**
+ * What one {@link Repo.undo} call did (issue #91).
+ *
+ * `excluded` is what THIS call dropped from the view; `alreadyExcluded` is what a previous
+ * undo had already dropped — reported rather than refused, so running undo twice converges
+ * instead of erroring. `purged` are the blobs whose bytes were evicted, `retained` the
+ * target blobs a still-selected op keeps alive (content-addressing means identical content
+ * is one blob, so this is the normal, not the exotic, case).
+ */
+export interface UndoResult {
+  /** The authored {@link Undo} record, or null when the call was a no-op. */
+  undoOid: string | null;
+  view: string;
+  excluded: string[];
+  alreadyExcluded: string[];
+  purged: string[];
+  retained: string[];
 }
 
 // Sidecar: ignore EVERYTHING under .avcs/ (the `*` also ignores this file itself), so the
@@ -1704,6 +1724,75 @@ export class Repo {
     this.#blobCache.delete(blobOid); // bytes changed under a stable oid — evict the cache
     this.logger.warn("redact.applied", { blobOid, redactionOid, by, reason, length: original.length });
     return redactionOid;
+  }
+
+
+  // ── local undo (issue #91) ─────────────────────────────────────────────────
+  /**
+   * Undo local ops: drop them from a view's projection, and with `purge` evict the blob
+   * bytes they uniquely reference.
+   *
+   * This is `redact`'s pre-share counterpart, and the split is the whole point. `redact`
+   * is admin-gated because it evicts bytes from a repo other people hold — a governance
+   * act. `undo` refuses the moment the ops have been pushed (see {@link pushedOpOrigins}),
+   * so by construction it only ever operates on history no other holder has. Nothing to
+   * co-ordinate ⇒ nobody's authority to ask for.
+   *
+   * Without `purge` this is fully reversible: the ops and their bytes stay in the store and
+   * only the view's `excludeOps` grows. With `purge` the bytes go, which is why it is opt-in
+   * and separately named. Both are append-only: the exclusion is a NEW view object and the
+   * act itself is recorded as an {@link Undo}.
+   */
+  async undo(args: {
+    /** Ops to undo. */
+    ops?: string[];
+    /** The view (line) to undo on. Default "main". */
+    view?: string;
+    /** Also evict the bytes the undone ops uniquely reference. Irreversible. */
+    purge?: boolean;
+    by: string;
+    reason?: string;
+  }): Promise<UndoResult> {
+    const viewName = args.view ?? "main";
+    const targets = [...(args.ops ?? [])];
+    if (!targets.length) throw new Error("undo: nothing to undo (name the op oids)");
+    for (const oid of targets) {
+      const obj = await this.store.get(oid).catch(() => null);
+      if (obj?.type !== "operation") throw new Error(`undo: not an operation: ${oid}`);
+    }
+    return this.store.withLock(`undo:${viewName}`, async () => {
+      const view = await this.getView(viewName);
+      const already = new Set(view.query.excludeOps ?? []);
+      const fresh = targets.filter((o) => !already.has(o));
+      const alreadyExcluded = targets.filter((o) => already.has(o));
+
+      if (!fresh.length) {
+        return { undoOid: null, view: viewName, excluded: [], alreadyExcluded, purged: [], retained: [] };
+      }
+      const viewOid = await this.createView(
+        viewName,
+        { ...view.query, excludeOps: [...already, ...fresh] },
+        (view.oid as string) ?? null,
+      );
+      const undo: Undo = {
+        type: "undo",
+        view: viewName,
+        ops: fresh,
+        viewOid,
+        ...(args.reason ? { reason: args.reason } : {}),
+        by: args.by,
+        createdAt: new Date().toISOString(),
+      };
+      const undoOid = await this.store.put(undo);
+      this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: 0, by: args.by, reason: args.reason });
+      return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: [], retained: [] };
+    });
+  }
+
+  /** Every recorded local undo, oldest first. */
+  async listUndos(): Promise<Undo[]> {
+    const undos = await this.store.collect<Undo>("undo");
+    return undos.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async #activeWaivers(view: string): Promise<Set<EvidenceKind>> {
