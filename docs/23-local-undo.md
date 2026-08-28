@@ -229,6 +229,7 @@ undo가 새로 들여온 성질이 아니다. "커밋 하나를 통째로 없던
 `test/local-undo.test.ts` — 이슈의 repro가 표제 테스트다(비밀 커밋 → `undo --purge` →
 바이트가 **사라졌고** 앞선 정상 커밋은 멀쩡하며 트리가 계속 projection된다). 그 외:
 `--purge` 없는 undo(바이트 보존·파일만 사라짐), 여전히 선택된 op과 공유하는 blob은 축출되지 않음,
-남은 edit의 merge base 보호, push된 op 거부(메시지가 `redact`를 지목), `--last`의 대상 해석과
-반복 시 뒤로 걸어가기, `Undo` 기록 조회, 이미 undo한 것을 다시 undo해도 오류가 아니라 멱등,
-그리고 CLI 경로 전체.
+남은 edit의 merge base 보호, §4.1의 "뒤 op이 내용을 물고 간" 경우(부분 지목은 `retained`로 보고되고
+전부 지목하면 축출된다), push된 op 거부(메시지가 `redact`를 지목), `--last`의 대상 해석과 반복 시
+뒤로 걸어가기, `Undo` 기록 조회, 이미 undo한 것을 다시 undo해도 오류가 아니라 멱등, 그리고 CLI
+경로 전체.
