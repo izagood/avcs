@@ -19,6 +19,23 @@ export function redactedStub(reason: string, redactionOid: string): Blob {
 }
 
 /**
+ * The same eviction for a LOCAL `undo --purge` (issue #91), with a different provenance
+ * pointer. `redacted` is the flag that marks the sanctioned oid≠content mismatch which the
+ * store and `fsck` already understand, so an undo-purged blob is not reported as bit-rot;
+ * `undoOid` names the {@link Undo} that ordered it. No Redaction exists for such a blob, so
+ * `applyRedactions` below never touches it — an undo is never propagated, by construction.
+ */
+export function purgedStub(reason: string, undoOid: string): Blob {
+  return {
+    type: "blob",
+    data: Buffer.from(`[PURGED: ${reason}]`).toString("base64"),
+    encoding: "base64",
+    redacted: true,
+    undoOid,
+  };
+}
+
+/**
  * Materialize every Redaction's stub AT its blob oid. A redacted blob's content no
  * longer hashes to its oid, so it can't propagate through content-addressed `put`
  * (which would re-address it). Instead the receiver syncs the (tiny) Redaction object

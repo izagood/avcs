@@ -83,6 +83,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 10 — observability:** `blame` (who/why), `logP`, deterministic `bisect`, `diff`
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
+- **Local undo** ([docs/23](docs/23-local-undo.md)) — `avcs undo [--last | <op-oid>…] [--purge]`: drop local ops from the view, and with `--purge` evict the bytes they uniquely reference. Refuses once the ops have been pushed, because that case belongs to admin-gated `redact`. Three tiers, not two: unshared AVCS → `undo`; shared AVCS → `redact`; git-side objects → not AVCS's business, which is exactly why `--purge` names them instead of letting "not recoverable" read as "handled"
 
 Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (36 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the hub runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the hub re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 360-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
@@ -269,6 +270,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [20 — Workspace-first git bridge](docs/20-workspace-bridge.md)
 - [21 — shared-paths: build environments shared across workspaces](docs/21-shared-paths.md)
 - [22 — Region policy arbitration (design)](docs/22-region-arbitration.md)
+- [23 — Local undo: the pre-share escape hatch](docs/23-local-undo.md)
 
 ## Contributing
 

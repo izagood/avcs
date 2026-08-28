@@ -96,6 +96,41 @@ async function discover(base: string, since: number, signer?: HubSigner): Promis
   return { oids: [...(await hubHave(base, signer))], cursor: null };
 }
 
+/**
+ * The push-side ledger (issue #91): op oid → the hub base URLs it was accepted by.
+ *
+ * `sync-cursors.json` above is a PULL cursor — it says how far this replica has read, and
+ * nothing at all about what has left it. Local `undo` needs the other direction: once an op
+ * has been replicated, evicting it is a governance act (`redact`), not a local one. Push is
+ * a diff against `GET /have` rather than a sequence, so there is no cursor to reuse — the
+ * accepted oids are recorded explicitly instead.
+ *
+ * Records only OPERATIONS: they are what a view selects and therefore what an undo can
+ * remove. Blobs travel with them, so an op-level record covers the bytes too.
+ */
+const PUSHED_OPS = "pushed-ops.json";
+
+async function readPushedOps(store: ObjectStore): Promise<Record<string, string[]>> {
+  const raw = await store.readAux(PUSHED_OPS);
+  if (!raw) return {};
+  try { return JSON.parse(raw.toString("utf8")) as Record<string, string[]>; } catch { return {}; }
+}
+
+async function recordPushedOps(store: ObjectStore, base: string, oids: string[]): Promise<void> {
+  if (!oids.length) return;
+  // Locked: this is read-modify-write, and two concurrent pushes dropping each other's
+  // entries would under-record — the one direction this ledger must not fail in.
+  await store.withLock("pushed-ops", async () => {
+    const ledger = await readPushedOps(store);
+    for (const oid of oids) {
+      const urls = ledger[oid] ?? [];
+      if (!urls.includes(base)) urls.push(base);
+      ledger[oid] = urls;
+    }
+    await store.writeAux(PUSHED_OPS, JSON.stringify(ledger, null, 2) + "\n");
+  });
+}
+
 /** Mirror Repo.pull's import side-effect: maintain the entity index for imported ops. */
 async function indexIfOperation(store: ObjectStore, obj: AnyObject, oid: string): Promise<void> {
   if (obj.type === "operation") {
@@ -114,28 +149,37 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
   const have = await hubHave(base, signWith);
   let pushed = 0;
   let rejected = 0;
-  for await (const obj of store.list()) {
-    const oid = obj.oid as string;
-    if (have.has(oid)) continue;
-    if (obj.type === "operation" && (obj as Operation).private) continue; // stash stays local
-    const body = JSON.stringify(obj);
-    const res = await fetch(`${base}/objects`, {
-      method: "POST",
-      headers: writeHeaders(signWith, "POST", "/objects", body, scopeOf(base)),
-      body,
-    });
-    if (res.status === 401) {
-      // Transport auth failed (no/invalid request signature): a write-auth hub refused the
-      // connection itself. Distinct from 403 (signed in, but this object's role/signature
-      // is insufficient). Surface it loudly — retrying object-by-object would all fail.
-      throw new Error(`POST /objects unauthorized (401) for ${oid}: ${(await res.json().catch(() => ({})) as { error?: string }).error ?? "transport auth required"}`);
+  const acceptedOps: string[] = [];
+  try {
+    for await (const obj of store.list()) {
+      const oid = obj.oid as string;
+      if (have.has(oid)) continue;
+      if (obj.type === "operation" && (obj as Operation).private) continue; // stash stays local
+      const body = JSON.stringify(obj);
+      const res = await fetch(`${base}/objects`, {
+        method: "POST",
+        headers: writeHeaders(signWith, "POST", "/objects", body, scopeOf(base)),
+        body,
+      });
+      if (res.status === 401) {
+        // Transport auth failed (no/invalid request signature): a write-auth hub refused the
+        // connection itself. Distinct from 403 (signed in, but this object's role/signature
+        // is insufficient). Surface it loudly — retrying object-by-object would all fail.
+        throw new Error(`POST /objects unauthorized (401) for ${oid}: ${(await res.json().catch(() => ({})) as { error?: string }).error ?? "transport auth required"}`);
+      }
+      if (res.status === 403) {
+        rejected++; // gated hub refused an unauthorized op (object-level role/signature)
+        continue;
+      }
+      if (!res.ok) throw new Error(`POST /objects failed for ${oid}: ${res.status} ${res.statusText}`);
+      if (obj.type === "operation") acceptedOps.push(oid);
+      pushed++;
     }
-    if (res.status === 403) {
-      rejected++; // gated hub refused an unauthorized op (object-level role/signature)
-      continue;
-    }
-    if (!res.ok) throw new Error(`POST /objects failed for ${oid}: ${res.status} ${res.statusText}`);
-    pushed++;
+  } finally {
+    // In `finally` on purpose: a push that throws part-way still left everything before the
+    // throw on the hub, and an undo must refuse those. Under-recording here would let the
+    // local path silently rewrite replicated history.
+    await recordPushedOps(store, base, acceptedOps);
   }
   return { pushed, rejected };
 }

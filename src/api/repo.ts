@@ -56,6 +56,7 @@ import type {
   RoleName,
   ScopeRef,
   Session,
+  Undo,
   View,
   ViewQuery,
   WorkLease,
@@ -212,6 +213,25 @@ export interface ContentionWarning {
   /** `line` is populated for an `acrossLines` check, so the caller can name the branch. */
   theirs: { op: string; actor: string; lamport: number; purpose: string; createdAt: string; line?: string }[];
   leaseHolders: { actor: string; leaseOid: string; scope: string; expiresAt: string }[];
+}
+
+/**
+ * What one {@link Repo.undo} call did (issue #91).
+ *
+ * `excluded` is what THIS call dropped from the view; `alreadyExcluded` is what a previous
+ * undo had already dropped — reported rather than refused, so running undo twice converges
+ * instead of erroring. `purged` are the blobs whose bytes were evicted, `retained` the
+ * target blobs a still-selected op keeps alive (content-addressing means identical content
+ * is one blob, so this is the normal, not the exotic, case).
+ */
+export interface UndoResult {
+  /** The authored {@link Undo} record, or null when the call was a no-op. */
+  undoOid: string | null;
+  view: string;
+  excluded: string[];
+  alreadyExcluded: string[];
+  purged: string[];
+  retained: string[];
 }
 
 // Sidecar: ignore EVERYTHING under .avcs/ (the `*` also ignores this file itself), so the
@@ -1702,8 +1722,223 @@ export class Repo {
     const { redactedStub } = await import("../store/applyRedactions.ts");
     await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
     this.#blobCache.delete(blobOid); // bytes changed under a stable oid — evict the cache
+    // …and the derived copies: a merge result lives as bytes in the compaction snapshot, so
+    // the object-store eviction alone would leave the plaintext readable there.
+    await this.#scrubDerivedCaches();
     this.logger.warn("redact.applied", { blobOid, redactionOid, by, reason, length: original.length });
     return redactionOid;
+  }
+
+  // ── local undo (issue #91) ─────────────────────────────────────────────────
+  /**
+   * Undo local ops: drop them from a view's projection, and with `purge` evict the blob
+   * bytes they uniquely reference.
+   *
+   * This is `redact`'s pre-share counterpart, and the split is the whole point. `redact`
+   * is admin-gated because it evicts bytes from a repo other people hold — a governance
+   * act. `undo` refuses the moment the ops have been pushed (see {@link pushedOps}),
+   * so by construction it only ever operates on history no other holder has. Nothing to
+   * co-ordinate ⇒ nobody's authority to ask for.
+   *
+   * Without `purge` this is fully reversible: the ops and their bytes stay in the store and
+   * only the view's `excludeOps` grows. With `purge` the bytes go, which is why it is opt-in
+   * and separately named. Both are append-only: the exclusion is a NEW view object and the
+   * act itself is recorded as an {@link Undo}.
+   */
+  async undo(args: {
+    /** Ops to undo. Mutually exclusive with `last`. */
+    ops?: string[];
+    /** Undo the ops of the most recent commit on this scope instead. */
+    last?: boolean;
+    /** The view (line) to undo on. Default "main". */
+    view?: string;
+    /** Resolve `last` inside a workspace's projection rather than the base view. */
+    workspace?: string;
+    /** Also evict the bytes the undone ops uniquely reference. Irreversible. */
+    purge?: boolean;
+    by: string;
+    reason?: string;
+  }): Promise<UndoResult> {
+    const viewName = args.view ?? "main";
+    if (args.last && args.ops?.length) throw new Error("undo: pass either --last or explicit op oids, not both");
+    const targets = args.last ? await this.#lastCommitOps(viewName, args.workspace) : [...(args.ops ?? [])];
+    if (!targets.length) throw new Error("undo: nothing to undo (name the op oids, or pass --last)");
+    for (const oid of targets) {
+      const obj = await this.store.get(oid).catch(() => null);
+      if (obj?.type !== "operation") throw new Error(`undo: not an operation: ${oid}`);
+    }
+    // The boundary that keeps `undo` and `redact` from blurring into one another. Anything
+    // replicated is somebody else's tree too, and only the governance plane may evict from it.
+    const pushed = await this.pushedOps();
+    const gone = targets.filter((o) => pushed.has(o));
+    if (gone.length) {
+      const where = [...new Set(gone.flatMap((o) => pushed.get(o) ?? []))].join(", ");
+      throw new Error(
+        `undo refuses: ${gone.length} of these op(s) have already been pushed (${gone[0]} → ${where}). ` +
+          `Another holder's projection depends on them, so evicting them is a governance act, not a local one — ` +
+          `use \`redact\` (admin-signed, propagates to every replica) instead.`,
+      );
+    }
+    return this.store.withLock(`undo:${viewName}`, async () => {
+      const view = await this.getView(viewName);
+      const already = new Set(view.query.excludeOps ?? []);
+      const fresh = targets.filter((o) => !already.has(o));
+      const alreadyExcluded = targets.filter((o) => already.has(o));
+      const { evictable, retained } = args.purge
+        ? await this.#purgeableBlobs(targets)
+        : { evictable: [], retained: [] };
+
+      // A repeat of an undo that already happened converges instead of erroring: nothing
+      // left to exclude AND nothing left to evict ⇒ no new view, no new record.
+      if (!fresh.length && !evictable.length) {
+        return { undoOid: null, view: viewName, excluded: [], alreadyExcluded, purged: [], retained };
+      }
+      const viewOid = fresh.length
+        ? await this.createView(viewName, { ...view.query, excludeOps: [...already, ...fresh] }, (view.oid as string) ?? null)
+        : (view.oid as string);
+      const undo: Undo = {
+        type: "undo",
+        view: viewName,
+        ops: fresh,
+        viewOid,
+        ...(evictable.length ? { purged: evictable } : {}),
+        ...(args.reason ? { reason: args.reason } : {}),
+        by: args.by,
+        createdAt: new Date().toISOString(),
+      };
+      // Record BEFORE evicting: a crash between the two leaves a record naming bytes that
+      // are still there, and re-running finishes the job. The reverse order would evict
+      // bytes nothing accounts for.
+      const undoOid = await this.store.put(undo);
+      if (evictable.length) {
+        const { purgedStub } = await import("../store/applyRedactions.ts");
+        const reason = args.reason ?? "local undo --purge";
+        for (const blobOid of evictable) {
+          await this.store.overwriteAt(blobOid, purgedStub(reason, undoOid));
+          this.#blobCache.delete(blobOid); // bytes changed under a stable oid
+        }
+        await this.#scrubDerivedCaches();
+      }
+      this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: evictable.length, by: args.by, reason: args.reason });
+      return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: evictable, retained };
+    });
+  }
+
+  /**
+   * The ops of the most recent commit on a scope (`undo --last`).
+   *
+   * "One commit" is already a first-class grouping: `commitWorkingTree` opens ONE session
+   * and authors every op of that capture against it, so the session is the commit and no new
+   * bookkeeping is needed. The newest op is picked in the reducer's own canonical order
+   * (lamport, then oid), and its whole session comes with it — a two-file commit undoes as
+   * two files, never half of one.
+   *
+   * Resolved against what the view currently SELECTS, so a repeat walks back one commit at a
+   * time: the ops a previous undo excluded are no longer candidates.
+   */
+  async #lastCommitOps(viewName: string, workspace?: string): Promise<string[]> {
+    const res = await this.materialize(viewName, workspace ? { workspace } : undefined);
+    const ops: Operation[] = [];
+    for (const oid of res.statuses.keys()) {
+      const op = await this.store.get<Operation>(oid).catch(() => null);
+      if (op?.type === "operation") ops.push(op);
+    }
+    if (!ops.length) throw new Error(`undo --last: ${viewName} has no ops left to undo`);
+    ops.sort((a, b) => a.lamport - b.lamport || (a.oid as string).localeCompare(b.oid as string));
+    const newest = ops[ops.length - 1] as Operation;
+    return ops.filter((o) => o.sessionOid === newest.sessionOid).map((o) => o.oid as string);
+  }
+
+  /**
+   * Split the blobs the undone ops reference into what `--purge` may evict and what it
+   * must spare.
+   *
+   * "Uniquely referenced" is decided against EVERY operation in the store other than the
+   * ones being undone — not merely the ops the target view currently selects. Content
+   * addressing means identical content is one blob, and an op on another line (or in a
+   * workspace, or one a previous undo excluded but did not purge) can hold the only other
+   * reference to it. Both `blobOid` and `baseBlobOid` count: a remaining `edit_file` needs
+   * its 3-way merge base as much as its content. Ref targets are spared too, since a ref
+   * can point at a blob (the landed-workspace set) that no op mentions.
+   *
+   * The asymmetry is deliberate. Sparing one blob too many leaves bytes the user must undo
+   * a second op to be rid of — annoying, and reported as `retained`. Evicting one too many
+   * silently breaks a projection nobody asked to change, irreversibly.
+   */
+  async #purgeableBlobs(targets: string[]): Promise<{ evictable: string[]; retained: string[] }> {
+    const withChunks = async (oid: string, into: Set<string>): Promise<void> => {
+      into.add(oid);
+      const blob = await this.store.get<Blob>(oid).catch(() => null);
+      if (blob?.chunked && blob.chunks) for (const c of blob.chunks) into.add(c);
+    };
+    const targetSet = new Set(targets);
+    const wanted = new Set<string>();
+    const spared = new Set<string>();
+    for (const op of await this.store.collect<Operation>("operation")) {
+      const mine = targetSet.has(op.oid as string);
+      // An undone op's own merge BASE is the previous content, which belongs to the op that
+      // wrote it — undoing this op is no statement about that. Only its own content goes.
+      if (mine) {
+        if (op.body.blobOid) await withChunks(op.body.blobOid, wanted);
+        continue;
+      }
+      for (const b of [op.body.blobOid, op.body.baseBlobOid]) if (b) await withChunks(b, spared);
+    }
+    for (const oid of (await this.store.listRefs()).values()) spared.add(oid);
+
+    const evictable: string[] = [];
+    const retained: string[] = [];
+    for (const oid of [...wanted].sort()) {
+      if (spared.has(oid)) { retained.push(oid); continue; }
+      const blob = await this.store.get<Blob>(oid).catch(() => null);
+      if (!blob || blob.redacted) continue; // already gone (gc) or already evicted — idempotent
+      evictable.push(oid);
+    }
+    return { evictable, retained };
+  }
+
+  /**
+   * Op oid → the hub URLs that accepted it (issue #91). Written by `pushToHub`; the record
+   * of what has left this machine, which `undo` refuses to touch.
+   *
+   * It is a record of THIS replica's pushes, so it is honest about what it can see and no
+   * more: a hub push (including the one inside `land`/`submit`) is recorded, while a peer
+   * that ran `avcs pull <this-dir>` copied objects without this side ever being asked. See
+   * docs/23 §5 for that boundary.
+   */
+  async pushedOps(): Promise<Map<string, string[]>> {
+    const raw = await this.store.readAux("pushed-ops.json");
+    if (!raw) return new Map();
+    try {
+      return new Map(Object.entries(JSON.parse(raw.toString("utf8")) as Record<string, string[]>));
+    } catch {
+      return new Map();
+    }
+  }
+
+  /** Every recorded local undo, oldest first. */
+  async listUndos(): Promise<Undo[]> {
+    const undos = await this.store.collect<Undo>("undo");
+    return undos.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  /**
+   * Drop every DERIVED copy of blob bytes after an eviction (`redact` / `undo --purge`).
+   *
+   * A projection's content is not always a stored blob: a 3-way merge result is a SYNTHETIC
+   * blob the reducer carries as bytes (`ReductionResult.synthBlobs`). Those bytes are held by
+   * the warm reduce cache, by the in-memory incremental snapshot, and — the one that outlives
+   * the process — by the persisted compaction snapshot at `.avcs/snapshot/<view>.cbor`. An
+   * eviction that stopped at the object store would leave the plaintext readable there.
+   *
+   * All of it is rebuildable cache: the cost of dropping it is one full reduce, and the read
+   * path never depends on it (`#loadPersistedSnapshot` treats an absent file as a cold start).
+   */
+  async #scrubDerivedCaches(): Promise<void> {
+    this.#incSnap = null;
+    this.#reduceCache.clear();
+    this.#persistedBaseOps.clear();
+    await rm(join(this.store.root, "snapshot"), { recursive: true, force: true });
   }
 
   async #activeWaivers(view: string): Promise<Set<EvidenceKind>> {

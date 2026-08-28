@@ -31,6 +31,7 @@ export type ObjectType =
   | "protection"
   | "promotion"
   | "redaction"
+  | "undo"
   | "override"
   | "approval"
   | "integration";
@@ -76,6 +77,9 @@ export interface Blob extends BaseObject {
   /** Phase 12: set once a Redaction evicted the original bytes (oid preserved). */
   redacted?: boolean;
   redactionOid?: string;
+  /** Issue #91: set instead of `redactionOid` when a local `undo --purge` did the eviction.
+   *  Same mechanism, different provenance — one is a governed act, the other pre-share. */
+  undoOid?: string;
 }
 
 // ── intent ──────────────────────────────────────────────────────────────────
@@ -544,6 +548,36 @@ export interface Redaction extends BaseObject {
   createdAt: string;
 }
 
+/**
+ * The record of a LOCAL undo (issue #91): the ops an author dropped from a view's
+ * projection before anything was shared, and — with `purge` — the blob bytes that
+ * eviction reclaimed.
+ *
+ * Deliberately NOT a {@link Redaction}. A redaction is a governance act over a repo other
+ * people already hold: admin-gated, signed, propagated, re-applied on every replica. An
+ * undo is the pre-share case — the ops never left this machine, so no other holder's
+ * `treeHash` can break and no authority beyond the author is involved. Keeping the two
+ * objects distinct is what keeps `redact`'s admin gate meaningful.
+ *
+ * Inert to the reducer: like a checkpoint it never projects into the tree. What changes
+ * the projection is the new `view` this undo authored alongside itself (`viewOid`).
+ */
+export interface Undo extends BaseObject {
+  type: "undo";
+  /** The view (line) whose projection lost these ops. */
+  view: string;
+  /** The ops THIS undo newly excluded (an already-excluded op is not re-recorded). */
+  ops: string[];
+  /** The view object the exclusion produced — what a reader re-materializes. */
+  viewOid: string;
+  /** Blob oids whose bytes this undo evicted. Absent for a plain (reversible) undo. */
+  purged?: string[];
+  reason?: string;
+  /** Actor id. No role requirement — see the doc comment; `redact` owns the gated case. */
+  by: string;
+  createdAt: string;
+}
+
 /** A reviewer's sign-off on a checkpoint (= PR approve). Gates finalize. */
 export interface Approval extends BaseObject {
   type: "approval";
@@ -582,6 +616,7 @@ export type AnyObject =
   | Protection
   | Promotion
   | Redaction
+  | Undo
   | Override
   | Approval
   | Integration;
