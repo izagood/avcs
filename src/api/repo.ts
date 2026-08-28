@@ -1760,6 +1760,18 @@ export class Repo {
       const obj = await this.store.get(oid).catch(() => null);
       if (obj?.type !== "operation") throw new Error(`undo: not an operation: ${oid}`);
     }
+    // The boundary that keeps `undo` and `redact` from blurring into one another. Anything
+    // replicated is somebody else's tree too, and only the governance plane may evict from it.
+    const pushed = await this.pushedOps();
+    const gone = targets.filter((o) => pushed.has(o));
+    if (gone.length) {
+      const where = [...new Set(gone.flatMap((o) => pushed.get(o) ?? []))].join(", ");
+      throw new Error(
+        `undo refuses: ${gone.length} of these op(s) have already been pushed (${gone[0]} → ${where}). ` +
+          `Another holder's projection depends on them, so evicting them is a governance act, not a local one — ` +
+          `use \`redact\` (admin-signed, propagates to every replica) instead.`,
+      );
+    }
     return this.store.withLock(`undo:${viewName}`, async () => {
       const view = await this.getView(viewName);
       const already = new Set(view.query.excludeOps ?? []);
@@ -1850,6 +1862,25 @@ export class Repo {
       evictable.push(oid);
     }
     return { evictable, retained };
+  }
+
+  /**
+   * Op oid → the hub URLs that accepted it (issue #91). Written by `pushToHub`; the record
+   * of what has left this machine, which `undo` refuses to touch.
+   *
+   * It is a record of THIS replica's pushes, so it is honest about what it can see and no
+   * more: a hub push (including the one inside `land`/`submit`) is recorded, while a peer
+   * that ran `avcs pull <this-dir>` copied objects without this side ever being asked. See
+   * docs/23 §5 for that boundary.
+   */
+  async pushedOps(): Promise<Map<string, string[]>> {
+    const raw = await this.store.readAux("pushed-ops.json");
+    if (!raw) return new Map();
+    try {
+      return new Map(Object.entries(JSON.parse(raw.toString("utf8")) as Record<string, string[]>));
+    } catch {
+      return new Map();
+    }
   }
 
   /** Every recorded local undo, oldest first. */

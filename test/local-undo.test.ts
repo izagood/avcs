@@ -10,6 +10,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/api/repo.ts";
+import { startHub } from "../src/hub/hubServer.ts";
+import { pushToHub } from "../src/hub/hubClient.ts";
 import type { Actor, Operation } from "../src/objects/types.ts";
 
 const dev: Actor = { kind: "human", id: "human:dev" };
@@ -147,4 +149,34 @@ test("--purge after a plain undo still evicts; a second --purge is a no-op", asy
   assert.deepEqual(again.purged, []);
   assert.equal(again.undoOid, null, "nothing left to do ⇒ no record");
   await rm(dir, { recursive: true, force: true });
+});
+
+test("undo refuses ops that have already been pushed, and names redact as the answer", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const hubDir = await mkdtemp(join(tmpdir(), "avcs-hub-"));
+  const repo = await Repo.init(dir);
+  await writeFile(join(dir, "app.ts"), "export const v = 1\n", "utf8");
+  const shared = await repo.commitWorkingTree(dir, { message: "ok", actor: dev });
+
+  const hub = await startHub({ repoDir: hubDir, port: 0 });
+  try {
+    await pushToHub(dir, hub.url);
+    // Committed AFTER the push ⇒ still local, still undoable.
+    await writeFile(join(dir, ".env"), SECRET, "utf8");
+    const bad = await repo.commitWorkingTree(dir, { message: "oops", actor: dev });
+
+    assert.deepEqual((await repo.pushedOps()).get(shared.ops[0] as string), [hub.url.replace(/\/$/, "")]);
+    await assert.rejects(
+      () => repo.undo({ ops: shared.ops, by: dev.id }),
+      (e: Error) => /already been pushed/.test(e.message) && /redact/.test(e.message),
+      "a replicated op is a governance problem, not a local one",
+    );
+    // The unpushed one is untouched by the refusal.
+    const r = await repo.undo({ ops: bad.ops, purge: true, by: dev.id });
+    assert.equal(r.purged.length, 1);
+  } finally {
+    await hub.close();
+  }
+  await rm(dir, { recursive: true, force: true });
+  await rm(hubDir, { recursive: true, force: true });
 });
