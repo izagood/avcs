@@ -367,7 +367,11 @@ async function main(): Promise<void> {
       if (!args.includes("--no-hooks")) {
         const { execFileSync } = await import("node:child_process");
         try {
-          const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: dir }).toString().trim();
+          // stderr is silenced deliberately: the catch below treats "no git here" as the
+          // ordinary standalone case, and a probe whose failure we ignore must not print
+          // git's `fatal:` to a user who never asked about git. Same stdio contract as
+          // `gitCmd`, which every other git probe in this file already uses.
+          const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
           const { isAbsolute, join } = await import("node:path");
           const hooksDir = isAbsolute(gp) ? gp : join(dir, gp);
           const cmd = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
@@ -967,7 +971,9 @@ async function main(): Promise<void> {
       const { execFileSync } = await import("node:child_process");
       let hooksDir: string;
       try {
-        const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd }).toString().trim();
+        // Silenced for the same reason as in `init`: the catch below reports the missing
+        // git repo in this CLI's own words, so git's raw `fatal:` would only duplicate it.
+        const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
         const { isAbsolute, join } = await import("node:path");
         hooksDir = isAbsolute(gp) ? gp : join(cwd, gp);
       } catch {
