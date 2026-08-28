@@ -57,6 +57,23 @@ function encodeValue(w: Writer, v: unknown): void {
     }
     case "bigint": throw new Error("bigint is not serializable in AVCS objects; pass a string");
     case "object": {
+      // Raw bytes are REFUSED, not encoded (issue #101). This codec has no byte-string
+      // (major type 2) writer, so a Buffer/Uint8Array would fall through to the generic
+      // map branch below and be written as {"0":97,"1":98,…} — round-tripping as a plain
+      // object where a Buffer is declared. That is unreadable to every consumer
+      // (`.equals` is Buffer-only; `.toString("utf8")` yields "[object Object]") and the
+      // failure surfaces far from the mistake.
+      //
+      // Adding a byte-string type instead would change what the encoder emits, and this
+      // encoder also produces the bytes that objects are content-ADDRESSED by — not a
+      // trade worth making. Callers hold bytes as base64 strings, which every object type
+      // already does (`Blob.data`).
+      if (ArrayBuffer.isView(v)) {
+        throw new Error(
+          "raw bytes are not serializable by this CBOR encoder (it has no byte-string type) — " +
+            "encode them as a base64 string, the way Blob.data does",
+        );
+      }
       if (Array.isArray(v)) {
         w.header(MAJOR_ARRAY, v.length);
         for (const item of v) encodeValue(w, item ?? null);
