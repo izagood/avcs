@@ -7,7 +7,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { decodeCbor } from "../src/core/cbor.ts";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -276,5 +278,36 @@ test("a later op carrying the secret forward keeps it in the tree — undo both,
   for (const b of [...full.purged, ...partial.retained]) {
     assert.doesNotMatch((await repo.readBlob(b)).toString("utf8"), /SUPERSECRET123/, "every copy is gone");
   }
+  await rm(dir, { recursive: true, force: true });
+});
+
+/** Every byte a persisted compaction snapshot holds as merged content (`synthBlobs`). */
+async function snapshotBytes(dir: string, view = "main"): Promise<Buffer[] | null> {
+  const p = join(dir, ".avcs", "snapshot", `${view}.cbor`);
+  if (!existsSync(p)) return null;
+  const raw = decodeCbor(await readFile(p)) as { snapshot: { result: { synthBlobs: [string, Record<string, number>][] } } };
+  return raw.snapshot.result.synthBlobs.map(([, bytes]) => Buffer.from(Object.values(bytes)));
+}
+
+test("--purge also scrubs the derived copies: a persisted snapshot holds merged CONTENT", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-undo-"));
+  const repo = await Repo.init(dir);
+  // Two concurrent disjoint edits over one base ⇒ the tree content is a MERGE result, which
+  // the reducer keeps as a synthetic blob — bytes, not an oid.
+  const intent = await repo.createIntent({ title: "t", owner: dev.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: dev });
+  const seed = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: dev, path: ".env", content: SECRET + "B\nC\n", declaredPurpose: "seed" });
+  const baseBlob = (await repo.materialize()).tree.get(".env") as string;
+  const e1 = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: dev, path: ".env", newText: SECRET + "B1\nC\n", baseBlobOid: baseBlob, declaredPurpose: "b", causalDeps: [seed] });
+  const e2 = await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: dev, path: ".env", newText: SECRET + "B\nC2\n", baseBlobOid: baseBlob, declaredPurpose: "c", causalDeps: [seed] });
+  await repo.compact("main");
+
+  const before = await snapshotBytes(dir);
+  assert.ok(before?.some((b) => b.includes("SUPERSECRET123")), "the hazard: the snapshot holds the merged plaintext");
+
+  await repo.undo({ ops: [seed, e1, e2], purge: true, by: dev.id });
+  assert.equal(await snapshotBytes(dir), null, "the snapshot the eviction invalidated is gone, plaintext with it");
+  // …and the repo still works: the cache was rebuildable, that was the whole point.
+  assert.equal((await repo.materialize()).tree.size, 0);
   await rm(dir, { recursive: true, force: true });
 });

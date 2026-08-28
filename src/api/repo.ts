@@ -1814,6 +1814,7 @@ export class Repo {
           await this.store.overwriteAt(blobOid, purgedStub(reason, undoOid));
           this.#blobCache.delete(blobOid); // bytes changed under a stable oid
         }
+        await this.#scrubDerivedCaches();
       }
       this.logger.warn("undo.applied", { view: viewName, ops: fresh.length, purged: evictable.length, by: args.by, reason: args.reason });
       return { undoOid, view: viewName, excluded: fresh, alreadyExcluded, purged: evictable, retained };
@@ -1916,6 +1917,25 @@ export class Repo {
   async listUndos(): Promise<Undo[]> {
     const undos = await this.store.collect<Undo>("undo");
     return undos.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  /**
+   * Drop every DERIVED copy of blob bytes after an eviction (`redact` / `undo --purge`).
+   *
+   * A projection's content is not always a stored blob: a 3-way merge result is a SYNTHETIC
+   * blob the reducer carries as bytes (`ReductionResult.synthBlobs`). Those bytes are held by
+   * the warm reduce cache, by the in-memory incremental snapshot, and — the one that outlives
+   * the process — by the persisted compaction snapshot at `.avcs/snapshot/<view>.cbor`. An
+   * eviction that stopped at the object store would leave the plaintext readable there.
+   *
+   * All of it is rebuildable cache: the cost of dropping it is one full reduce, and the read
+   * path never depends on it (`#loadPersistedSnapshot` treats an absent file as a cold start).
+   */
+  async #scrubDerivedCaches(): Promise<void> {
+    this.#incSnap = null;
+    this.#reduceCache.clear();
+    this.#persistedBaseOps.clear();
+    await rm(join(this.store.root, "snapshot"), { recursive: true, force: true });
   }
 
   async #activeWaivers(view: string): Promise<Set<EvidenceKind>> {
