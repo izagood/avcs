@@ -286,6 +286,41 @@ async function installHooks(hooksDir: string, avcsCmd: string, force: boolean): 
   return { installed, skipped };
 }
 
+/**
+ * After `undo --purge`, name the copy the eviction could NOT reach: git's.
+ *
+ * `undo` is an AVCS command and has no business rewriting git history — the correct fix
+ * differs by whether the commit was pushed, so it is the user's call and no avcs command
+ * should make it for them. But silence is worse than useless here: to somebody who just
+ * leaked a credential, "bytes evicted, not recoverable" reads as *handled*, and in bridge
+ * mode it is not — git still holds its own object.
+ *
+ * Only speaks when git is actually present (same silent probe as everywhere else in this
+ * file). No git, no extra line: the standalone message is already accurate and stays clean.
+ * Names a concrete commit when git can point at one, and states a CONDITION when it can't,
+ * rather than asserting something it did not check.
+ */
+async function warnGitStillHolds(repo: Repo, undoneOps: string[]): Promise<void> {
+  if (!gitCmd(cwd, ["rev-parse", "--git-dir"])) return;
+  const paths: string[] = [];
+  for (const oid of undoneOps) {
+    const op = await repo.store.get<Operation>(oid).catch(() => null);
+    const path = op?.body.path ?? op?.target.entityId;
+    if (path && !paths.includes(path)) paths.push(path);
+  }
+  console.log("note: those bytes are gone from AVCS only — git keeps its own copy of what it committed.");
+  const SHOWN = 5;
+  const named: string[] = [];
+  for (const p of paths) {
+    const sha = gitCmd(cwd, ["log", "--all", "-n", "1", "--pretty=%h", "--", p]);
+    if (sha) named.push(`  git ${sha} still contains ${p}`);
+  }
+  for (const line of named.slice(0, SHOWN)) console.log(line);
+  if (named.length > SHOWN) console.log(`  …and ${named.length - SHOWN} more path(s) in git history`);
+  if (!named.length) console.log("  if these files were committed to git, that history still holds them");
+  console.log("  clearing them from git is a separate step, and differs once pushed — avcs will not do it for you");
+}
+
 async function main(): Promise<void> {
   switch (cmd) {
     case "version": {
@@ -736,6 +771,42 @@ async function main(): Promise<void> {
       for (const m of r.renamed) console.log(`  R ${m.from} -> ${m.to}`);
       reportContention(r.contention);
       console.log(`committed ${r.ops.length} change(s) into ${scopeLabel(scope)} as "${message}"`);
+      break;
+    }
+    case "undo": {
+      // `avcs undo [--last | <op-oid>…] [--purge]` — the pre-share escape hatch (issue #91).
+      // Same branch → scope mapping as `commit`, so `--last` names the commit this branch
+      // just made rather than whatever the base view happens to hold.
+      const repo = await Repo.open(cwd);
+      const VALUED = new Set(["--reason", "--author", "--line"]);
+      const oids: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const a = args[i] as string;
+        if (a.startsWith("--")) { if (VALUED.has(a)) i++; continue; }
+        oids.push(a);
+      }
+      const scope = await scopeFor(repo, cwd, flag("--line"));
+      const r = await repo.undo({
+        ...(args.includes("--last") ? { last: true } : { ops: oids }),
+        ...(scope.line ? { view: scope.line } : {}),
+        ...(scope.workspace ? { workspace: scope.workspace } : {}),
+        purge: args.includes("--purge"),
+        by: flag("--author") ?? "human:cli",
+        ...(flag("--reason") ? { reason: flag("--reason") as string } : {}),
+      });
+      if (!r.excluded.length && !r.purged.length) {
+        console.log(`nothing to undo — ${r.alreadyExcluded.length} op(s) were already undone in ${scopeLabel(scope)}`);
+        break;
+      }
+      console.log(`undid ${r.excluded.length} op(s) in ${scopeLabel(scope)}`);
+      for (const o of r.excluded) console.log(`  - ${o}`);
+      if (r.purged.length) {
+        console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
+        await warnGitStillHolds(repo, [...r.excluded, ...r.alreadyExcluded]);
+      }
+      if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
+      if (!args.includes("--purge")) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
+      console.log(`recorded as ${r.undoOid}`);
       break;
     }
     case "worktree": {
@@ -1291,6 +1362,9 @@ async function main(): Promise<void> {
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
+          "  undo [--last | <op-oid>…] [--purge] [--reason r]  drop local ops from the view;\n" +
+          "                              --purge also evicts the bytes they uniquely reference (irreversible).\n" +
+          "                              Refuses once the ops have been pushed — that case is `redact` (admin)\n" +
           "  git-sync -m <msg> [--commit]   capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
           "  git-mode [sidecar|committed]   show/set how AVCS history relates to git\n" +
           "  verify-git [<commit>]       check a git commit is a faithful projection of its AVCS checkpoint\n" +

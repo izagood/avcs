@@ -87,7 +87,7 @@ GitHub 실사용 36종 병렬 검토 결과는 **[09 — 사용 사례 커버리
 - **Phase 9 — Scale** ✅ *(MVP)*: entity index(`historyOf`, O(ops-on-entity)) + `materializeAt`(frontier 인과폐포) + chunked large blob(>256KB→64KB 청크, content-address dedup). *후속: incremental reduce(checkpoint base), path-scoped/sparse materialize, FastCDC/외부 LFS.*
 - **Phase 10 — Observability** ✅: `blame`(누가/왜)·`historyOf`·`logP`(before/after)·`bisect`(결정론적, checkout 없음)·`diffTrees`/`diff`. MCP blame/history/diff, CLI blame/diff. audit·사후 메타데이터는 이미 git보다 강함
 - **Phase 11 — 외부 기여** ✅: 거버넌스 repo에서 비멤버 op은 quarantine(트리 제외, 죽은 `quarantined` 배선)→reviewer `promote`. `proposeOutsider`(admission cap)·`Evidence.fromUntrustedRunner`(비신뢰 CI 신뢰 안 함). *후속: 실제 isolated runner.*
-- **Phase 12 — Redaction/보안** ✅: admin 서명 `redact`로 유출 blob byte-eviction(oid 보존→treeHash 유효, BFG analog) + break-glass `grantOverride`(만료 waiver) + forward-only `rollbackTo`(CAS)
+- **Phase 12 — Redaction/보안** ✅: admin 서명 `redact`로 유출 blob byte-eviction(oid 보존→treeHash 유효, BFG analog) + break-glass `grantOverride`(만료 waiver) + forward-only `rollbackTo`(CAS). *공유 전 로컬 사례는 `avcs undo [--purge]`가 맡는다 — push된 op은 거부하고 `redact`로 넘긴다([23](23-local-undo.md)).*
 - **소소** ✅: `revert` op(forward inverse+provenance) · `coAuthors` · `private` op(stash, gossip 제외) · Release semver+supportStatus · line-scoped Protection(per-view)
 
 ## Phase 13–16 — 수렴 & MCP 일급화 ✅ *(완료)*

@@ -2,7 +2,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { decodeCbor } from "../src/core/cbor.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/api/repo.ts";
@@ -98,5 +100,33 @@ test("rollback advances the head forward to a prior checkpoint (CAS, no rewrite)
   const rb = await repo.rollbackTo("main", cp1, "human:lead");
   assert.equal(rb.finalized, true);
   assert.equal(await repo.protectedHead("main"), cp1, "head rolled forward to the prior checkpoint");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("redaction also scrubs the derived copies: a persisted snapshot holds merged CONTENT", async () => {
+  const { dir, repo } = await governed("admin");
+  const lead = { kind: "human", id: "human:lead" } as const;
+  const intent = await repo.createIntent({ title: "t", owner: lead.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: lead });
+  // Two concurrent disjoint edits over one base ⇒ the tree content is a MERGE result, which
+  // the reducer keeps as a synthetic blob: bytes, not an oid. Evicting the stored blob does
+  // not reach those bytes, and the persisted compaction snapshot outlives the process.
+  const SECRET = "AWS_SECRET_KEY=AKIA_leaked\n";
+  const seed = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: lead, path: "config.env", content: SECRET + "B\nC\n", declaredPurpose: "seed" });
+  const baseBlob = (await repo.materialize()).tree.get("config.env") as string;
+  await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: lead, path: "config.env", newText: SECRET + "B1\nC\n", baseBlobOid: baseBlob, declaredPurpose: "b", causalDeps: [seed] });
+  await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: lead, path: "config.env", newText: SECRET + "B\nC2\n", baseBlobOid: baseBlob, declaredPurpose: "c", causalDeps: [seed] });
+  await repo.compact("main");
+
+  const snap = join(dir, ".avcs", "snapshot", "main.cbor");
+  const synth = async (): Promise<Buffer[] | null> => {
+    if (!existsSync(snap)) return null;
+    const raw = decodeCbor(await readFile(snap)) as { snapshot: { result: { synthBlobs: [string, Record<string, number>][] } } };
+    return raw.snapshot.result.synthBlobs.map(([, b]) => Buffer.from(Object.values(b)));
+  };
+  assert.ok((await synth())?.some((b) => b.includes("AKIA_leaked")), "the hazard: merged plaintext on disk");
+
+  await repo.redact(baseBlob, "leaked AWS key", "human:lead");
+  assert.equal(await synth(), null, "the eviction reached the snapshot too");
   await rm(dir, { recursive: true, force: true });
 });

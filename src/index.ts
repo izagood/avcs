@@ -7,7 +7,7 @@
 
 // Repository / materialization
 export { Repo } from "./api/repo.ts";
-export type { GitMode, RemoteConfig, ContentionWarning, SharedPathEntry, SharedPathMode, SharedPathLink } from "./api/repo.ts";
+export type { GitMode, RemoteConfig, ContentionWarning, UndoResult, SharedPathEntry, SharedPathMode, SharedPathLink } from "./api/repo.ts";
 
 // Content-addressing — the sacrosanct interop invariant. A consumer (e.g. avcshub)
 // that stores objects MUST address them with THESE functions, not a re-implementation:

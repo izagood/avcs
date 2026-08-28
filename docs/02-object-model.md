@@ -8,7 +8,7 @@
 type ObjectType =
   | "blob"|"intent"|"session"|"operation"|"evidence"|"decision"|"checkpoint"|"view"|"policy"
   // 후속 phase의 운영·거버넌스 객체 (단일 진실 공급원은 types.ts):
-  | "lease"|"release"|"line"|"membership"|"protection"|"promotion"|"redaction"|"override"|"approval";
+  | "lease"|"release"|"line"|"membership"|"protection"|"promotion"|"redaction"|"undo"|"override"|"approval";
 interface BaseObject { type: ObjectType; oid?: string }  // oid는 저장 시 채워짐
 interface Actor { kind: "human"|"ai_agent"|"ci_bot"; id: string; model?: string }
 ```
