@@ -824,9 +824,17 @@ async function main(): Promise<void> {
       const r = await repo.pullHub(url, signer ? { as: signer } : undefined);
       // Phase 13.1: remember where we came from — `avcs sync` now works with no URL.
       await repo.addRemote("origin", url);
+      // …and leave a USABLE tree (issue #96). Fetching the DAG and stopping left only
+      // `.avcs`, and the next `commit` read that emptiness as "every tracked file was
+      // deleted" — one deletion authored per file. A clone you cannot work in is not a clone.
+      // `checkoutInto`, not `writeWorkspace`: the latter DELETES its target before writing —
+      // it is for `materialize --out <fresh dir>` — and pointed at a repo root it would take
+      // `.avcs` with it. (Its non-empty-directory guard catches that, loudly.) `checkoutInto`
+      // projects in place, which is what the git bridge already does after a pull.
+      const written = await repo.checkoutInto(dir, "main");
       console.log(
-        `cloned ${r.pulled} object(s) from ${url} into ${dir}  [remote origin recorded]` +
-          (canSign ? `  [signing as ${signer}]` : ""),
+        `cloned ${r.pulled} object(s) from ${url} into ${dir}, wrote ${written.length} file(s)` +
+          `  [remote origin recorded]` + (canSign ? `  [signing as ${signer}]` : ""),
       );
       if (explicitIdentity && !canSign) {
         console.error(`avcs: no private key held for ${signer ?? "the requested actor"} — the clone was sent UNSIGNED (see \`avcs key ls\`)`);
@@ -1060,13 +1068,16 @@ async function main(): Promise<void> {
     case "commit": {
       const repo = await Repo.open(cwd);
       const message = flag("-m") ?? flag("--message");
-      if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>]");
+      if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>] [--allow-mass-delete]");
       const author = flag("--author") ?? "human:cli";
       // Same branch → scope mapping as the git bridge, so a capture is in the same place
       // whichever command made it. Outside git this resolves to the base view, as before.
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
-      const r = await repo.commitWorkingTree(cwd, { message, actor: { kind: "human", id: author }, ...scope });
+      const r = await repo.commitWorkingTree(cwd, {
+        message, actor: { kind: "human", id: author }, ...scope,
+        allowMassDelete: args.includes("--allow-mass-delete"),
+      });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
       for (const p of r.added) console.log(`  A ${p}`);
       for (const p of r.modified) console.log(`  M ${p}`);
