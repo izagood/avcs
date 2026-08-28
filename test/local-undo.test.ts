@@ -376,7 +376,151 @@ test("undo --last --purge clears the secret from BOTH planes (the whole point)",
   assert.equal(gitFails(dir, "cat-file", "-e", `${bad}^{commit}`), true, "the commit object is pruned");
   // ③ the earlier legitimate commit survives in both planes
   assert.match(git(dir, "log", "--oneline"), /ok$/m);
-  assert.ok((await (await Repo.open(dir)).materialize()).tree.has("app.ts"), "avcs kept the good commit");
+  const repo = await Repo.open(dir);
+  const tree = (await repo.materialize()).tree;
+  assert.ok(tree.has("app.ts"), "avcs kept the good commit");
+  // ④ the two planes agree with reality: the file is STILL ON DISK (the user has to fix it),
+  //    and neither plane claims to hold it. `--mixed` never touched the working tree.
+  assert.match(await readFile(join(dir, "src/config.ts"), "utf8"), new RegExp(GSECRET), "still on disk to fix");
+  assert.ok(!tree.has("src/config.ts"), "the avcs view does not select it");
+  assert.equal(git(dir, "status", "--porcelain", "--", "src"), "?? src/", "and git calls it untracked");
+  assert.match(out, /still on disk and no longer tracked/, "and the output says so");
 
+  await rm(dir, { recursive: true, force: true });
+});
+
+/** The op that wrote `path`, so a refusal can be provoked by naming ops explicitly —
+ *  `--last` would name a different commit once later work sits on top. */
+async function opFor(dir: string, path: string): Promise<string> {
+  const repo = await Repo.open(dir);
+  for (const op of await repo.store.collect<Operation>("operation")) {
+    if ((op.body.path ?? op.target.entityId) === path) return op.oid as string;
+  }
+  throw new Error(`no op for ${path}`);
+}
+
+/** Every refusal below asserts the same two things: the AVCS side still COMPLETED (a refusal
+ *  on the git plane must not cost the user the eviction they asked for), and the message
+ *  names the remedy that actually fits their situation. */
+const avcsSideDone = async (dir: string, out: string): Promise<void> => {
+  assert.match(out, /purged 1 blob/, "the avcs side still ran");
+  assert.equal(grepAvcs(dir, GSECRET), false, "and really evicted the bytes");
+};
+
+test("refuses a pushed commit — rotation is the remedy, never a force-push", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "ok", { "app.ts": "export const v = 1\n" });
+  await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+  const bare = await mkdtemp(join(tmpdir(), "avcs-undo-remote-"));
+  git(bare, "init", "-q", "--bare", ".");
+  git(dir, "remote", "add", "origin", bare);
+  git(dir, "push", "-q", "-u", "origin", "HEAD:refs/heads/main");
+
+  const out = avcs(dir, "undo", "--last", "--purge");
+  await avcsSideDone(dir, out);
+  assert.match(out, /did NOT remove them — the commit is already on a remote/);
+  assert.match(out, /origin\/main/);
+  assert.match(out, /ROTATE THE CREDENTIAL/);
+  assert.match(out, /force-push/, "and says plainly that it will not do the theatre");
+  assert.doesNotMatch(out, /--force/, "no force-push is ever offered, not even behind a flag");
+  // The git plane is untouched: refusing means refusing, not half-doing it.
+  assert.match(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), /oops/);
+  await rm(dir, { recursive: true, force: true });
+  await rm(bare, { recursive: true, force: true });
+});
+
+test("refuses a secret buried under a later commit — filter-repo, not a reset", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+  await gitCommit(dir, "later work", { "app.ts": "export const v = 1\n" });
+
+  const out = avcs(dir, "undo", "--purge", await opFor(dir, "src/config.ts"));
+  await avcsSideDone(dir, out);
+  assert.match(out, /did NOT remove them — the commit is not at the tip/);
+  assert.match(out, /1 later commit\(s\) sit on top of it/);
+  assert.match(out, /git filter-repo --path src\/config\.ts --invert-paths/);
+  assert.match(out, /filter-branch/, "and the fallback for repos without filter-repo");
+  assert.match(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), /oops/, "git untouched");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("refuses when the same commit carries work the user did not undo", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "seed", { "app.ts": "export const v = 1\n" });
+  await gitCommit(dir, "oops + real work", { "src/config.ts": LEAK, "lib.ts": "export const w = 2\n" });
+
+  const out = avcs(dir, "undo", "--purge", await opFor(dir, "src/config.ts"));
+  await avcsSideDone(dir, out);
+  assert.match(out, /also carries work you did not undo/);
+  assert.match(out, /it changes lib\.ts, which no undone op covers/);
+  assert.match(out, /git filter-repo --path src\/config\.ts --invert-paths/);
+  assert.match(git(dir, "log", "-1", "--pretty=%s"), /oops \+ real work/, "the commit is still there");
+  assert.equal(git(dir, "show", "HEAD:lib.ts"), "export const w = 2", "and so is the work");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("refuses a dirty tree, and the retry it prints finishes the git half", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "ok", { "app.ts": "export const v = 1\n" });
+  const bad = await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+  await writeFile(join(dir, "app.ts"), "export const v = 99\n", "utf8"); // uncommitted work
+
+  const out = avcs(dir, "undo", "--last", "--purge");
+  await avcsSideDone(dir, out);
+  assert.match(out, /did NOT remove them — the git tree is not clean/);
+  assert.match(out, /app\.ts/);
+  assert.match(out, /Moving HEAD out from under uncommitted work/);
+  const retry = /re-run:\s+(avcs undo --purge [\w ]+)/.exec(out);
+  assert.ok(retry, `the refusal prints an explicit retry, got:\n${out}`);
+  assert.doesNotMatch(retry[1] as string, /--last/, "never --last: after the undo it names another commit");
+  assert.match(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), /oops/, "git untouched so far");
+
+  // Clean the tree and run exactly what it told the user to run. The avcs side has already
+  // converged, so this run exists only to finish the git side.
+  git(dir, "checkout", "--", "app.ts");
+  const again = avcs(dir, ...(retry[1] as string).split(/\s+/).slice(1));
+  assert.match(again, /nothing to undo/, "the avcs side does not repeat itself");
+  assert.match(again, /removed 1 commit\(s\) holding those bytes from `main`/);
+  assert.equal(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), "", "and now git is clean too");
+  assert.equal(gitFails(dir, "cat-file", "-e", `${bad}^{commit}`), true);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("refuses when another local ref would keep the bytes reachable", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "ok", { "app.ts": "export const v = 1\n" });
+  await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+  git(dir, "tag", "keepme");
+
+  const out = avcs(dir, "undo", "--last", "--purge");
+  await avcsSideDone(dir, out);
+  assert.match(out, /another ref still points into that history/);
+  assert.match(out, /refs\/tags\/keepme/);
+  assert.match(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), /oops/, "git untouched");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("--no-git leaves git alone and says so", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "ok", { "app.ts": "export const v = 1\n" });
+  await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+
+  const out = avcs(dir, "undo", "--last", "--purge", "--no-git");
+  await avcsSideDone(dir, out);
+  assert.match(out, /--no-git — git still holds its own copy/);
+  assert.match(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), /oops/, "git untouched, as asked");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("a leak in the very first commit: the branch goes, nothing else is lost", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  const only = await gitCommit(dir, "oops", { "src/config.ts": LEAK });
+
+  const out = avcs(dir, "undo", "--last", "--purge");
+  await avcsSideDone(dir, out);
+  assert.match(out, /main is unborn now — that run was its whole history/);
+  assert.equal(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), "");
+  assert.equal(gitFails(dir, "cat-file", "-e", `${only}^{commit}`), true);
+  assert.equal(git(dir, "status", "--porcelain", "--", "src"), "?? src/", "the file is on disk, untracked");
   await rm(dir, { recursive: true, force: true });
 });
