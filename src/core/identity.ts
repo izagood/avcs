@@ -8,7 +8,7 @@
 //
 // ed25519 via node:crypto — no external dependency.
 
-import { generateKeyPairSync, sign as nodeSign, verify as nodeVerify } from "node:crypto";
+import { createPublicKey, generateKeyPairSync, sign as nodeSign, verify as nodeVerify } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 export interface Signature {
@@ -29,6 +29,18 @@ export function generateKeypair(): Keypair {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
   return { publicKey: publicKey as string, privateKey: privateKey as string };
+}
+
+/**
+ * Recover the public half of an ed25519 keypair from its private PEM.
+ *
+ * A key file holds only the private key, so importing one used to leave the actor
+ * "signable but not trusted" — nothing it signed could be honored (issue #96). ed25519
+ * private keys carry the public point, so the trusted record can be reconstructed rather
+ * than shipped alongside; the SPKI/PEM encoding matches `generateKeypair`'s byte for byte.
+ */
+export function publicKeyFromPrivate(privateKeyPem: string): string {
+  return createPublicKey(privateKeyPem).export({ type: "spki", format: "pem" }) as string;
 }
 
 export function signMessage(privateKeyPem: string, message: string): string {

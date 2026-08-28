@@ -8,8 +8,13 @@
 //
 // Two distinct questions, and the surface must not blur them:
 //   - which public keys does this REPO trust?      (keys/ — shared, gossiped)
-//   - which private keys can THIS MACHINE sign with? (private/ — local, never shared)
+//   - which private keys can THIS MACHINE sign with? (local, never shared)
 // Listing the second must never print the key material itself.
+//
+// Since issue #98 the second really is machine-scoped: private keys live in
+// `~/.avcs/private/` (see src/api/keystore.ts), with `<store>/private/` kept as a per-repo
+// override. `test/_isolate-keystore.ts`, loaded by `npm test`, gives each test its own
+// keystore so these never touch the developer's real one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";

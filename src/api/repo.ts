@@ -5,7 +5,7 @@
 // agent workflow: intent → session → propose op → attach evidence → materialize →
 // decide → checkpoint.
 
-import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp } from "node:fs/promises";
+import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { Buffer } from "node:buffer";
@@ -21,10 +21,22 @@ import { defaultPolicy, MATERIALIZER_VERSION } from "../reducer/policy.ts";
 import {
   Keyring,
   generateKeypair,
+  publicKeyFromPrivate,
   signMessage,
   type KeyRecord,
   type Signature,
 } from "../core/identity.ts";
+import {
+  adoptionEnabled,
+  assertKeyFilename,
+  listMachineKeys,
+  loadMachineKey,
+  machineKeyPath,
+  machineKeystoreDir,
+  readKeyFile,
+  saveMachineKey,
+  type KeyFile,
+} from "./keystore.ts";
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
 import { isBinary } from "../core/bytes.ts";
 import { lcsLineLength } from "../merge/merge3.ts";
@@ -264,11 +276,31 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /** The committed-mode ignore entry for the shared-path cache tree (docs/21 §3.3). */
 const SHARED_IGNORE_LINE = "/shared/";
 
+/** Which of the two private keystores a key lives in (issue #98). `"repo"` is the
+ *  per-checkout override, `"machine"` the default shared by every repo on the box. */
+export type KeyScope = "repo" | "machine";
+
+/** The actor kind an id implies, by the `kind:name` convention the CLI already uses. Key
+ *  files written before #98 carry no kind, and `actorKind` is stored on a trust record but
+ *  never consulted by a trust check (only `actorId` is), so a guess here cannot grant
+ *  authority — it only keeps the record readable. */
+export function kindOfActorId(id: string): Actor["kind"] {
+  return id.startsWith("human:") ? "human" : id.startsWith("ci:") ? "ci_bot" : "ai_agent";
+}
+
 export class Repo {
   readonly dir: string;
   readonly store: ObjectStore;
   readonly keyring = new Keyring();
   readonly metrics = new Metrics();
+  /**
+   * One-line notices about the machine keystore (issue #98) — a key adopted out of a
+   * repo-local store, or a repo-local key that differs from the machine one. Collected on
+   * the instance rather than printed from here so the CLI/MCP decide how to surface them,
+   * and so a test can assert the user was told without parsing stdout. Never contains key
+   * material.
+   */
+  readonly keystoreNotices: string[] = [];
   /** Structured logger (silent by default; CLI/hub/MCP wire a console/OTel sink). */
   logger: Logger = silentLogger();
   #clock = new LamportClock();
@@ -398,20 +430,49 @@ export class Repo {
     return { keyId, privateKey, publicKey };
   }
 
-  // ── local private keystore (issue #15 Layer 2 / B2) ────────────────────────
-  // Public keys live in `keys/` (trusted, shared). PRIVATE keys live ONLY here,
-  // locally on the owner's machine — never shared, never committed. The MCP server
-  // loads them to sign a decision on the owner's behalf AFTER an elicitation
-  // confirmation, so an agent (which never sees the key) cannot forge a human
-  // decision. gitignored in both modes: sidecar ignores all of .avcs/, committed
-  // lists /private/ explicitly.
+  // ── local private keystore (issue #15 Layer 2 / B2; machine-scoped since #98) ──────
+  // Public keys live in `keys/` (trusted, shared, gossiped WITH the repo). PRIVATE keys
+  // are never shared and never committed. The MCP server loads them to sign a decision on
+  // the owner's behalf AFTER an elicitation confirmation, so an agent (which never sees
+  // the key) cannot forge a human decision.
+  //
+  // There are TWO sources, read in this order (issue #98):
+  //
+  //   1. `<store>/private/` — repo-local. An OVERRIDE, for the deliberate case: a checkout
+  //      that must sign as a different actor (a CI checkout, a second identity). Read first
+  //      so every repo holding a key today keeps working byte-identically.
+  //   2. the machine keystore (`~/.avcs/private/`, see ./keystore.ts) — the default. An
+  //      actor identity belongs to a person and a machine, not to a checkout, which is what
+  //      `key ls`'s "signable on this machine" always claimed.
+  //
+  // The repo-local directory stays gitignored in both modes (sidecar ignores all of .avcs/,
+  // committed lists /private/ explicitly) — but a key that was never in the repo does not
+  // need that line to hold, which is the point of moving the default out.
   #privateKeysDir(): string {
     return join(this.store.root, "private");
   }
-  /** Persist an actor's PRIVATE key locally (owner machine only), perms 0600. */
-  async saveLocalKey(actorId: string, privateKey: string): Promise<void> {
-    await mkdir(this.#privateKeysDir(), { recursive: true });
-    await writeFile(join(this.#privateKeysDir(), `${actorId}.json`), JSON.stringify({ actorId, privateKey }), { encoding: "utf8", mode: 0o600 });
+  /**
+   * Persist an actor's PRIVATE key, perms 0600.
+   *
+   * Defaults to the MACHINE keystore (issue #98): `key provision` mints an identity for a
+   * person on a box, not for a checkout. `scope: "repo"` writes the repo-local override
+   * instead — that is what `clone --key` uses, so importing a credential for one repo does
+   * not silently install it machine-wide.
+   */
+  async saveLocalKey(actorId: string, privateKey: string, opts?: { scope?: KeyScope; actorKind?: Actor["kind"] }): Promise<void> {
+    assertKeyFilename(actorId);
+    const rec: KeyFile = { actorId, privateKey, ...(opts?.actorKind ? { actorKind: opts.actorKind } : {}) };
+    if ((opts?.scope ?? "machine") === "machine") {
+      await saveMachineKey(rec);
+      return;
+    }
+    await mkdir(this.#privateKeysDir(), { recursive: true, mode: 0o700 });
+    const p = join(this.#privateKeysDir(), `${actorId}.json`);
+    await writeFile(p, JSON.stringify(rec), { encoding: "utf8", mode: 0o600 });
+    await chmod(p, 0o600); // writeFile's mode applies only on create; rotation must not leave it looser
+  }
+  #note(msg: string): void {
+    if (!this.keystoreNotices.includes(msg)) this.keystoreNotices.push(msg);
   }
   /**
    * Adopt an existing private key into THIS repo's keystore (issue #58).
@@ -426,8 +487,15 @@ export class Repo {
    * take one from. An ambiguous directory names the choice rather than picking silently —
    * signing as the wrong actor is worse than a stop, because the wrong identity ends up in
    * history where it cannot be quietly corrected.
+   *
+   * Defaults to `scope: "repo"` (issue #98): `clone --key` says "THIS repo signs as this
+   * actor", and installing a credential machine-wide as a side effect of a clone flag would
+   * be a surprising write to a shared resource that could also shadow the machine's default
+   * identity. `avcs key import` passes `scope: "machine"` when that IS what the user asked
+   * for. Either way the public half is registered as trusted here, or the import would leave
+   * the actor able to sign and unable to be believed (issue #96).
    */
-  async importLocalKey(source: string, actorId?: string): Promise<string> {
+  async importLocalKey(source: string, actorId?: string, opts?: { scope?: KeyScope }): Promise<string> {
     const { readdir: rd } = await import("node:fs/promises");
     let file = source;
     const asRepoRoot = existsSync(join(ObjectStore.resolveStoreDir(source), "private"))
@@ -446,7 +514,7 @@ export class Repo {
       file = join(asRepoRoot, `${pick}.json`);
     }
     if (!existsSync(file)) throw new Error(`no such key file: ${file}`);
-    let parsed: { actorId?: unknown; privateKey?: unknown };
+    let parsed: { actorId?: unknown; privateKey?: unknown; actorKind?: Actor["kind"] };
     try {
       parsed = JSON.parse(await readFile(file, "utf8")) as typeof parsed;
     } catch {
@@ -456,23 +524,92 @@ export class Repo {
     if (!id || typeof parsed.privateKey !== "string") {
       throw new Error(`not an avcs key file (expected { actorId, privateKey }): ${file}`);
     }
-    await this.saveLocalKey(id, parsed.privateKey);
+    const kind = kindOfActorId(id);
+    await this.saveLocalKey(id, parsed.privateKey, { scope: opts?.scope ?? "repo", actorKind: parsed.actorKind ?? kind });
+    // …and register the PUBLIC half as trusted (issue #96). Persisting only the private
+    // half left the actor `signable 1 / trusted 0`: it could sign, and nothing it signed
+    // was honored. The holder of a private key can already sign anything, so trusting the
+    // key they explicitly handed over adds no authority — it just stops the import from
+    // being useless.
+    await this.#trustPrivateKeyOwner(id, parsed.privateKey, parsed.actorKind ?? kind);
     return id;
   }
 
   /**
-   * Actor ids this machine holds a PRIVATE key for — i.e. who it can sign as. Returns ids
-   * only: the key material must never travel with a listing, or `key ls` becomes the
-   * disclosure it is meant to help avoid.
+   * Register the public half of a locally-held private key as trusted by this repo.
+   *
+   * The private half is machine-scoped; the trusted public record is per-repo (it is
+   * gossiped with the repo). So a repo created AFTER the identity holds the key but does
+   * not yet trust it, and nothing it signs is honored. Idempotent, and it never overwrites
+   * a different public key already recorded for the id — a trust record is an assertion
+   * other replicas may already have acted on.
+   */
+  async #trustPrivateKeyOwner(actorId: string, privateKey: string, actorKind: Actor["kind"]): Promise<void> {
+    let publicKey: string;
+    try {
+      publicKey = publicKeyFromPrivate(privateKey);
+    } catch {
+      return; // not an ed25519 PEM (a test fixture, a placeholder) — nothing to trust
+    }
+    const existing = await this.#readTrustedRecord(actorId);
+    if (existing) {
+      if (existing.publicKey.trim() !== publicKey.trim()) {
+        this.#note(`${actorId}: this repo already trusts a DIFFERENT public key for this actor — left as is; the local private key will not verify here`);
+      }
+      return;
+    }
+    await this.registerPublicKey({ keyId: actorId, publicKey, actorId, actorKind });
+  }
+  /** The trusted public-key record this repo holds for `keyId`, read from disk — the
+   *  in-memory keyring is only warmed by `Repo.open`, and `Repo.init` skips it. */
+  async #readTrustedRecord(keyId: string): Promise<KeyRecord | null> {
+    const p = join(this.#keysDir(), `${keyId}.json`);
+    if (!existsSync(p)) return null;
+    try {
+      return JSON.parse(await readFile(p, "utf8")) as KeyRecord;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Actor ids this machine holds a PRIVATE key for — i.e. who it can sign as. Merged over
+   * both sources (issue #98). Returns ids only: the key material must never travel with a
+   * listing, or `key ls` becomes the disclosure it is meant to help avoid.
    */
   async listLocalKeys(): Promise<string[]> {
-    const dir = this.#privateKeysDir();
+    return (await this.listLocalKeySources()).map((k) => k.actorId);
+  }
+
+  /**
+   * The same listing, saying WHICH keystore each key would be read from — the winner under
+   * repo → machine precedence. `key ls` needs this to stay honest: "signable on this
+   * machine" and "signable only in this checkout" are different facts, and a user with a
+   * repo override needs to be able to see it.
+   *
+   * `shadowed` marks a repo-local key that is hiding a machine key for the same actor id.
+   * Present only when true, so an entry that shadows nothing keeps the plain shape. Without
+   * it a listing cannot tell "this key exists only in this checkout" apart from "this
+   * checkout is overriding your machine identity" — and after the #98 migration adopts a
+   * key, every repo-local entry is the second kind.
+   */
+  async listLocalKeySources(): Promise<{ actorId: string; source: KeyScope; shadowed?: true }[]> {
+    const repoIds = await this.#listKeyDir(this.#privateKeysDir());
+    const machineIds = new Set(await listMachineKeys());
+    const by = new Map<string, KeyScope>();
+    for (const id of machineIds) by.set(id, "machine");
+    for (const id of repoIds) by.set(id, "repo"); // repo wins, matching #findLocalKey
+    return [...by.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([actorId, source]) => ({ actorId, source, ...(source === "repo" && machineIds.has(actorId) ? { shadowed: true as const } : {}) }));
+  }
+  async #listKeyDir(dir: string): Promise<string[]> {
     if (!existsSync(dir)) return [];
-    const { readdir } = await import("node:fs/promises");
-    return (await readdir(dir))
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => f.replace(/\.json$/, ""))
-      .sort();
+    try {
+      return (await readdir(dir)).filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, ""));
+    } catch {
+      return [];
+    }
   }
 
   /** Public keys this REPO trusts (shared/gossiped) — a different question from which
@@ -495,19 +632,85 @@ export class Repo {
    * not silently lose the ability to be recognised as themselves.
    */
   async ensureOwnerKey(actor: Actor, keyId = actor.id): Promise<{ keyId: string; created: boolean }> {
-    if (await this.loadLocalKey(actor.id)) return { keyId, created: false };
+    const held = await this.loadLocalKey(actor.id);
+    if (held) {
+      // The private half is machine-scoped now, the trusted public record is per-repo — so a
+      // repo created after the identity holds the key but does not yet trust it, and every
+      // signature it makes here is dropped by the trust gate. Register it, which is what the
+      // user means by "provision me here". Still idempotent: no new key is minted.
+      await this.#trustPrivateKeyOwner(actor.id, held, actor.kind);
+      return { keyId, created: false };
+    }
     return { keyId: await this.provisionOwnerKey(actor, keyId), created: true };
   }
 
-  /** Load a locally-held private key for `actorId`, or null if none is stored. */
+  /**
+   * Load a locally-held private key for `actorId`, or null if neither keystore holds one.
+   *
+   * Repo-local override first, then the machine keystore (issue #98). A key found ONLY in a
+   * repo-local store is also ADOPTED into the machine keystore here — that is the migration:
+   * every repo holding a key today keeps signing with exactly that key (precedence), and the
+   * identity becomes usable in the next repo the user creates without a second provision.
+   */
   async loadLocalKey(actorId: string): Promise<string | null> {
-    const p = join(this.#privateKeysDir(), `${actorId}.json`);
-    if (!existsSync(p)) return null;
+    const found = await this.#findLocalKey(actorId);
+    if (!found) return null;
+    if (found.source === "repo") await this.#adoptIntoMachineKeystore(actorId, found.privateKey);
+    return found.privateKey;
+  }
+
+  /** Where a private key for `actorId` comes from, repo-local first. */
+  async #findLocalKey(actorId: string): Promise<{ privateKey: string; source: KeyScope } | null> {
     try {
-      return (JSON.parse(await readFile(p, "utf8")) as { privateKey: string }).privateKey;
+      assertKeyFilename(actorId);
     } catch {
-      return null;
+      return null; // an id that cannot name a file has no key, rather than throwing on a read
     }
+    const repoKey = await readKeyFile(join(this.#privateKeysDir(), `${actorId}.json`));
+    if (repoKey) return { privateKey: repoKey.privateKey, source: "repo" };
+    const machine = await loadMachineKey(actorId);
+    return machine ? { privateKey: machine, source: "machine" } : null;
+  }
+
+  /**
+   * Copy a repo-local key into the machine keystore, once, and say so (issue #98 migration).
+   *
+   * The conflicting case is the one that matters: if the machine keystore already holds a
+   * DIFFERENT key for the same actor id, do nothing but warn.
+   *   - Overwriting would destroy a credential whose signatures already exist in history and
+   *     cannot be re-made — the same reason `ensureOwnerKey` is idempotent.
+   *   - Erroring would break a repo that works today, for a migration the user did not ask
+   *     for at this moment.
+   *   - Keeping both costs nothing: repo → machine precedence means this repo goes on signing
+   *     with exactly the key it signed with before, and the user is told there are two so
+   *     they can reconcile deliberately.
+   */
+  async #adoptIntoMachineKeystore(actorId: string, privateKey: string): Promise<void> {
+    if (!adoptionEnabled()) return;
+    const existing = await loadMachineKey(actorId);
+    if (existing === privateKey) return; // already adopted
+    if (existing) {
+      this.#note(
+        `${actorId}: this checkout holds a private key that differs from the one in the machine keystore ` +
+          `(${machineKeystoreDir()}) — keeping both; this repo keeps signing with its own. Remove one to reconcile.`,
+      );
+      return;
+    }
+    const kind = (await readKeyFile(join(this.#privateKeysDir(), `${actorId}.json`)))?.actorKind ?? kindOfActorId(actorId);
+    try {
+      await saveMachineKey({ actorId, privateKey, actorKind: kind });
+    } catch (e) {
+      // Adoption is a convenience on a READ path: `loadLocalKey` is what `#resolveHubSigner`
+      // and the MCP decision signer call. A read-only home, a full disk or an odd
+      // $XDG_CONFIG_HOME must not take away a repo's ability to sign with the key it already
+      // has — that would turn a migration into an outage.
+      this.#note(`${actorId}: could not adopt this checkout's key into the machine keystore (${(e as Error).message}); this repo still signs with its own copy`);
+      return;
+    }
+    this.#note(
+      `${actorId}: private key adopted from this checkout into the machine keystore (${machineKeyPath(actorId)}); ` +
+        `other repos on this machine can now sign as ${actorId}. The copy in this repo still takes precedence.`,
+    );
   }
   /**
    * Resolve the local actor key used to authenticate hub writes (SSH-style transport auth):
@@ -515,7 +718,8 @@ export class Repo {
    *   1. an explicit actorId (CLI `--as`),
    *   2. the `AVCS_ACTOR` env var,
    *   3. `actorId` in `.avcs/config.json`,
-   *   4. the sole key in the private keystore (unambiguous default identity).
+   *   4. the sole key across both keystores — repo-local override, then the machine
+   *      keystore (issue #98) — as the unambiguous default identity.
    * Returns undefined when no local key resolves — an unsigned write still succeeds against
    * a no-auth/read-public hub, so signing is opt-in by having a key, not mandatory.
    */
@@ -537,10 +741,10 @@ export class Repo {
       if (typeof cfg.actorId === "string") actorId = cfg.actorId;
     }
     if (!actorId) {
-      try {
-        const files = (await readdir(this.#privateKeysDir())).filter((f) => f.endsWith(".json"));
-        if (files.length === 1) actorId = files[0]!.replace(/\.json$/, "");
-      } catch { /* no private keystore yet */ }
+      // The sole key across BOTH keystores (issue #98) — so a repo freshly `init`'d on a
+      // machine that already holds one identity resolves it without any configuration.
+      const held = await this.listLocalKeySources();
+      if (held.length === 1) actorId = held[0]!.actorId;
     }
     return actorId;
   }
@@ -551,7 +755,10 @@ export class Repo {
    */
   async provisionOwnerKey(actor: Actor, keyId = actor.id): Promise<string> {
     const { privateKey } = await this.generateActorKey(actor, keyId);
-    await this.saveLocalKey(actor.id, privateKey);
+    // Machine scope (issue #98): `key provision` mints an identity for a person on a box.
+    // The public half is registered as trusted in THIS repo by `generateActorKey`, because
+    // trust is a per-repo, gossiped assertion; only the secret is machine-wide.
+    await this.saveLocalKey(actor.id, privateKey, { scope: "machine", actorKind: actor.kind });
     return keyId;
   }
   #sign(type: string, payload: Record<string, unknown>, signWith?: { keyId: string; privateKey: string }): Signature | undefined {
