@@ -2,7 +2,10 @@
 #
 # AVCS uninstaller — removes the `avcs` launcher created by install.sh.
 # This only deletes the launcher; your repo checkout and any .avcs data are
-# left untouched.
+# left untouched — including the machine keystore (~/.avcs/private, or
+# $XDG_CONFIG_HOME/avcs/private). Signing keys are credentials whose signatures
+# already exist in history: an uninstaller must never destroy them silently.
+# Remove that directory by hand if you really mean to.
 #
 # Usage:
 #   ./uninstall.sh [--bin-dir <dir>] [--name <cmd>]

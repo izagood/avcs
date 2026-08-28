@@ -18,6 +18,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Repo } from "../api/repo.ts";
+import { machineKeystoreDir } from "../api/keystore.ts";
 import { isBinary } from "../core/bytes.ts";
 import { ObjectStore } from "../store/objectStore.ts";
 import { serializeResult, errorEnvelope, boundedLimit } from "./respond.ts";
@@ -502,6 +503,12 @@ export const TOOLS: ToolDef[] = [
     handler: async (repo) => ({
       local: await repo.listLocalKeys(),
       trusted: await repo.listTrustedKeys(),
+      // Additive (issue #98): there are two private keystores now — the machine-level one
+      // and the repo-local override — and an agent reasoning about "can I sign here?"
+      // needs to know which, because a repo override only applies in that checkout.
+      localSources: await repo.listLocalKeySources(),
+      keystore: machineKeystoreDir(),
+      keystoreNotices: repo.keystoreNotices,
     }),
   },
   {
