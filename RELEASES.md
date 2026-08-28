@@ -31,6 +31,9 @@ particular every change to the **reduce/merge algorithm** or the **operation for
   written by `pushToHub`; not gossiped.
 - Recorded as a first-class `Undo` object (`repo.listUndos()`), alongside the NEW `view`
   object the exclusion authors — the act is append-only in both halves.
+- In a git-bridge repo, `--purge` also names what it did NOT reach: git keeps its own copy of
+  what it committed, and clearing that is the user's call (it differs once pushed), so the CLI
+  points at the commit rather than acting. No git ⇒ no extra output.
 - **Determinism unchanged.** Excluding ops is an already-supported reduce input, so
   `MATERIALIZER_VERSION` / `MERGE3_VERSION` are NOT bumped. Verified under
   `AVCS_VERIFY_INCREMENTAL=1`.
