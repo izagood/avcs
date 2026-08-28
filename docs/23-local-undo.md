@@ -54,19 +54,19 @@ API는 `repo.undo({ ops \| last, view, workspace, purge, by, reason })` → `Und
 그 경우 필요한 것은 projection에서 빼는 것뿐이다. 바이트를 지우는 쪽은 **따로 이름 붙여** 옵트인
 시킨다 — 되돌릴 수 없는 일은 실수로 일어나면 안 된다.
 
-## 3. 경계: undo ↔ redact
+## 3. 경계: undo ↔ redact ↔ (git은 avcs의 일이 아니다)
 
-이 기능의 핵심은 명령이 아니라 **경계**다.
+이 기능의 핵심은 명령이 아니라 **경계**다. 그리고 경계는 둘이 아니라 **셋**이다.
 
 ```
-      아직 push 안 됨                        이미 push 됨
-  ┌──────────────────────────┐        ┌──────────────────────────────┐
-  │  avcs undo [--purge]     │        │  repo.redact(blob, …)        │
-  │  · 역할 요구 없음         │        │  · role admin 필요            │
-  │  · 서명 없음              │        │  · admin 서명 필수            │
-  │  · 전파 없음              │        │  · 모든 replica에 전파         │
-  │  · Undo 객체로 기록       │        │  · Redaction 객체로 기록       │
-  └──────────────────────────┘        └──────────────────────────────┘
+  ① 공유 전 avcs 이력            ② 공유된 avcs 이력            ③ git 쪽 객체
+  ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │  avcs undo [--purge]     │  │  repo.redact(blob, …)    │  │  avcs의 일이 아니다        │
+  │  · 역할 요구 없음         │  │  · role admin 필요        │  │  · git reset / rebase     │
+  │  · 서명 없음              │  │  · admin 서명 필수        │  │  · git filter-repo        │
+  │  · 전파 없음              │  │  · 모든 replica에 전파     │  │  · push했다면 호스트 절차  │
+  │  · Undo 객체로 기록       │  │  · Redaction 객체로 기록   │  │  ↳ 사용자가 결정한다       │
+  └──────────────────────────┘  └──────────────────────────┘  └──────────────────────────┘
 ```
 
 - **undo가 role을 요구하지 않는 이유**: undo는 op이 push된 순간 **거부한다**(§5). 따라서
@@ -77,6 +77,41 @@ API는 `repo.undo({ ops \| last, view, workspace, purge, by, reason })` → `Und
 
 두 객체를 하나로 합치지 않은 것도 같은 이유다. `Undo`와 `Redaction`이 별개이기 때문에
 `applyRedactions`(전파)는 undo를 절대 집어 들지 않고, hub는 admin 서명 없는 축출을 계속 거부한다.
+
+### 3.1 ③ git 티어 — 축출이 닿지 않는 곳
+
+git 브리지 모드(docs/14)에서는 같은 파일이 **두 저장소에** 들어간다. `undo --purge`는 avcs
+쪽만 축출한다. git commit 객체는 그대로 남는다:
+
+```
+$ avcs undo --last --purge
+purged 1 blob(s) — bytes evicted, not recoverable
+
+$ grep -rl "GITMODE456SECRET" .avcs/      → 없음                    ✅
+$ git log --all -S "GITMODE456SECRET"     → 8a81259 oops: …          ← 여전히 있다
+```
+
+**이것은 올바른 동작이다.** git 이력을 재작성하는 것은 avcs 명령이 할 일이 아니다 — 올바른
+조치가 push 여부에 따라 달라지므로 그 판단은 사용자의 것이고, avcs가 대신 내려선 안 된다.
+
+하지만 **침묵은 그보다 나쁘다.** 방금 크리덴셜을 흘린 사람에게 `bytes evicted, not
+recoverable`은 *처리됐다*로 읽히고, 브리지 모드에서 그것은 사실이 아니다. 그래서
+`avcs undo --purge`는 **git이 실제로 있을 때만** 자기가 닿지 못한 곳을 말한다:
+
+```
+purged 1 blob(s) — bytes evicted, not recoverable
+note: those bytes are gone from AVCS only — git keeps its own copy of what it committed.
+  git 8a81259 still contains src/config.ts
+  clearing them from git is a separate step, and differs once pushed — avcs will not do it for you
+```
+
+- 탐지는 이 파일의 다른 곳과 같은 조용한 probe(`gitCmd(cwd, ["rev-parse", "--git-dir"])`)다.
+  **git이 없으면 아무 말도 하지 않는다** — 독립 모드 메시지는 이미 정확하고, 없는 도구에 대한
+  주의를 달아 어지럽히지 않는다(테스트가 이 절반도 함께 고정한다).
+- git이 커밋을 짚어 줄 수 있으면 **그 sha를 이름으로 부른다**(`git log --all -n 1 --pretty=%h
+  -- <path>`). 짚을 수 없으면 단정하지 않고 **조건으로** 말한다("if these files were committed
+  to git, …") — 확인하지 않은 것을 확인한 것처럼 말하지 않는다.
+- **git 명령을 대신 실행해 주겠다고 제안하지 않는다.**
 
 ## 4. `--purge`: 무엇이 "유일 참조"인가
 
