@@ -287,38 +287,253 @@ async function installHooks(hooksDir: string, avcsCmd: string, force: boolean): 
 }
 
 /**
- * After `undo --purge`, name the copy the eviction could NOT reach: git's.
+ * The git side of `undo --purge` (docs/23 §3.1).
  *
- * `undo` is an AVCS command and has no business rewriting git history — the correct fix
- * differs by whether the commit was pushed, so it is the user's call and no avcs command
- * should make it for them. But silence is worse than useless here: to somebody who just
- * leaked a credential, "bytes evicted, not recoverable" reads as *handled*, and in bridge
- * mode it is not — git still holds its own object.
+ * In bridge mode the same file lands in TWO stores, so an eviction that stops at `.avcs/`
+ * leaves the secret readable in a git object while the CLI prints `bytes evicted, not
+ * recoverable`. That is a trap, and telling the user to go run `filter-repo` themselves
+ * hands back the hardest part of the job. So `--purge` finishes it in git too.
  *
- * Only speaks when git is actually present (same silent probe as everywhere else in this
- * file). No git, no extra line: the standalone message is already accurate and stays clean.
- * Names a concrete commit when git can point at one, and states a CONDITION when it can't,
- * rather than asserting something it did not check.
+ * It does so only where it can PROVE the rewrite is safe and local — every condition below
+ * is checked against git itself, not assumed — and where it cannot, it does the AVCS side
+ * anyway and names what is left plus the exact command for that situation. The dangerous
+ * cases are refusals, not silent best-effort:
+ *
+ *  1. reachable from a remote ⇒ published; rotation is the only real remediation and a
+ *     force-push is theatre. avcs never pushes, with or without a flag.
+ *  2. reachable from another local ref (tag, second branch, a stash) ⇒ moving this branch
+ *     alone would leave the bytes reachable, so the purge would not be one.
+ *  3. detached HEAD ⇒ no branch to move.
+ *  4. the commits are not a contiguous run at the tip ⇒ removing them is a genuine history
+ *     rewrite, not a reset. Different, harder job: `filter-repo`.
+ *  5. a commit in that run also carries work no undone op covers ⇒ a blind reset would
+ *     destroy something the user did not ask to destroy.
+ *  6. a dirty tree ⇒ HEAD must not move out from under uncommitted work.
+ *
+ * `pushedOps` (the AVCS push ledger, docs/23 §5) is a SEPARATE and independent check that
+ * `repo.undo` already enforces: an op can be un-pushed to the hub while its git commit sits
+ * on `origin`, and vice versa. Both have to hold.
+ *
+ * Silent probes throughout (`gitCmd`'s `stdio: ["ignore","pipe","ignore"]`), and no git means
+ * no output at all: the standalone message is already accurate and gains nothing from a
+ * caution about a tool that is not here.
  */
-async function warnGitStillHolds(repo: Repo, undoneOps: string[]): Promise<void> {
-  if (!gitCmd(cwd, ["rev-parse", "--git-dir"])) return;
+type GitPurge =
+  | { do: "nothing" }
+  | { do: "remove"; branch: string; resetTo: string | null; commits: string[] }
+  | { do: "refuse"; because: string; detail: string[]; remedy: string[] };
+
+const gitLines = (s: string | null): string[] => (s ?? "").split("\n").filter((l) => l.length > 0);
+
+/** Paths the undone ops wrote — where git's own copy of the same bytes would be. */
+async function pathsOfOps(repo: Repo, ops: string[]): Promise<string[]> {
   const paths: string[] = [];
-  for (const oid of undoneOps) {
+  for (const oid of ops) {
     const op = await repo.store.get<Operation>(oid).catch(() => null);
     const path = op?.body.path ?? op?.target.entityId;
     if (path && !paths.includes(path)) paths.push(path);
   }
-  console.log("note: those bytes are gone from AVCS only — git keeps its own copy of what it committed.");
-  const SHOWN = 5;
-  const named: string[] = [];
-  for (const p of paths) {
-    const sha = gitCmd(cwd, ["log", "--all", "-n", "1", "--pretty=%h", "--", p]);
-    if (sha) named.push(`  git ${sha} still contains ${p}`);
+  return paths;
+}
+
+/** Every path one commit changed. `--root` because git omits the initial commit's diff
+ *  without it, and `--no-renames` so a rename reports BOTH sides (a purge cares about both).
+ *  `-z` so a path with a space is not returned quoted. */
+function commitPaths(dir: string, sha: string): string[] {
+  const raw = gitCmd(dir, ["log", "-1", "--root", "--pretty=format:", "--name-only", "--no-renames", "-z", sha]);
+  return (raw ?? "").split("\0").map((p) => p.trim()).filter((p) => p.length > 0);
+}
+
+function shortSha(dir: string, sha: string): string {
+  return gitCmd(dir, ["rev-parse", "--short", sha]) ?? sha.slice(0, 7);
+}
+
+/** `avcs undo --purge <oids>` — the retry that re-does only the git half, since the AVCS
+ *  half has already converged. Never `--last`: after the undo, `--last` names a DIFFERENT
+ *  commit, so telling the user to repeat it would walk them one commit further back. */
+function retryCommand(ops: string[]): string {
+  return `avcs undo --purge ${ops.join(" ")}`;
+}
+
+function planGitPurge(dir: string, paths: string[], ops: string[]): GitPurge {
+  if (gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") return { do: "nothing" };
+  const head = gitCmd(dir, ["rev-parse", "HEAD"]);
+  if (!head || !paths.length) return { do: "nothing" };
+  // Newest first. Path-limited, so it names exactly the commits that could hold these bytes.
+  const touching = gitLines(gitCmd(dir, ["log", "--pretty=%H", "HEAD", "--", ...paths]));
+  if (!touching.length) return { do: "nothing" }; // git never committed these paths
+  const invert = paths.map((p) => `--path ${p}`).join(" ");
+  const rewrite = [
+    `    git filter-repo ${invert} --invert-paths`,
+    `    (no filter-repo? git filter-branch --index-filter 'git rm --cached --ignore-unmatch ${paths.join(" ")}' -- --all)`,
+    "  Then confirm it worked:  git log --all -S '<the secret>'",
+  ];
+
+  // ① Published. Checked first because it outranks every other finding: once served, the
+  //    secret is out, and no local surgery changes that.
+  const refs = gitLines(gitCmd(dir, ["for-each-ref", "--format=%(refname)"]));
+  const remotes = refs.filter((r) => r.startsWith("refs/remotes/"));
+  const onRemote = remotes.length ? touching.filter((c) => reachableFrom(dir, c, remotes)) : [];
+  if (onRemote.length) {
+    const where = remotes.filter((r) => reachableFrom(dir, onRemote[0] as string, [r])).map((r) => r.replace("refs/remotes/", ""));
+    return {
+      do: "refuse",
+      because: "the commit is already on a remote",
+      detail: [`  ${shortSha(dir, onRemote[0] as string)} is reachable from ${where.join(", ") || "a remote-tracking ref"}`],
+      remedy: [
+        "  ROTATE THE CREDENTIAL. It is published — anyone who fetched already has it, so rewriting",
+        "  history now is theatre: it cannot un-publish what was already served. avcs will not",
+        "  force-push for you, and there is no flag for it.",
+        "  Cleaning the remote afterwards is your host's procedure, and costs every collaborator a re-clone.",
+      ],
+    };
   }
-  for (const line of named.slice(0, SHOWN)) console.log(line);
-  if (named.length > SHOWN) console.log(`  …and ${named.length - SHOWN} more path(s) in git history`);
-  if (!named.length) console.log("  if these files were committed to git, that history still holds them");
-  console.log("  clearing them from git is a separate step, and differs once pushed — avcs will not do it for you");
+
+  // ② No branch to move.
+  const branch = gitCmd(dir, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (!branch) {
+    return {
+      do: "refuse",
+      because: "HEAD is detached",
+      detail: ["  there is no branch here for avcs to move"],
+      remedy: [`  Check out the branch that holds those commits, then re-run:  ${retryCommand(ops)}`],
+    };
+  }
+
+  // ③ Not at the tip. A secret buried under later commits is a rewrite, not a reset.
+  const buried = (why: string): GitPurge => ({ do: "refuse", because: "the commit is not at the tip", detail: [`  ${why}`], remedy: ["  Removing it is a genuine history rewrite rather than a reset — a different, harder job:", ...rewrite] });
+  if (touching[0] !== head) {
+    const later = gitLines(gitCmd(dir, ["rev-list", `${touching[0]}..HEAD`])).length;
+    return buried(`${shortSha(dir, touching[0] as string)} holds ${paths.join(", ")}, and ${later} later commit(s) sit on top of it`);
+  }
+  const chain = gitLines(gitCmd(dir, ["rev-list", "--first-parent", "HEAD"]));
+  const oldest = touching[touching.length - 1] as string;
+  const depth = chain.indexOf(oldest);
+  if (depth < 0) return buried(`${shortSha(dir, oldest)} is not on this branch's first-parent line`);
+  const window = chain.slice(0, depth + 1);
+  if (gitLines(gitCmd(dir, ["rev-list", "--merges", "--no-walk", ...window])).length) {
+    return buried("a merge commit is in the run that would have to be removed");
+  }
+
+  // ④ Another ref would keep the bytes reachable, so the reset would not purge anything.
+  const others = refs.filter((r) => r !== `refs/heads/${branch}`);
+  const held = others.length ? window.filter((c) => reachableFrom(dir, c, others)) : [];
+  if (held.length) {
+    const by = others.filter((r) => reachableFrom(dir, held[0] as string, [r]));
+    return {
+      do: "refuse",
+      because: "another ref still points into that history",
+      detail: [`  ${shortSha(dir, held[0] as string)} is also reachable from ${by.join(", ")}`],
+      remedy: [
+        `  Moving \`${branch}\` alone would leave the bytes reachable, so the purge would not be one.`,
+        `  Delete or move that ref yourself, then re-run:  ${retryCommand(ops)}`,
+      ],
+    };
+  }
+
+  // ⑤ Something else in the run that the user never asked to lose.
+  const covers = (p: string): boolean => paths.includes(p) || p === ".avcs" || p.startsWith(".avcs/");
+  for (const sha of window) {
+    const changed = commitPaths(dir, sha);
+    const extra = changed.filter((p) => !covers(p));
+    if (!extra.length) continue;
+    if (changed.some(covers)) {
+      return {
+        do: "refuse",
+        because: `${shortSha(dir, sha)} also carries work you did not undo`,
+        detail: [`  it changes ${extra.join(", ")}, which no undone op covers`],
+        remedy: [
+          "  Dropping that commit would drop that work with it, and you did not ask for that.",
+          `  Either undo those ops too and re-run, or rewrite just the leaked path:`,
+          ...rewrite,
+        ],
+      };
+    }
+    return buried(`${shortSha(dir, sha)} changes only ${extra.join(", ")}, and sits inside the run that would have to go`);
+  }
+
+  // ⑥ HEAD must not move out from under uncommitted work. Untracked entries are exempt:
+  //    a `--mixed` reset never touches them, and in sidecar mode `.avcs/` is one of them.
+  const dirty = gitLines(gitCmd(dir, ["status", "--porcelain"]))
+    .filter((l) => !l.startsWith("??"))
+    .filter((l) => !l.slice(3).startsWith(".avcs/"));
+  if (dirty.length) {
+    return {
+      do: "refuse",
+      because: "the git tree is not clean",
+      detail: dirty.slice(0, 5).map((l) => `  ${l}`),
+      remedy: [
+        "  Moving HEAD out from under uncommitted work is how work gets lost, so avcs stops here.",
+        `  Commit those changes or set them aside, then re-run:  ${retryCommand(ops)}`,
+      ],
+    };
+  }
+
+  // Every condition holds. `resetTo === null` ⇒ the whole run is the branch's entire
+  // history, so the branch itself goes and is left unborn — nothing extra is lost, since
+  // the only thing it held is what we were asked to remove.
+  const parent = gitCmd(dir, ["rev-parse", "--verify", "--quiet", `${window[window.length - 1]}^`]);
+  return { do: "remove", branch, resetTo: parent, commits: window };
+}
+
+/** Is `sha` reachable from any of `from`? `rev-list -1 sha --not <refs>` prints nothing
+ *  exactly when everything reachable from `sha` is already covered by them. */
+function reachableFrom(dir: string, sha: string, from: string[]): boolean {
+  return gitCmd(dir, ["rev-list", "-1", sha, "--not", ...from]) === "";
+}
+
+/**
+ * Carry out the plan and REPORT what actually happened, verified rather than asserted.
+ *
+ * `--mixed`, deliberately: it moves the branch and resets the index but never touches the
+ * working tree, so the leaked file stays on disk. That is correct — the user still has to
+ * fix it — and it makes the two planes agree afterwards: git calls the file untracked (or
+ * modified), and the AVCS view no longer selects the op, so `avcs status` calls it new. Both
+ * say "this content is on disk and is recorded nowhere".
+ *
+ * Then the object itself goes, not merely its reachability: `--expire-unreachable` drops the
+ * reflog entries that would otherwise hand the commit back (and only those — the user's
+ * reflog for still-reachable work survives), `ORIG_HEAD` is removed because `reset` had just
+ * written it, and `gc --prune=now` collects what is left.
+ */
+function applyGitPurge(dir: string, plan: Extract<GitPurge, { do: "remove" }>): void {
+  const shorts = plan.commits.map((c) => `${shortSha(dir, c)} ${gitCmd(dir, ["log", "-1", "--pretty=%s", c]) ?? ""}`.trim());
+  if (plan.resetTo) {
+    gitCmd(dir, ["reset", "--mixed", plan.resetTo]);
+  } else {
+    gitCmd(dir, ["update-ref", "-d", `refs/heads/${plan.branch}`]);
+    gitCmd(dir, ["rm", "-r", "--cached", "-q", "--", "."]);
+  }
+  gitCmd(dir, ["update-ref", "-d", "ORIG_HEAD"]);
+  gitCmd(dir, ["reflog", "expire", "--expire-unreachable=now", "--all"]);
+  gitCmd(dir, ["gc", "--prune=now", "--quiet"]);
+
+  const survivors = plan.commits.filter((c) => gitCmd(dir, ["cat-file", "-e", `${c}^{commit}`]) !== null);
+  console.log(`git: removed ${plan.commits.length} commit(s) holding those bytes from \`${plan.branch}\`, and pruned the objects.`);
+  for (const s of shorts) console.log(`  - ${s}`);
+  console.log(plan.resetTo ? `  ${plan.branch} is now at ${shortSha(dir, plan.resetTo)}.` : `  ${plan.branch} is unborn now — that run was its whole history.`);
+  console.log("  The working tree is untouched, so the leaked file is still on disk and no longer tracked — fix it before you commit again.");
+  if (survivors.length) {
+    console.log(`  WARNING: git can still read ${survivors.map((c) => shortSha(dir, c)).join(", ")} — something else holds it.`);
+    console.log("  Check `git fsck --lost-found`, other worktrees, and `git reflog --all`, then re-check with `git log --all -S '<the secret>'`.");
+  }
+}
+
+/** The git half of `undo --purge`: do it where it is provably safe, and where it is not, say
+ *  precisely what is left and the one command that fits that situation. */
+async function settleGitAfterPurge(repo: Repo, ops: string[], noGit: boolean): Promise<void> {
+  const paths = await pathsOfOps(repo, ops);
+  const plan = planGitPurge(cwd, paths, ops);
+  if (plan.do === "nothing") return;
+  if (noGit) {
+    console.log("git: --no-git — git still holds its own copy of those bytes, and clearing it is on you.");
+    console.log(`  When you want avcs to try:  ${retryCommand(ops)}`);
+    return;
+  }
+  if (plan.do === "remove") return applyGitPurge(cwd, plan);
+  console.log(`git: those bytes are in git too, and avcs did NOT remove them — ${plan.because}.`);
+  for (const d of plan.detail) console.log(d);
+  for (const r of plan.remedy) console.log(r);
 }
 
 async function main(): Promise<void> {
@@ -798,18 +1013,22 @@ async function main(): Promise<void> {
         by: flag("--author") ?? "human:cli",
         ...(flag("--reason") ? { reason: flag("--reason") as string } : {}),
       });
+      // The git half runs on every `--purge`, including a converged re-run that evicts
+      // nothing new: the AVCS side is idempotent, so a retry after a refusal (say, once the
+      // tree is clean) must be able to finish the git side it could not do the first time.
+      const purging = args.includes("--purge");
+      const targeted = [...r.excluded, ...r.alreadyExcluded];
       if (!r.excluded.length && !r.purged.length) {
         console.log(`nothing to undo — ${r.alreadyExcluded.length} op(s) were already undone in ${scopeLabel(scope)}`);
+        if (purging) await settleGitAfterPurge(repo, targeted, args.includes("--no-git"));
         break;
       }
       console.log(`undid ${r.excluded.length} op(s) in ${scopeLabel(scope)}`);
       for (const o of r.excluded) console.log(`  - ${o}`);
-      if (r.purged.length) {
-        console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
-        await warnGitStillHolds(repo, [...r.excluded, ...r.alreadyExcluded]);
-      }
+      if (r.purged.length) console.log(`purged ${r.purged.length} blob(s) — bytes evicted, not recoverable`);
+      if (purging) await settleGitAfterPurge(repo, targeted, args.includes("--no-git"));
       if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
-      if (!args.includes("--purge")) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
+      if (!purging) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
       console.log(`recorded as ${r.undoOid}`);
       break;
     }
@@ -1368,8 +1587,11 @@ async function main(): Promise<void> {
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view]             write the view's files into the working dir\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
-          "  undo [--last | <op-oid>…] [--purge] [--reason r]  drop local ops from the view;\n" +
-          "                              --purge also evicts the bytes they uniquely reference (irreversible).\n" +
+          "  undo [--last | <op-oid>…] [--purge] [--no-git] [--reason r]  drop local ops from the view;\n" +
+          "                              --purge also evicts the bytes they uniquely reference (irreversible),\n" +
+          "                              and in a git repo removes the commit(s) holding them too — only when\n" +
+          "                              nothing is pushed, they are at the tip, and no other work would be\n" +
+          "                              lost. Otherwise it says what is left. --no-git skips the git half.\n" +
           "                              Refuses once the ops have been pushed — that case is `redact` (admin)\n" +
           "  git-sync -m <msg> [--commit]   capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
           "  git-mode [sidecar|committed]   show/set how AVCS history relates to git\n" +

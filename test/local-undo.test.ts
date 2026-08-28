@@ -27,6 +27,13 @@ const git = (cwd: string, ...a: string[]): string =>
   execFileSync("git", a, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 const hasGit = (() => { try { execFileSync("git", ["--version"], { stdio: "ignore" }); return true; } catch { return false; } })();
 const SECRET = "AWS_SECRET_ACCESS_KEY=SUPERSECRET123\n";
+/** True when `git <a…>` exits non-zero — the shape a "the object is gone" probe needs. */
+const gitFails = (cwd: string, ...a: string[]): boolean => {
+  try { execFileSync("git", a, { cwd, stdio: "ignore" }); return false; } catch { return true; }
+};
+/** True when any byte under `.avcs/` still contains `needle` (the eviction's own proof). */
+const grepAvcs = (cwd: string, needle: string): boolean =>
+  spawnSync("grep", ["-rq", needle, ".avcs"], { cwd }).status === 0;
 
 /** The issue's repro: one legitimate commit, then one that slipped `.env` in. */
 async function repoWithLeak(): Promise<{
@@ -318,39 +325,58 @@ test("--purge also scrubs the derived copies: a persisted snapshot holds merged 
   await rm(dir, { recursive: true, force: true });
 });
 
-// The git bridge is the third tier: `undo --purge` evicts the AVCS copy, and git keeps its
-// own. That is correct — rewriting git history is not an avcs command's business — but
-// "bytes evicted, not recoverable" reads as "handled" to someone who just leaked a
-// credential, so the CLI has to name what it did NOT do.
-test("in a git repo, --purge says the git object still holds the bytes", { skip: !hasGit }, async () => {
+// ── the git plane (docs/23 §3.1) ───────────────────────────────────────────────
+//
+// `undo --purge` used to stop at the AVCS store and merely NAME git's surviving copy. It
+// no longer does: a command that says "bytes evicted, not recoverable" while the secret
+// sits in a git object is a trap, and handing the user `filter-repo` gives back the hardest
+// part of the job. So `--purge` finishes the job in git too — but ONLY when it can prove
+// doing so is safe and local, and it says exactly what is left when it cannot.
+
+/** A git repo with the avcs bridge hooks installed, so `git commit` ingests into AVCS. */
+async function bridged(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "avcs-undo-git-"));
-  git(dir, "init", "-q");
+  git(dir, "init", "-q", ".");
   git(dir, "config", "user.email", "t@example.com");
   git(dir, "config", "user.name", "Tester");
-  avcs(dir, "init", "."); // installs the bridge hooks, so `git commit` ingests into AVCS too
+  avcs(dir, "init", ".");
+  return dir;
+}
 
-  // NOT `.env`: a global gitignore commonly ignores it, which would make git stage nothing
-  // and this test silently prove nothing. An ordinary source filename is always tracked.
-  await mkdir(join(dir, "src"), { recursive: true });
-  await writeFile(join(dir, "src/config.ts"), 'export const TOKEN = "GITMODE456SECRET"\n', "utf8");
+/** Commit `files` through git, so both planes record it. */
+async function gitCommit(dir: string, message: string, files: Record<string, string>): Promise<string> {
+  for (const [rel, content] of Object.entries(files)) {
+    await mkdir(join(dir, rel, ".."), { recursive: true });
+    await writeFile(join(dir, rel), content, "utf8");
+  }
   git(dir, "add", "-A");
-  git(dir, "commit", "-m", "oops");
-  assert.match(avcs(dir, "log"), /src\/config\.ts/, "the hook ingested the commit into AVCS");
-  const sha = git(dir, "log", "--all", "-n", "1", "--pretty=%h", "--", "src/config.ts");
-  assert.ok(sha, "git holds a commit touching the path");
+  git(dir, "commit", "-m", message);
+  return git(dir, "rev-parse", "HEAD");
+}
+
+// NOT `.env` anywhere below: a global gitignore commonly ignores it, which would make git
+// stage nothing and these tests silently prove nothing. An ordinary source filename is
+// always tracked.
+const GSECRET = "GITMODE456SECRET";
+const LEAK = `export const TOKEN = "${GSECRET}"\n`;
+
+test("undo --last --purge clears the secret from BOTH planes (the whole point)", { skip: !hasGit }, async () => {
+  const dir = await bridged();
+  await gitCommit(dir, "ok", { "app.ts": "export const v = 1\n" });
+  const bad = await gitCommit(dir, "oops", { "src/config.ts": LEAK });
 
   const out = avcs(dir, "undo", "--last", "--purge", "--reason", "hardcoded token");
   assert.match(out, /purged 1 blob/);
-  assert.match(out, /gone from AVCS only/i, "names what the eviction did not reach");
-  assert.match(out, new RegExp(`git ${sha}`), "and names the commit that still contains it");
-  assert.match(out, /src\/config\.ts/);
-  assert.doesNotMatch(out, /run `?git (reset|filter-repo|rebase)/, "does not offer to rewrite their git history");
 
-  // The claim is true: AVCS evicted its copy, git kept its own.
-  const repo = await Repo.open(dir);
-  const purged = (await repo.listUndos()).at(-1)?.purged ?? [];
-  assert.equal(purged.length, 1);
-  assert.doesNotMatch((await repo.readBlob(purged[0] as string)).toString("utf8"), /GITMODE456SECRET/);
-  assert.match(git(dir, "log", "--all", "-S", "GITMODE456SECRET", "--oneline"), /oops/);
+  // ① the AVCS plane: no byte of it anywhere under .avcs/
+  assert.equal(grepAvcs(dir, GSECRET), false, "no copy left in .avcs/");
+  // ② the git plane: the pickaxe finds nothing, and the object is really gone (not merely
+  //    unreachable — the reflog and a lost-found fsck would still hand it back).
+  assert.equal(git(dir, "log", "--all", "-S", GSECRET, "--oneline"), "", "git holds no commit with it");
+  assert.equal(gitFails(dir, "cat-file", "-e", `${bad}^{commit}`), true, "the commit object is pruned");
+  // ③ the earlier legitimate commit survives in both planes
+  assert.match(git(dir, "log", "--oneline"), /ok$/m);
+  assert.ok((await (await Repo.open(dir)).materialize()).tree.has("app.ts"), "avcs kept the good commit");
+
   await rm(dir, { recursive: true, force: true });
 });
