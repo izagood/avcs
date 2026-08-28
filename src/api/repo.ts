@@ -2164,10 +2164,26 @@ export class Repo {
    */
   async integrateHub(
     remoteOrUrl: string,
-    args: { view: string; checkpoint: string; by: string; ticketId?: string; signWith?: { keyId: string; privateKey: string } },
+    args: { view: string; checkpoint: string; by?: string; ticketId?: string; signWith?: { keyId: string; privateKey: string } },
   ): Promise<{ verdict: IntegrationResult["verdict"]; legacy?: boolean } & Record<string, unknown>> {
     const url = await this.#resolveRemote(remoteOrUrl);
-    const signWith = args.signWith ?? (await this.#resolveHubSigner(args.by));
+    // Resolve the actor ONCE, here (issue #95). `by` is two things at once — who signs the
+    // request, and who the integration ticket records — so the two must not be allowed to
+    // disagree, and neither may be `undefined` on the wire (a missing `by` reaches the hub
+    // as a malformed body and comes back 400).
+    //
+    // Callers may omit it: `localActorId` already knows the order
+    // (explicit → AVCS_ACTOR → config.json → the sole private key). The CLI used to
+    // duplicate the first two steps and then substitute the literal "human:cli", which has
+    // no key and no membership, so an authenticating hub refused the credential outright.
+    const by = await this.localActorId(args.by);
+    if (!by) {
+      throw new Error(
+        "no actor identity to integrate as — pass --as <actor-id>, set AVCS_ACTOR, " +
+          "record `actorId` in .avcs/config.json, or run `avcs key provision <actor-id>`",
+      );
+    }
+    const signWith = args.signWith ?? (await this.#resolveHubSigner(by));
     let hasIntegrate = false;
     try {
       const v = (await (await fetch(`${url}/version`)).json()) as { integrate?: boolean };
@@ -2176,7 +2192,7 @@ export class Repo {
 
     if (hasIntegrate) {
       const { integrateWithHub } = await import("../hub/hubClient.ts");
-      const r = await integrateWithHub(this.dir, url, { ...args, signWith });
+      const r = await integrateWithHub(this.dir, url, { ...args, by, signWith });
       // needs_evidence pulled delta objects through a separate store — refresh caches.
       this.#blobCache.clear();
       return r as { verdict: IntegrationResult["verdict"] } & Record<string, unknown>;
@@ -2185,10 +2201,10 @@ export class Repo {
     // Legacy fallback (old hub): finalize CAS + pull, bounded retries. This CAN lose
     // races (that is exactly the funnel Phase 14 removes) — surfaced honestly.
     for (let attempt = 0; attempt < 3; attempt++) {
-      await this.pullHub(url, { as: args.by });
+      await this.pullHub(url, { as: by });
       const parentHead = await this.protectedHead(args.view);
-      await this.pushHub(url, { as: args.by });
-      const r = await this.finalizeHub(url, { view: args.view, newCheckpoint: args.checkpoint, parentHead, by: args.by, signWith });
+      await this.pushHub(url, { as: by });
+      const r = await this.finalizeHub(url, { view: args.view, newCheckpoint: args.checkpoint, parentHead, by, signWith });
       if (r.finalized) return { verdict: "advanced", head: r.head ?? args.checkpoint, legacy: true };
       if (!/head moved/.test(r.reason ?? "")) return { verdict: "rejected", reason: r.reason ?? `finalize failed (${r.status})`, legacy: true };
     }
