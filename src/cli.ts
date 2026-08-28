@@ -827,7 +827,9 @@ async function main(): Promise<void> {
       const r = await land(repo, {
         view: flag("--view"),
         summary: flag("-m"),
-        by: flag("--as") ?? process.env.AVCS_ACTOR ?? "human:cli",
+        // Pass it through, possibly undefined: the repo resolves the identity (issue #95).
+        // Duplicating the chain here is what cut it short of config.json and the keystore.
+        by: flag("--as"),
         hub: flag("--remote"),
         workspace: flag("--workspace"),
         maxAttempts: flag("--max-attempts") ? Number(flag("--max-attempts")) : undefined,
@@ -851,9 +853,9 @@ async function main(): Promise<void> {
       const repo = await Repo.open(cwd);
       const view = flag("--view") ?? "main";
       const remote = flag("--remote") ?? "origin";
-      const by = flag("--as") ?? process.env.AVCS_ACTOR ?? "human:cli";
+      const by = flag("--as"); // undefined is fine — integrateHub resolves it (issue #95)
       const checkpoint = await repo.createCheckpoint(view, flag("-m") ?? `submit ${view}`);
-      const r = await repo.integrateHub(remote, { view, checkpoint, by });
+      const r = await repo.integrateHub(remote, { view, checkpoint, ...(by ? { by } : {}) });
       switch (r.verdict) {
         case "advanced":
           console.log(`✓ advanced — head is now ${String(r.head).slice(0, 24)}…${r.legacy ? "  [legacy hub fallback]" : ""}`);

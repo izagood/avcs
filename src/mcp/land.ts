@@ -17,7 +17,9 @@ import type { Repo } from "../api/repo.ts";
 export interface LandArgs {
   view?: string;
   summary?: string;
-  by: string;
+  /** Who is landing. Omit to let the repo resolve it (issue #95) — see `Repo.localActorId`.
+   *  The MCP tool still requires it: an agent knows its own id and should say so. */
+  by?: string;
   hub?: string;
   maxAttempts?: number;
   workspace?: string;
@@ -50,6 +52,17 @@ export async function land(repo: Repo, args: LandArgs): Promise<LandResult> {
   const maxAttempts = Math.max(1, Math.floor(args.maxAttempts ?? 5));
   const summary = args.summary ?? `land ${view}`;
 
+  // Resolve the actor once, before anything uses it (issue #95). Three call sites below
+  // need it — the sync, the local finalize, and the hub integrate — and a `undefined`
+  // reaching `finalize` produces a malformed request rather than a useful error.
+  const by = await repo.localActorId(args.by);
+  if (!by) {
+    throw new Error(
+      "no actor identity to land as — pass --as <actor-id>, set AVCS_ACTOR, " +
+        "record `actorId` in .avcs/config.json, or run `avcs key provision <actor-id>`",
+    );
+  }
+
   // A workspace is local and idempotent — do it once, before the loop it does not affect.
   if (args.workspace) await repo.landWorkspace(args.workspace);
 
@@ -66,7 +79,7 @@ export async function land(repo: Repo, args: LandArgs): Promise<LandResult> {
   while (attempts < maxAttempts) {
     attempts++;
     // (a) The hub gates on what it can see, so our ops/evidence go first.
-    if (hasRemote) await repo.sync(remote, { as: args.by });
+    if (hasRemote) await repo.sync(remote, { as: by });
 
     // (b) Check the work actually merges BEFORE minting a checkpoint for it.
     const res = await repo.materialize(view);
@@ -95,7 +108,7 @@ export async function land(repo: Repo, args: LandArgs): Promise<LandResult> {
     // (d) Land it. With no remote this is a local finalize; with one, the queue decides.
     if (!hasRemote) {
       const parentHead = await repo.protectedHead(view);
-      const r = await repo.finalize({ view, newCheckpoint: checkpoint, parentHead, by: args.by });
+      const r = await repo.finalize({ view, newCheckpoint: checkpoint, parentHead, by });
       if (r.finalized) {
         return { landed: true, head: r.head ?? checkpoint, treeHash: res.treeHash, attempts, via: "local" };
       }
@@ -109,7 +122,7 @@ export async function land(repo: Repo, args: LandArgs): Promise<LandResult> {
       continue;
     }
 
-    const verdict = await repo.integrateHub(remote, { view, checkpoint, by: args.by });
+    const verdict = await repo.integrateHub(remote, { view, checkpoint, by });
     if (verdict.verdict === "advanced") {
       return {
         landed: true,
