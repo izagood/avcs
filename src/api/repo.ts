@@ -39,6 +39,7 @@ import {
 } from "./keystore.ts";
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
 import { isBinary } from "../core/bytes.ts";
+import { PurgedBlobError, purgeTombstoneOf } from "../store/applyRedactions.ts";
 import { lcsLineLength } from "../merge/merge3.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
@@ -311,6 +312,10 @@ export class Repo {
   // the rare mutations that can invalidate them (gc deletes; redaction overwrites bytes).
   #opCache = new Map<string, Operation>();
   #blobCache = new Map<string, Buffer>();
+  /** oid → the `Undo` that evicted its bytes, for every purge tombstone `readBlob` has seen
+   *  (issue #97). Derived from the same read as `#blobCache`, so the two are invalidated
+   *  together by `#forgetBlobs` — bytes that changed under a stable oid must be re-read. */
+  #purgedBlobs = new Map<string, string>();
   // Last full reduction's snapshot, for incremental reduce (docs/11 A6b — DEFAULT ON since
   // Phase 13.3). Only the main materialize path updates it; reduceIncremental is correct for
   // ANY append-superset (harness-proven) and throws NonIncrementalError otherwise (→ fall
@@ -839,6 +844,55 @@ export class Repo {
     return this.store.put({ type: "blob", data: "", encoding: "base64", chunked: true, chunks } satisfies Blob);
   }
 
+  /**
+   * The oid `putBlob` WOULD assign to `data`, computed without writing anything.
+   *
+   * `#assertCapturable` has to ask "are these bytes already a purged blob?" BEFORE authoring
+   * anything, and `putBlob`-then-look would leave orphan objects behind every refusal. So the
+   * chunking rule is mirrored here rather than exercised. Both branches are pinned to
+   * `putBlob` by test (`test/purge-tombstone.test.ts` refuses a chunked file too, which only
+   * works if the manifest oid computed here is the one `putBlob` writes).
+   */
+  #blobOidFor(data: Buffer): string {
+    const address = (b: Blob): string => computeOid("blob", b as unknown as Record<string, unknown>);
+    if (data.length <= Repo.CHUNK_THRESHOLD) {
+      return address({ type: "blob", data: data.toString("base64"), encoding: "base64" });
+    }
+    const chunks: string[] = [];
+    for (let i = 0; i < data.length; i += Repo.CHUNK_SIZE) {
+      chunks.push(address({ type: "blob", data: data.subarray(i, i + Repo.CHUNK_SIZE).toString("base64"), encoding: "base64" }));
+    }
+    return address({ type: "blob", data: "", encoding: "base64", chunked: true, chunks });
+  }
+
+  /**
+   * Refuse to capture content whose bytes an `undo --purge` has already evicted (issue #97).
+   *
+   * `--purge` leaves the leaked file on disk on purpose — the user still has to fix it. If they
+   * do not notice, the next commit re-adds that path, and because blobs are content-addressed
+   * the new op resolves to the SAME oid, which now holds a tombstone. The secret does not come
+   * back (`store.put` never rewrites an oid it already holds), so what this prevents is not a
+   * leak but a silent lie: an op that looks like an ordinary capture and a path that
+   * materializes as `[PURGED: …]`.
+   *
+   * Only `undoOid` refuses, for the same reason as `#treeEntryBytes`: a REDACTED blob is an
+   * admin-signed governance fact that propagates to every replica, and a path pointing at it
+   * is not a broken local derivation — the stub is what every holder is meant to project.
+   */
+  async #assertCapturable(path: string, content: Buffer): Promise<void> {
+    const oid = this.#blobOidFor(content);
+    if (!(await this.store.has(oid))) return; // brand-new content — nothing to have purged
+    const undoOid = purgeTombstoneOf(await this.store.get<Blob>(oid).catch(() => null));
+    if (!undoOid) return;
+    throw new PurgedBlobError(
+      `commit refuses: \`${path}\` hashes to ${oid}, a blob whose bytes \`undo --purge\` evicted ` +
+        `(undo ${undoOid}). Blobs are content-addressed, so re-adding it would put that purge tombstone ` +
+        `back in the view instead of your content. The file is still on disk because the eviction left the ` +
+        `fix to you \u2014 fix or delete \`${path}\`, then commit again.`,
+      { path, oid, undoOid },
+    );
+  }
+
   async readBlob(oid: string): Promise<Buffer> {
     const cached = this.#blobCache.get(oid);
     if (cached) return cached;
@@ -846,8 +900,33 @@ export class Repo {
     const buf = blob.chunked && blob.chunks
       ? Buffer.concat(await Promise.all(blob.chunks.map((c) => this.readBlob(c))))
       : Buffer.from(blob.data, "base64");
+    // Note a purge tombstone HERE rather than re-reading the object at the guard that acts on
+    // it (issue #97): this read already had the marker in hand, so `#treeEntryBytes` costs no
+    // extra I/O on a path the project deliberately keeps to one object read per new blob.
+    // `readBlob` itself stays permissive — `fsck`, `undo`'s convergence check and the CLI's
+    // own inspection all read the stub on purpose.
+    const tomb = purgeTombstoneOf(blob) ?? blob.chunks?.map((c) => this.#purgedBlobs.get(c)).find((u) => u !== undefined);
+    if (tomb) this.#purgedBlobs.set(oid, tomb);
     this.#blobCache.set(oid, buf);
     return buf;
+  }
+
+  /**
+   * Drop warm blob bytes AND their tombstone markers (issue #97): both are derived from the
+   * same object read, so an oid whose bytes changed underneath it — which only a redaction, a
+   * purge, a pull that applied one, or a GC can do — must lose both or the marker outlives
+   * what it describes. No oids means every one of them.
+   */
+  #forgetBlobs(...oids: string[]): void {
+    if (!oids.length) {
+      this.#blobCache.clear();
+      this.#purgedBlobs.clear();
+      return;
+    }
+    for (const oid of oids) {
+      this.#blobCache.delete(oid);
+      this.#purgedBlobs.delete(oid);
+    }
   }
 
   /**
@@ -1928,7 +2007,7 @@ export class Repo {
     // Evict the bytes: overwrite the blob in place with the (deterministic) stub.
     const { redactedStub } = await import("../store/applyRedactions.ts");
     await this.store.overwriteAt(blobOid, redactedStub(reason, redactionOid));
-    this.#blobCache.delete(blobOid); // bytes changed under a stable oid — evict the cache
+    this.#forgetBlobs(blobOid); // bytes changed under a stable oid — evict the cache
     // …and the derived copies: a merge result lives as bytes in the compaction snapshot, so
     // the object-store eviction alone would leave the plaintext readable there.
     await this.#scrubDerivedCaches();
@@ -2022,7 +2101,7 @@ export class Repo {
         const reason = args.reason ?? "local undo --purge";
         for (const blobOid of evictable) {
           await this.store.overwriteAt(blobOid, purgedStub(reason, undoOid));
-          this.#blobCache.delete(blobOid); // bytes changed under a stable oid
+          this.#forgetBlobs(blobOid); // bytes changed under a stable oid
         }
         await this.#scrubDerivedCaches();
       }
@@ -2281,7 +2360,7 @@ export class Repo {
   async applyRedactions(): Promise<number> {
     const { applyRedactions } = await import("../store/applyRedactions.ts");
     const n = await applyRedactions(this.store);
-    if (n > 0) this.#blobCache.clear(); // bytes changed under stable oids — evict the cache
+    if (n > 0) this.#forgetBlobs(); // bytes changed under stable oids — evict the cache
     return n;
   }
 
@@ -2305,7 +2384,7 @@ export class Repo {
     const r = await pullFromHub(this.dir, hubUrl, await this.#resolveHubSigner(opts?.as));
     // pull may have applied redactions (blob bytes overwritten under stable oids) and
     // wrote through a separate ObjectStore; drop the warm blob cache so reads re-hit disk.
-    this.#blobCache.clear();
+    this.#forgetBlobs();
     this.#observeImported(r.maxLamport); // Phase 13.2: sort after the imported history
     return { pulled: r.pulled };
   }
@@ -2401,7 +2480,7 @@ export class Repo {
       const { integrateWithHub } = await import("../hub/hubClient.ts");
       const r = await integrateWithHub(this.dir, url, { ...args, by, signWith });
       // needs_evidence pulled delta objects through a separate store — refresh caches.
-      this.#blobCache.clear();
+      this.#forgetBlobs();
       return r as { verdict: IntegrationResult["verdict"] } & Record<string, unknown>;
     }
 
@@ -3342,8 +3421,7 @@ export class Repo {
     for (const [path, blobOid] of res.tree) {
       if (shared.length && inShared(path)) { skipped.push(path); continue; }
       const full = join(workDir, path);
-      const synth = res.synthBlobs.get(blobOid);
-      const want = synth ?? (await this.readBlob(blobOid));
+      const want = await this.#treeEntryBytes(path, blobOid, res.synthBlobs.get(blobOid));
       // Skip a file whose bytes already match (issue #64). Rewriting the whole
       // projection on every hook was the bulk of a git-sync's I/O, and it churned
       // mtimes — which makes build tools and `git status` see phantom changes. The
@@ -3549,6 +3627,13 @@ export class Repo {
     const contention: ContentionWarning[] = [];
     if (!added.length && !modified.length && !removed.length && !renamed.length)
       return { ops, added, modified, removed, renamed, intent: "", contention };
+
+    // Before ANY object is authored: a path whose content resolves to a purged blob is refused
+    // outright (issue #97), so a refusal costs the user nothing — no intent, no session, no
+    // half-captured commit. Deletions need no check; they carry no content.
+    for (const path of [...added, ...modified, ...renamed.map((r) => r.to)].sort()) {
+      await this.#assertCapturable(path, disk.get(path)!);
+    }
 
     const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
     const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
@@ -3968,7 +4053,7 @@ export class Repo {
       // Objects were deleted from under the warm caches — drop them so the next
       // materialize re-tails from disk (GC'd op-log entries are then skipped).
       for (const oid of quarantinedOps) this.#opCache.delete(oid);
-      for (const oid of blobs) this.#blobCache.delete(oid);
+      this.#forgetBlobs(...blobs);
     }
     const sharedKeys = opts.shared ? await this.#collectSharedCaches(opts.dryRun ?? false) : [];
     this.logger.info("gc", { dryRun: opts.dryRun ?? false, blobs: blobs.length, quarantinedOps: quarantinedOps.length, sharedKeys: sharedKeys.length });
@@ -4280,10 +4365,11 @@ export class Repo {
     await writeFile(marker, `materialized ${result.treeHash}\n`, "utf8");
     for (const [path, blobOid] of result.tree) {
       const full = join(targetDir, path);
+      // Symbol-merged files are synthesized content, not a stored blob; a purge tombstone is
+      // not content at all and stops here rather than landing on disk (issue #97).
+      const bytes = await this.#treeEntryBytes(path, blobOid, result.synthBlobs.get(blobOid));
       await mkdir(dirname(full), { recursive: true });
-      // Symbol-merged files are synthesized content, not a stored blob.
-      const synth = result.synthBlobs.get(blobOid);
-      await writeFile(full, synth ?? await this.readBlob(blobOid));
+      await writeFile(full, bytes);
     }
   }
 
@@ -4344,12 +4430,42 @@ export class Repo {
     return oid;
   }
 
+  /**
+   * Bytes for ONE materialized tree entry — the single boundary where a stored blob becomes
+   * file content, and therefore the one place an `undo --purge` tombstone must not cross
+   * (issue #97).
+   *
+   * `materialize` itself still reports the tree honestly: the oid IS that content's oid, which
+   * is the content-addressing that kept the evicted bytes gone in the first place. What stops
+   * here is deriving BYTES from it — the step that used to replace a source file with
+   * `[PURGED: …]` and exit 0. A tree that looks fine is worse than a stop.
+   *
+   * A REDACTION is deliberately NOT refused. `undoOid` is the discriminator, never `redacted`
+   * (both stubs set that — it is what tells the store and `fsck` the oid≠content mismatch is
+   * sanctioned). An admin-signed redaction propagates to every replica by design, and
+   * projecting its stub is what a replica that legitimately received one is supposed to do.
+   */
+  async #treeEntryBytes(path: string, blobOid: string, synth: Buffer | undefined): Promise<Buffer> {
+    if (synth !== undefined) return synth; // reducer-synthesized merge content, not a stored blob
+    const bytes = await this.readBlob(blobOid);
+    const undoOid = this.#purgedBlobs.get(blobOid); // recorded by the read above — no extra I/O
+    if (undoOid) {
+      throw new PurgedBlobError(
+        `purged blob reachable from the view: \`${path}\` resolves to ${blobOid}, which holds an ` +
+          `\`undo --purge\` tombstone rather than content (evicted by undo ${undoOid}). Refusing to write ` +
+          `the tombstone text as that file's content \u2014 fix or delete \`${path}\` in your working tree, ` +
+          `then commit again.`,
+        { path, oid: blobOid, undoOid },
+      );
+    }
+    return bytes;
+  }
+
   /** Resolve the materialized tree into {path, bytes} entries (byte-preserving). */
   async materializedBytes(result: ReductionResult): Promise<{ path: string; bytes: Buffer }[]> {
     const out: { path: string; bytes: Buffer }[] = [];
     for (const [path, blobOid] of result.tree) {
-      const synth = result.synthBlobs.get(blobOid);
-      out.push({ path, bytes: synth ?? (await this.readBlob(blobOid)) });
+      out.push({ path, bytes: await this.#treeEntryBytes(path, blobOid, result.synthBlobs.get(blobOid)) });
     }
     return out;
   }

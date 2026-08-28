@@ -35,6 +35,40 @@ export function purgedStub(reason: string, undoOid: string): Blob {
   };
 }
 
+/** Whether `blob` is a LOCAL `undo --purge` tombstone — the one stub that must never reach a
+ *  file, as opposed to {@link redactedStub}, which a replica is supposed to project. `undoOid`
+ *  is the discriminator; `redacted` is NOT, because both stubs set it (issue #97). */
+export function purgeTombstoneOf(blob: Blob | null | undefined): string | null {
+  return blob?.undoOid ?? null;
+}
+
+/**
+ * A {@link purgedStub} was about to be treated as file CONTENT (issue #97).
+ *
+ * Blobs are content-addressed, so re-adding the file `undo --purge` deliberately left on disk
+ * resolves to the very oid that now holds the tombstone. The eviction still holds — the secret
+ * bytes do not come back, and content-addressing is what guarantees that — but the derivation
+ * is broken: a source file would be silently replaced by a sentinel string. Producing a tree
+ * that looks fine is worse than stopping, so `commit` and the materialize-to-bytes boundary
+ * raise this instead of succeeding.
+ *
+ * Typed, and carrying `path`/`oid`/`undoOid`, for the same reason `CorruptObjectError` carries
+ * `oid` (F1, docs/13): a failure deep inside `materialize` has to be actionable, which means
+ * naming the file to fix and the record that ordered the purge — never an opaque throw.
+ */
+export class PurgedBlobError extends Error {
+  readonly path: string;
+  readonly oid: string;
+  readonly undoOid: string;
+  constructor(message: string, where: { path: string; oid: string; undoOid: string }) {
+    super(message);
+    this.name = "PurgedBlobError";
+    this.path = where.path;
+    this.oid = where.oid;
+    this.undoOid = where.undoOid;
+  }
+}
+
 /**
  * Materialize every Redaction's stub AT its blob oid. A redacted blob's content no
  * longer hashes to its oid, so it can't propagate through content-addressed `put`

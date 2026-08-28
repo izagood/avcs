@@ -220,8 +220,10 @@ git: those bytes are in git too, and avcs did NOT remove them — another ref st
 #### 3.1.4 하지 않는 것
 
 - **remote에 대한 `--force`는 없다.** 플래그로도 없다. push되었다면 답은 교체다.
-- **git이 없으면 아무 말도 하지 않는다.** 독립 모드 출력은 이미 정확하고, 없는 도구에 대한
-  주의로 어지럽히지 않는다(테스트가 이 절반도 같은 무게로 고정한다).
+- **git이 없으면 git에 대해 아무 말도 하지 않는다.** 없는 도구에 대한 주의로 어지럽히지
+  않는다(테스트가 이 절반도 같은 무게로 고정한다). 단, "유출 파일이 아직 디스크에 있다"는
+  경고 자체는 독립 경로도 한다 — git 평면이 이미 하던 말이고, git이 없다고 사라져야 할 사실이
+  아니다(§4.4).
 - **git 절반을 끄고 싶으면 `--no-git`.** avcs 쪽만 축출하고, git이 여전히 사본을 들고 있다는
   사실과 나중에 avcs에게 맡길 때 쓸 명령을 말해 준다.
 
@@ -301,6 +303,65 @@ projection의 내용이 항상 저장된 blob인 것은 아니다. 3-way merge �
 
 > 같은 구멍이 `redact`에도 있었다(Phase 12 이래). 축출 메커니즘이 같으므로 이 PR에서 함께
 > 고쳤다 — admin gate는 건드리지 않는다.
+
+### 4.4 묘비는 내용이 아니다 — 재커밋 · materialize 가드 (이슈 #97)
+
+`--purge`는 작업 트리를 건드리지 않는다. 고칠 사람은 사용자이므로 **유출된 파일은 디스크에
+그대로 남는다**(§3.1.2). 사용자가 그 사실을 눈치채지 못했을 때 v0.35.0까지 일어난 일:
+
+1. 다음 `avcs commit`이 그 경로를 **경고 없이 다시 추가**한다.
+2. blob은 content-addressed이므로 새 op이 **같은 oid**로 해석된다 — 이제 purge 묘비인 oid로.
+3. `materialize`가 그 묘비 텍스트를 **파일 내용으로 기록하고 exit 0** 한다.
+
+```
+$ cat mat/secret.ts
+[PURGED: local undo --purge]
+```
+
+보안 성질은 깨지지 않는다. 비밀 바이트는 돌아오지 않고(`store.put`은 이미 가진 oid를 다시
+쓰지 않는다), 그것을 보장한 것이 바로 content-addressing이다. **깨지는 것은 무결성이다** —
+소스 파일이 진단도 실패 코드도 없이 센티널 문자열로 바뀐다. 그래서 세 가지를 더한다:
+
+- **`commit`이 거부한다** (`Repo.#assertCapturable`). 새 내용이 `undoOid`를 가진 기존 blob의
+  oid로 해석되면 경로·oid·purge를 명령한 `Undo`를 이름으로 대고 거부한다. 객체를 하나라도
+  authoring하기 **전에** 검사하므로, 거부가 intent·session·반쪽 커밋을 남기지 않는다.
+- **`materialize`가 바이트를 만들지 않는다** (`Repo.#treeEntryBytes`). tree → bytes 경계
+  하나에서만 막는다: `materialize` 자체가 돌려주는 `tree`는 정직하다(그 oid가 정말 그 내용의
+  oid다). 멈추는 것은 그 oid에서 **내용을 유도하는** 단계, 즉 파일을 센티널로 덮어쓰는 단계다.
+  `materializedBytes`/`materializedFiles`/`projectInto`/`checkoutInto`/`writeWorkspace`가
+  모두 이 경계를 지난다. 잘 만들어진 것처럼 보이는 트리는 멈추는 것보다 나쁘다.
+- **독립 모드도 경고한다.** 0.35.0의 git 평면은 성공 시 "the leaked file is still on disk and
+  no longer tracked — fix it before you commit again"을 이미 출력했다. git이 없는 저장소는
+  그 문장을 볼 길이 없었으므로, 동등한 문장을 독립 경로에도 준다(git을 언급하지 않는 형태로 —
+  §3.1.4).
+
+대가는 정직하게 적어 둔다: **purge된 내용은 바이트가 완전히 같은 채로는 다시 커밋할 수 없다.**
+`--purge`가 오판이었다 해도 그 oid는 이미 묘비이고, purge는 되돌릴 수 없다고 문서에 적힌 그대로다
+(§9). 한 바이트라도 다르면 다른 blob이므로 정상적으로 커밋된다. 거부 대신 조용히 묘비를
+project하는 쪽이 나은 거래인 경우는 없다.
+
+두 가드는 서로의 중복이 아니다. `commit` 가드가 있어도 (a) 이 변경 **이전에** 이미 그 상태가 된
+저장소가 있고, (b) view가 purge된 blob에 닿는 경로는 재커밋만이 아니다(`operation.propose`
+직접 호출, 제외를 되돌린 view, 다른 line·workspace의 op). 그래서 materialize 가드는 독립적인
+마지막 방어선으로 남는다.
+
+### 4.5 가드는 `undoOid`로 판정한다 — `redacted`가 아니다
+
+`purgedStub`과 `redactedStub`은 **둘 다** `redacted: true`를 쓴다(§4). 따라서 그 플래그로
+가드를 걸면 **redaction이 깨진다**:
+
+| | 표시 필드 | 성질 | materialize |
+|---|---|---|---|
+| `redactedStub` | `redactionOid` | admin 서명 · **모든 복제본으로 전파**되는 거버넌스 사실 | stub을 **기록한다** — 정당하게 redaction을 받은 복제본이 project해야 하는 내용 |
+| `purgedStub` | `undoOid` | **로컬** `undo --purge` · 전파되지 않는다 | **항상 깨진 파생** — 거부한다 |
+
+`purgedStub`의 doc 주석이 그 안전성의 근거를 이미 말한다: 그런 blob에는 `Redaction`이 없으므로
+`applyRedactions`가 건드리지 않는다 — **undo는 구조적으로 전파되지 않는다.** 그래서 `undoOid`의
+존재는 "이건 로컬 사고다"와 동의어이고, 판정 기준으로 삼기에 안전하다.
+
+`purgeTombstoneOf(blob)`(`src/store/applyRedactions.ts`)가 그 판정 하나만 담당하며, 두 가드가
+같은 함수를 쓴다. redaction이 그대로 전파되고 그대로 materialize된다는 사실은
+`test/purge-tombstone.test.ts`가 고정한다.
 
 ## 5. 이미 push된 op은 거부한다
 
@@ -384,6 +445,9 @@ capture마다 **session 하나**를 열고 그 capture의 모든 op을 거기에
   `NonIncrementalError` → 전체 reduce로 폴백한다. `AVCS_VERIFY_INCREMENTAL=1`로 검증한다.
 - 스키마 변경은 **가산적**이다: `ObjectType`에 `"undo"`, `Blob`에 선택적 `undoOid`.
   기존 `.avcs` 저장소는 그대로 열린다.
+- §4.4의 두 가드도 결정론에 중립적이다. 새 판정은 저장된 `Blob`의 기존 `undoOid` 필드만 읽고,
+  reduce 입력도 `treeHash` 계산도 바꾸지 않는다 — 성공하던 환원은 바이트 하나까지 그대로이고,
+  달라지는 것은 예전에 묘비를 내용으로 기록하던 경로가 이제 실패한다는 점뿐이다.
 
 ## 9. checkpoint를 찍은 op도 `--purge`할 수 있다
 
@@ -406,3 +470,19 @@ capture마다 **session 하나**를 열고 그 capture의 모든 op을 거기에
 push된 op 거부(메시지가 `redact`를 지목), `--last`의 대상 해석과 반복 시
 뒤로 걸어가기, `Undo` 기록 조회, 이미 undo한 것을 다시 undo해도 오류가 아니라 멱등, 그리고 CLI
 경로 전체.
+
+`test/purge-tombstone.test.ts` — §4.4/§4.5의 가드. 이슈 #97의 repro가 표제 테스트다
+(purge → 디스크에 남은 파일을 재커밋 → **거부되고**, 메시지가 경로·oid·`Undo`를 이름으로 댄다).
+그 외: materialize가 `[PURGED: …]`를 내용으로 쓰는 대신 실패하고 `avcs materialize --out`이
+exit 1을 낸다, 아무도 선택하지 않는 묘비는 문제가 아니다(가드는 **view** 기준이다),
+chunk manifest도 잡힌다(`#blobOidFor`가 `putBlob`의 threshold 256K·stride 64K를 정확히
+재현해야만 통과한다), 독립 `undo --purge`가 "still on disk" 경고를 낸다, 그리고
+**redaction은 그대로다** — admin 서명 redaction이 전파되고 stub이 그대로 materialize되며,
+redaction된 blob 위로 경로를 다시 커밋하는 것은 여전히 허용된다(`redacted`로 가드를 걸었다면
+전부 깨지는 지점이다).
+
+바이트가 정말 사라졌다는 증명은 `.avcs/`에 대한 **평문 grep으로는 불가능하다** — 객체는 CBOR이고
+blob payload는 그 안의 base64 문자열이므로, 바이트가 있든 없든 평문 grep은 0을 돌려준다. 그래서
+스캐너는 needle의 base64를 **세 정렬 전부**(base64는 3바이트→4문자이므로 부분 문자열의 인코딩은
+offset mod 3에 달려 있다) 시도하고, **음성 결과를 신뢰하기 전에 있는 것이 확실한 내용을 향해
+같은 스캐너를 돌려 자기검증**한다(`scannerSeesKnownContent`).
