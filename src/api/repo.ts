@@ -1726,7 +1726,6 @@ export class Repo {
     return redactionOid;
   }
 
-
   // ── local undo (issue #91) ─────────────────────────────────────────────────
   /**
    * Undo local ops: drop them from a view's projection, and with `purge` evict the blob
@@ -1734,7 +1733,7 @@ export class Repo {
    *
    * This is `redact`'s pre-share counterpart, and the split is the whole point. `redact`
    * is admin-gated because it evicts bytes from a repo other people hold — a governance
-   * act. `undo` refuses the moment the ops have been pushed (see {@link pushedOpOrigins}),
+   * act. `undo` refuses the moment the ops have been pushed (see {@link pushedOps}),
    * so by construction it only ever operates on history no other holder has. Nothing to
    * co-ordinate ⇒ nobody's authority to ask for.
    *

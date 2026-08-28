@@ -118,13 +118,17 @@ async function readPushedOps(store: ObjectStore): Promise<Record<string, string[
 
 async function recordPushedOps(store: ObjectStore, base: string, oids: string[]): Promise<void> {
   if (!oids.length) return;
-  const ledger = await readPushedOps(store);
-  for (const oid of oids) {
-    const urls = ledger[oid] ?? [];
-    if (!urls.includes(base)) urls.push(base);
-    ledger[oid] = urls;
-  }
-  await store.writeAux(PUSHED_OPS, JSON.stringify(ledger, null, 2) + "\n");
+  // Locked: this is read-modify-write, and two concurrent pushes dropping each other's
+  // entries would under-record — the one direction this ledger must not fail in.
+  await store.withLock("pushed-ops", async () => {
+    const ledger = await readPushedOps(store);
+    for (const oid of oids) {
+      const urls = ledger[oid] ?? [];
+      if (!urls.includes(base)) urls.push(base);
+      ledger[oid] = urls;
+    }
+    await store.writeAux(PUSHED_OPS, JSON.stringify(ledger, null, 2) + "\n");
+  });
 }
 
 /** Mirror Repo.pull's import side-effect: maintain the entity index for imported ops. */
