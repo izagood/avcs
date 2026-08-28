@@ -175,12 +175,27 @@ test("Repo.pushHub: signs writes with the local actor key (--as / sole-key)", as
     assert.ok(r.pushed >= 1, "objects pushed under transport auth");
     assert.equal(r.rejected, 0);
 
-    // a client with no local key cannot satisfy a write-auth hub → loud 401.
+    // A client with no credential AT ALL cannot satisfy a write-auth hub → loud 401.
+    //
+    // Since #98 a private key lives at MACHINE scope, so a freshly init'd repo is no longer
+    // keyless by construction — it inherits whatever this machine can sign as, which is the
+    // whole point of that change. `saveLocalKey` above therefore wrote into the machine
+    // keystore, and a second repo in this process would resolve that same key. Keyless now
+    // means "no repo key and no machine key", so point this one at an empty config home.
     const anonDir = await mkdtemp(join(tmpdir(), "avcs-tauth-anon-"));
-    const anon = await Repo.init(anonDir);
-    await anon.createIntent({ title: "anon", owner: "human:x", kind: "feature" });
-    await assert.rejects(() => anon.pushHub(hub.url), /unauthorized \(401\)/);
-    await rm(anonDir, { recursive: true, force: true });
+    const anonHome = await mkdtemp(join(tmpdir(), "avcs-tauth-anon-home-"));
+    const savedHome = process.env.AVCS_CONFIG_HOME;
+    process.env.AVCS_CONFIG_HOME = anonHome;
+    try {
+      const anon = await Repo.init(anonDir);
+      await anon.createIntent({ title: "anon", owner: "human:x", kind: "feature" });
+      await assert.rejects(() => anon.pushHub(hub.url), /unauthorized \(401\)/);
+    } finally {
+      if (savedHome === undefined) delete process.env.AVCS_CONFIG_HOME;
+      else process.env.AVCS_CONFIG_HOME = savedHome;
+      await rm(anonHome, { recursive: true, force: true });
+      await rm(anonDir, { recursive: true, force: true });
+    }
   } finally {
     await hub.close();
     await rm(hubDir, { recursive: true, force: true });
