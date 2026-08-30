@@ -98,7 +98,7 @@ interface Integration extends BaseObject {
 허브 전용이 아니라 **repo API**다 — 허브 없는 로컬 다중 프로세스 finalize 퍼널도 함께 죽인다.
 
 ```
-submitIntegration({ view, checkpoint, by, ticketId?, signWith? })
+submitIntegration({ view, checkpoint, by, ticketId?, signWith?, dryRun? })
   → { verdict: "advanced";       head; integration }
   | { verdict: "conflict";       packet; integration }
   | { verdict: "needs_evidence"; integratedCheckpoint; treeHash; requiredChecks; missingLocally: oid[]; ticketId }
@@ -115,6 +115,30 @@ submitIntegration({ view, checkpoint, by, ticketId?, signWith? })
 5. **충돌 판정** — 제출 델타와 교차하는 `needs_human`/파일 충돌이 있으면 verdict `conflict` + **최소 수리 패킷**: 키별 상대 op oid/actor/purpose, base blob oid, `detectFileConflicts`의 ConflictRegion, 그리고 **`recallDecisions(key)` 결정 메모리 동봉** — 에이전트가 과거 선례로 L2급 겹침을 스스로 결정 제안까지 끌고 갈 수 있게 한다(L4 인간 게이트는 불변). "pull 하고 다시 하세요"를 이 패킷이 대체한다.
 6. **게이트** — 역할(`finalizeRole`), 승인(제출 checkpoint에 바인딩된 approval을 integrated checkpoint로 **승계**, `carryApprovals !== false`일 때; GitHub이 PR approval을 merge commit과 무관하게 세는 것과 동형 — `carriedApprovals`로 기록), waiver, required checks(모드는 14.5).
 7. **전진** — integrated `Checkpoint` 저작(headOps=F, treeHash=4의 결과, evidence는 14.5 규칙) → `setRef("head:<view>")` → `Integration{verdict:"advanced"}` 기록 → 이벤트 waiter wake. **fast-forward**(현 head ⊆ closure(submitted))는 기존 finalize 의미로 단락 + `fresh` 바인딩.
+
+#### 14.2a `dryRun` — head를 움직이지 않는 판정 (이슈 #79)
+
+큐는 "이게 랜딩해도 되나"의 authority이고, 그 답을 내놓을 자연스러운 자리는 **머지 전 체크**다 —
+작성자가 아직 작업 중일 때 verdict를 보고하는 잡. 그런 잡이 보고의 부수효과로 보호된 head를
+전진시켜서는 안 된다.
+
+`dryRun: true`면 **1~6단계가 그대로 돈다.** 따라서 `conflict`는 수리 패킷을, `needs_evidence`는
+required checks를 그대로 담는다. 판정 로직을 복제하지 않는 것이 요점이다 — §2가 모든 큐 결정은
+objects + Protection의 순수 함수여야 한다고 규정하고, 두 번째 구현은 바로 그 보장을 깬다.
+
+건너뛰는 것은 **변이뿐**이다:
+
+- `head:<view>` 미설정
+- `Integration` 감사 객체 미기록 (따라서 멱등성 ref도 안 생겨, 매 dry run이 새로 판정된다)
+- 예약 생성/소비/만료정리 없음
+
+`finalize:<view>` 락은 **여전히 잡는다** — 일관된 읽기에 필요하다. 그래서 공짜는 아니지만,
+랜딩해 보고서야 아는 것보다는 훨씬 싸다.
+
+**한 가지 예외**: `needs_evidence` 경로의 draft checkpoint는 dry run에서도 저작된다. 내용
+주소화된 불변 객체라 같은 입력이면 같은 oid이므로 큐 상태의 변이가 아니라 재사용 가능한
+파생물이고, 결과가 호출자에게 검증 대상을 지목해야 하기 때문이다. 결정하는 상태(head·예약·감사)는
+아무것도 건드리지 않는다.
 
 ### 14.3 hub 엔드포인트 (M)
 
