@@ -2495,6 +2495,57 @@ export class Repo {
     return finalizeOnHub(hubUrl, { ...args, signWith });
   }
   /** Pull objects a network hub holds that this repo lacks. */
+  /**
+   * Take objects straight into this repo's store — no network.
+   *
+   * `pullHub` was the ONLY way in, which forces a consumer that already holds the objects
+   * in its own process to speak HTTP to itself: a loopback listener, a secret route to hide
+   * it behind, and the code that keeps that route from leaking. The cost is not only the
+   * round trip. When the loopback address cannot be resolved (port not yet bound, no socket),
+   * "cannot receive objects" surfaces as a `rejected` integration verdict — something that is
+   * not a policy judgement wearing a policy judgement's face.
+   *
+   * This is `pullHub` with the transport removed and nothing else: same store writes, same
+   * operation indexing, same Lamport advance, same redaction pass. Anything left out here
+   * would just be rebuilt outside, which is the problem this exists to end.
+   *
+   * Forgery needs no check. `store.put` recomputes the content address, so an object whose
+   * body was altered lands at ITS OWN oid and cannot displace the original — the same
+   * property the HTTP path relies on rather than a weaker one for being closer to home.
+   */
+  async importObjects(objects: Iterable<AnyObject> | AsyncIterable<AnyObject>): Promise<{
+    imported: number;
+    skipped: number;
+  }> {
+    const { keysOf } = await import("../reducer/reducer.ts");
+    let imported = 0;
+    let skipped = 0;
+    let maxLamport = 0;
+    const seen: string[] = [];
+    for await (const obj of objects as AsyncIterable<AnyObject>) {
+      // Address first: `has` on the recomputed oid is what makes a repeat call cheap and
+      // makes "already here" distinguishable from "newly arrived".
+      const { oid: _incoming, ...payload } = obj as AnyObject & { oid?: string };
+      void _incoming;
+      const oid = computeOid(obj.type, payload as Record<string, unknown>);
+      if (await this.store.has(oid)) { skipped++; continue; }
+      await this.store.put(obj as never);
+      if (obj.type === "operation") {
+        for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
+        maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
+      }
+      seen.push(oid);
+      imported++;
+    }
+    if (imported) {
+      const { applyRedactions } = await import("../store/applyRedactions.ts");
+      await applyRedactions(this.store);
+      this.#forgetBlobs(...seen);
+      this.#observeImported(maxLamport);
+    }
+    return { imported, skipped };
+  }
+
   async pullHub(hubUrl: string, opts?: { as?: string }): Promise<{ pulled: number }> {
     const { pullFromHub } = await import("../hub/hubClient.ts");
     // Sign reads when this replica holds a key (issue #50): a hub that gates reads refuses
