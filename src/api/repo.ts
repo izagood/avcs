@@ -130,9 +130,17 @@ export interface ConflictPacket {
   }[];
 }
 
-/** The persisted needs_evidence reservation (`.avcs/queue/<view>.json`, docs/17 §14.3):
- *  survives a hub restart so an in-flight ticket keeps its slot until the TTL. */
-interface IntegrationReservation {
+/**
+ * The persisted needs_evidence reservation (`.avcs/queue/<view>.json`, docs/17 §14.3):
+ * survives a hub restart so an in-flight ticket keeps its slot until the TTL.
+ *
+ * EXPORTED because the file is not the only place this can live. A multi-instance consumer
+ * cannot share a local aux file, so it keeps the reservation in its own store and translates
+ * both ways. That translation was being written against `Record<string, unknown>` — which
+ * means a field added here would not have broken anything, it would just have stopped being
+ * carried, silently. A name is the minimum that makes the translation type-checked.
+ */
+export interface IntegrationReservation {
   ticketId: string;
   submittedCheckpoint: string;
   integratedCheckpoint: string;
