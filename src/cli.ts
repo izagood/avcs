@@ -1083,8 +1083,15 @@ async function main(): Promise<void> {
     case "checkout": {
       const repo = await Repo.open(cwd);
       const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
-      const written = await repo.checkoutInto(cwd, view);
-      console.log(`checked out ${written.length} file(s) from ${view}`);
+      // `--at <checkpoint>` projects THAT checkpoint rather than the view's current
+      // frontier — what a CI job needs to examine the tree it was triggered for.
+      const at = flag("--at");
+      const written = await repo.checkoutInto(cwd, view, at ? { at } : undefined);
+      console.log(
+        at
+          ? `checked out ${written.length} file(s) from ${view} at ${at.slice(0, 16)}…`
+          : `checked out ${written.length} file(s) from ${view}`,
+      );
       break;
     }
     case "commit": {
@@ -1710,7 +1717,8 @@ async function main(): Promise<void> {
           "  fsck [--rebuild]            verify object integrity + op-log; --rebuild repairs the log\n" +
           "  bundle <file>               export the whole repo to a portable file\n" +
           "  unbundle <file>             import a bundle into this repo\n" +
-          "  checkout [view]             write the view's files into the working dir\n" +
+          "  checkout [view] [--at <cp>] write the view's files into the working dir\n" +
+          "                              --at pins it to a checkpoint (what a CI job needs)\n" +
           "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
           "  undo [--last | <op-oid>…] [--purge] [--no-git] [--reason r]  drop local ops from the view;\n" +
           "                              --purge also evicts the bytes they uniquely reference (irreversible),\n" +

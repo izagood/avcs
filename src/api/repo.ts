@@ -3520,13 +3520,22 @@ export class Repo {
    * capture cannot produce them (§3.5) — but a history contaminated before shared paths
    * existed can still be opened, and writing those files would spill recorded content over a
    * live build environment. So they are skipped and named rather than written.
+   *
+   * `at` pins the projection to a CHECKPOINT instead of the view's current frontier. A job
+   * has to run on the tree it was triggered for: if the head advances between the trigger and
+   * the claim, a job that checks out "now" examines a different tree, and its evidence is then
+   * bound to a checkpoint nothing verified — which is what `Protection.requireBoundEvidence`
+   * stands on. The store could already do this (`materializeAt(cp.headOps)`, which
+   * `checkpointBytes` uses); only the physical checkout had no way to ask.
    */
   async projectInto(
     workDir: string,
     view = "main",
-    opts?: { workspace?: string },
+    opts?: { workspace?: string; at?: string },
   ): Promise<{ written: string[]; shared: SharedPathLink[]; skipped: string[] }> {
-    const res = await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
+    const res = opts?.at
+      ? await this.materializeAt((await this.#checkpointAt(opts.at)).headOps)
+      : await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
     const shared = await this.readSharedPaths();
     const inShared = (rel: string): boolean => shared.some((e) => rel === e.path || rel.startsWith(e.path + "/"));
     const written: string[] = [];
@@ -3556,8 +3565,29 @@ export class Repo {
     return { written: written.sort(), shared: await this.linkSharedPaths(workDir, res.tree), skipped: skipped.sort() };
   }
 
-  /** Write a view's materialized files into `workDir` (alongside .avcs, like git). */
-  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string }): Promise<string[]> {
+  /**
+   * Read `at` as a Checkpoint, or refuse.
+   *
+   * Falling back to the head on a bad oid would be the worst possible failure here: the
+   * caller believes it is examining an old tree and is not told otherwise. A job would then
+   * report evidence for the wrong tree with no signal at all.
+   */
+  async #checkpointAt(at: string): Promise<Checkpoint> {
+    let obj: unknown;
+    try {
+      obj = await this.store.get(at);
+    } catch {
+      throw new Error(`no such checkpoint: ${at}`);
+    }
+    if ((obj as { type?: string })?.type !== "checkpoint") {
+      throw new Error(`not a checkpoint: ${at} (it is a ${(obj as { type?: string })?.type ?? "unknown object"})`);
+    }
+    return obj as Checkpoint;
+  }
+
+  /** Write a view's materialized files into `workDir` (alongside .avcs, like git).
+   *  `at` pins the projection to a checkpoint — see {@link projectInto}. */
+  async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string; at?: string }): Promise<string[]> {
     return (await this.projectInto(workDir, view, opts)).written;
   }
 
