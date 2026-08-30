@@ -39,11 +39,57 @@ export interface KeyFile {
  *   2. `$XDG_CONFIG_HOME/avcs` — the platform convention, when the user has opted into it.
  *   3. `~/.avcs` — the default, alongside ~/.ssh and ~/.gnupg.
  */
+/**
+ * Which test runner, if any, this process is under — or `null` for ordinary use.
+ *
+ * This is a denylist and cannot be complete; a runner not listed here still reaches the
+ * `$HOME` fallback. That is accepted deliberately: the alternative is refusing by default and
+ * breaking every real invocation of the CLI, which is the far worse failure. The list covers
+ * what actually bit us —
+ *
+ *   - `node --test` sets NODE_TEST_CONTEXT (avcs' own suite)
+ *   - vitest sets VITEST (avcshub's suite — 11 fixture keys reached a real `~/.avcs` this way,
+ *     and the resulting ambiguity in `localActorId`'s sole-key fallback made the client sign
+ *     nothing, so every `POST /objects` came back 401)
+ *   - jest sets JEST_WORKER_ID
+ *
+ * A consumer's own isolation (setting AVCS_CONFIG_HOME in its test setup) is the real
+ * protection; this is defence in depth for the case where they have not done it yet.
+ */
+function testRunner(): string | null {
+  if (process.env.NODE_TEST_CONTEXT) return "`node --test`";
+  if (process.env.VITEST) return "vitest";
+  if (process.env.JEST_WORKER_ID) return "jest";
+  return null;
+}
+
 export function configHome(): string {
   const explicit = process.env.AVCS_CONFIG_HOME;
   if (explicit) return explicit;
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg) return join(xdg, "avcs");
+  // Under `node --test` with neither variable set, REFUSE rather than fall back to $HOME
+  // (issue #107). The comment above says a test must never touch the developer's real
+  // credential store, and `test/_isolate-keystore.ts` upholds that — but only for processes
+  // the `npm test` script starts. Running one file the ordinary way drops the harness, and
+  // the old fallback then wrote fixtures into `~/.avcs/private/` silently.
+  //
+  // That is not a tidiness problem. The stray keys survive into later runs, so assertions on
+  // an exact signable list begin failing and read as a product regression; and they make
+  // `localActorId`'s sole-key fallback ambiguous, which stops `avcs submit` resolving an
+  // actor at all. Both happened before this guard existed.
+  //
+  // A throw here converts a silent, delayed, misattributed failure into an immediate one that
+  // names its own fix. Nothing about ordinary use changes: `NODE_TEST_CONTEXT` is set by the
+  // Node test runner, so a real invocation of the CLI never reaches this branch.
+  const runner = testRunner();
+  if (runner) {
+    throw new Error(
+      `refusing to resolve the machine keystore under ${runner} without AVCS_CONFIG_HOME — ` +
+        "it would write credentials into the real store. Set AVCS_CONFIG_HOME to a temp dir " +
+        "for the test process (avcs' own suite does this via --import ./test/_isolate-keystore.ts).",
+    );
+  }
   return join(homedir(), ".avcs");
 }
 
