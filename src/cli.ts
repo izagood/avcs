@@ -631,17 +631,39 @@ async function main(): Promise<void> {
     }
     case "status": {
       const repo = await Repo.open(cwd);
-      const view = args[1] ?? "main";
-      const res = await repo.materialize(view);
+      // Report the scope this working tree actually writes into (issue #87), the same way
+      // `conflicts` and capture already resolve it. On a topic branch that is a WORKSPACE,
+      // whose ops the base view deliberately excludes — so a base-view reading described
+      // something the user was not working on: their own work missing, and a head their next
+      // capture would not build on.
+      //
+      // An explicit `avcs status <view>` still wins; this only decides what to report when
+      // nothing was named.
+      const explicit = args[1] && !args[1].startsWith("--") ? args[1] : undefined;
+      // `main` is the base view, not a line — wrapping it as `{ line: "main" }` would make the
+      // label read "line main" for someone who just typed `avcs status main`.
+      const scope: BranchScope = explicit
+        ? (explicit === "main" ? {} : { line: explicit })
+        : await scopeFor(repo, cwd);
+      const view = scope.line ?? "main";
+      const workspace = flag("--workspace") ?? scope.workspace;
+      const res = await repo.materialize(view, workspace ? { workspace } : undefined);
       const counts: Record<string, number> = {};
       for (const s of res.statuses.values()) counts[s] = (counts[s] ?? 0) + 1;
+      // Name the scope, always. Unlabelled numbers were the ambiguity itself — "files: 2"
+      // means nothing until you know which scope counted them.
+      console.log(`scope: ${scopeLabel({ ...scope, workspace })}`);
       console.log(`view: ${view}`);
       console.log(`operations: ${JSON.stringify(counts)}`);
       console.log(`files: ${res.tree.size}   conflicts: ${res.conflicts.length}   auto-merged: ${res.autoDecisions.length}`);
       console.log(`treeHash: ${res.treeHash}`);
       for (const a of res.autoDecisions)
         console.log(`  ✓ auto @ ${a.key}: chose ${a.chosenOp.slice(0, 16)} (policy ${a.policyVersion})`);
-      if (res.conflicts.length) console.log(`\nrun \`avcs conflicts ${view}\` to review`);
+      if (res.conflicts.length) {
+        // Point at the same scope these conflicts came from; naming the base view here would
+        // reproduce the mismatch this change removes.
+        console.log(`\nrun \`avcs conflicts${workspace ? ` --workspace ${workspace}` : view === "main" ? "" : ` ${view}`}\` to review`);
+      }
       // Phase 15.3: early conflict warning — other actors' live concurrent work (and
       // lease holders) on the keys this replica's actor has authored on. Needs a local
       // identity for perspective; without one the section is simply omitted.
