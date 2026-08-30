@@ -2895,7 +2895,10 @@ export class Repo {
     const target = await this.store.get<Operation>(opOid);
     const path = target.body.path ?? (target.target.entityId.split("#")[0] as string);
     const before = await this.materializeAt(target.causalDeps);
-    const prev = (await this.materializedFiles(before)).find((f) => f.path === path);
+    // BYTES, not the utf8 view: `revert` re-authors this content as a new op below, so a lossy
+    // read writes mangled bytes into an append-only graph — unrecoverable, unlike a lossy
+    // comparison. `putBlob` takes `string | Uint8Array`, so no conversion is needed.
+    const prev = (await this.materializedBytes(before)).find((f) => f.path === path);
     const causalDeps = await this.lineFrontier(line);
     const common = {
       sessionOid: target.sessionOid,
@@ -2912,7 +2915,7 @@ export class Repo {
     return this.proposeOperation({
       ...common,
       target: { entityKind: "file", entityId: path },
-      body: { kind: "put_file", path, blobOid: await this.putBlob(prev.content) },
+      body: { kind: "put_file", path, blobOid: await this.putBlob(prev.bytes) },
     });
   }
 
@@ -3867,15 +3870,41 @@ export class Repo {
   }
 
   /**
-   * Resolve the canonical projection (path→content) a checkpoint froze, for provenance
-   * verification. `treeHashOk` re-confirms the checkpoint's recorded treeHash still
-   * reproduces from its frontier (internal integrity); `files` is what git's committed
-   * tree at the linked SHA must match exactly for the commit to be a faithful projection.
+   * A checkpoint's projection, as BYTES.
+   *
+   * This is the primitive shape. The storage layer is already all Buffer — `readBlob`,
+   * `#treeEntryBytes` and `materializedBytes` all return one, and `putBlob` accepts
+   * `string | Uint8Array`. String appeared in exactly one outermost layer, and that layer
+   * destroyed binary content: a 12-byte PNG header comes back as 20 bytes with every invalid
+   * UTF-8 sequence replaced by U+FFFD, which is not recoverable.
+   *
+   * Anything handing the projection back out — a git-plane comparison, `avcs show`, an op
+   * re-authored from a previous state — takes bytes. The string view below is for line-wise
+   * work (blame, diff hunks, merge3), which genuinely wants text.
    */
-  async checkpointFiles(checkpointOid: string): Promise<{ treeHash: string; treeHashOk: boolean; files: { path: string; content: string }[] }> {
+  async checkpointBytes(checkpointOid: string): Promise<{
+    treeHash: string;
+    treeHashOk: boolean;
+    files: { path: string; bytes: Buffer }[];
+  }> {
     const cp = await this.store.get<Checkpoint>(checkpointOid);
     const res = await this.materializeAt(cp.headOps);
-    return { treeHash: cp.treeHash, treeHashOk: res.treeHash === cp.treeHash, files: await this.materializedFiles(res) };
+    return {
+      treeHash: cp.treeHash,
+      treeHashOk: res.treeHash === cp.treeHash,
+      files: await this.materializedBytes(res),
+    };
+  }
+
+  /** The utf8 text view of {@link checkpointBytes}. A convenience for line-wise callers, not
+   *  the primitive — a binary path read through here is lossy by construction. */
+  async checkpointFiles(checkpointOid: string): Promise<{
+    treeHash: string;
+    treeHashOk: boolean;
+    files: { path: string; content: string }[];
+  }> {
+    const r = await this.checkpointBytes(checkpointOid);
+    return { ...r, files: r.files.map(({ path, bytes }) => ({ path, content: bytes.toString("utf8") })) };
   }
 
   /** Write `.avcs/.gitignore` for `mode`. Idempotent; safe to call on every sync. */
