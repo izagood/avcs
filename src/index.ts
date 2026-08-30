@@ -37,6 +37,9 @@ export { MassDeleteError } from "./api/repo.ts";
 // along on `Repo`; standalone symbols do not. `RepoNotFoundError` shipped without this line
 // and was unreachable from a consumer despite every core gate being green.
 export { RepoNotFoundError } from "./api/repo.ts";
+// The queue's own vocabulary, for a consumer that has to persist a reservation somewhere
+// other than the local aux file (a multi-instance hub) and translate it back.
+export type { IntegrationReservation } from "./api/repo.ts";
 
 // Hub (server + client) — the replication / trust boundary avcshub productionizes
 export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
