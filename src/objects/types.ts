@@ -211,6 +211,21 @@ export type OperationStatus =
   | "quarantined";
 
 // ── evidence ────────────────────────────────────────────────────────────────
+/**
+ * What a piece of evidence attests to.
+ *
+ * The eight names below are the vocabulary the core itself reasons about. `custom:<name>`
+ * is the open slot: a consumer's pipeline runs jobs the core has never heard of — build,
+ * deploy, publish, smoke — and with a closed union those had no name at all. What that
+ * cost is concrete: such a job's evidence cannot be a `requiredCheck`, so a checkpoint it
+ * proved stays `unbound` forever, and the consumer ends up recording the same evidence a
+ * second time on a plane of its own.
+ *
+ * Matching stays EXACT string equality — `custom:deploy` is satisfied only by
+ * `custom:deploy`, never by `custom:deploy-staging` or any prefix of it. An open vocabulary
+ * whose members loosely satisfy each other would make `requiredChecks` meaningless, which
+ * is the opposite of what this is for.
+ */
 export type EvidenceKind =
   | "parse"
   | "typecheck"
@@ -219,7 +234,8 @@ export type EvidenceKind =
   | "integration_test"
   | "benchmark"
   | "security_scan"
-  | "api_compat";
+  | "api_compat"
+  | `custom:${string}`;
 export type EvidenceResult = "pass" | "fail" | "partial" | "not_run";
 
 export interface Evidence extends BaseObject {
