@@ -40,6 +40,23 @@ function flag(name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+/**
+ * `name`'s value, refusing the flag that was given without one.
+ *
+ * `flag` cannot tell "absent" from "present but empty" — both are `undefined` — so a caller
+ * writing `flag("--at") ? … : …` silently ignores `--at` typed with nothing after it. For a
+ * flag that PINS something that is the worst outcome available: the caller believes it named
+ * a checkpoint and gets the current head, with no signal. The core already refuses a bad
+ * checkpoint oid for exactly this reason; this keeps the rule from collapsing one layer up.
+ */
+function valueFlag(name: string): string | undefined {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  const v = args[i + 1];
+  if (v === undefined || v === "") throw new Error(`${name} needs a value (e.g. \`${name} <checkpoint>\`)`);
+  return v;
+}
+
 // ── git-bridge worktree resolution ──────────────────────────────────────────
 // AVCS keeps a SINGLE store and is git-agnostic at its core. These helpers live
 // in the CLI (the bridge layer, which already shells out to git) so the core
@@ -1085,7 +1102,7 @@ async function main(): Promise<void> {
       const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
       // `--at <checkpoint>` projects THAT checkpoint rather than the view's current
       // frontier — what a CI job needs to examine the tree it was triggered for.
-      const at = flag("--at");
+      const at = valueFlag("--at");
       const written = await repo.checkoutInto(cwd, view, at ? { at } : undefined);
       console.log(
         at
