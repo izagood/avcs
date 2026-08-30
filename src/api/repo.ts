@@ -1694,12 +1694,21 @@ export class Repo {
     }
   }
 
-  async #writeReservation(view: string, resv: IntegrationReservation | null): Promise<void> {
+  async #writeReservation(view: string, resv: IntegrationReservation | null, dry = false): Promise<void> {
+    if (dry) return; // #79: a preview must not take or release the one in-flight slot
     await this.store.writeAux(this.#queueRel(view), JSON.stringify(resv) + "\n");
   }
 
-  /** Record an Integration verdict (append-only audit) and point the idempotency ref at it. */
-  async #recordIntegration(fields: Omit<Integration, "type" | "createdAt">): Promise<string> {
+  /**
+   * Record an Integration verdict (append-only audit) and point the idempotency ref at it.
+   *
+   * `dry` (issue #79) writes nothing and returns "" — the oid only ever travels back to the
+   * caller as `IntegrationResult.integration`, and a preview has no audit record to name.
+   * Centralising the skip here rather than at each of the dozen call sites is deliberate: a
+   * verdict path added later is silently correct instead of silently leaking a write.
+   */
+  async #recordIntegration(fields: Omit<Integration, "type" | "createdAt">, dry = false): Promise<string> {
+    if (dry) return "";
     const integ: Integration = { type: "integration", ...fields, createdAt: new Date().toISOString() };
     const oid = await this.store.put(integ);
     await this.store.setRef(`integration:${fields.view}:${fields.ticketId}`, oid);
@@ -1773,8 +1782,27 @@ export class Repo {
     by: string;
     ticketId?: string;
     signWith?: { keyId: string; privateKey: string };
+    /**
+     * Compute the verdict and write NOTHING (issue #79).
+     *
+     * The queue is the right authority for "may this land?", and the natural place to surface
+     * that is a pre-merge check — a job reporting the verdict while the author is still
+     * working. Such a job must not advance the protected head as a side effect of reporting.
+     *
+     * The decision path is not duplicated: steps 1–6 run unchanged, so a `conflict` still
+     * carries its repair packet and a `needs_evidence` still names its required checks.
+     * docs/17 §2 requires every queue decision to be a pure function of objects + Protection,
+     * and a second implementation would break exactly that. What a dry run skips is the
+     * mutation: no integrated Checkpoint, no `head:<view>`, no reservation written or
+     * cleared, no Integration audit object.
+     *
+     * `finalize:<view>` is still taken — a consistent read needs it — so this is cheaper than
+     * landing to find out, not free.
+     */
+    dryRun?: boolean;
   }): Promise<IntegrationResult> {
     const view = args.view;
+    const dry = args.dryRun === true;
     const ticketId = args.ticketId ?? sha256hex(`${view}:${args.checkpoint}`);
     const result = await this.store.withLock(`finalize:${view}`, async (): Promise<IntegrationResult> => {
       // 1. Idempotency — a terminal success replays as-is (safe resubmission).
@@ -1794,8 +1822,8 @@ export class Repo {
           view, ticketId: resv.ticketId, submittedCheckpoint: resv.submittedCheckpoint,
           baseHead: await this.protectedHead(view), resultCheckpoint: resv.integratedCheckpoint,
           verdict: "expired", reason: `needs_evidence reservation expired at ${resv.expiresAt}`, by: resv.by,
-        });
-        await this.#writeReservation(view, null);
+        }, dry);
+        await this.#writeReservation(view, null, dry);
         resv = null;
       }
       if (resv && resv.ticketId !== ticketId) {
@@ -1806,7 +1834,7 @@ export class Repo {
       const cp = await this.store.get<Checkpoint>(args.checkpoint);
       const missing = await this.#missingCausalDeps(cp.headOps);
       if (missing.length) {
-        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason: `incomplete causal history: ${missing.length} object(s) missing`, by: args.by });
+        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason: `incomplete causal history: ${missing.length} object(s) missing`, by: args.by }, dry);
         return { verdict: "rejected", reason: `incomplete causal history: ${missing.length} object(s) missing — push them first (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""})` };
       }
 
@@ -1814,7 +1842,7 @@ export class Repo {
       const prot = await this.getProtection(view);
       if (prot && !(await this.hasRole(args.by, prot.finalizeRole ?? "maintainer"))) {
         const reason = `${args.by} lacks role ${prot.finalizeRole ?? "maintainer"} to integrate ${view}`;
-        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason, by: args.by });
+        await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead: await this.protectedHead(view), verdict: "rejected", reason, by: args.by }, dry);
         return { verdict: "rejected", reason };
       }
 
@@ -1844,7 +1872,7 @@ export class Repo {
         const integration = await this.#recordIntegration({
           view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
           verdict: "conflict", conflictKeys: packet.conflicts.map((c) => c.key), by: args.by,
-        });
+        }, dry);
         return { verdict: "conflict", packet, integration };
       }
 
@@ -1855,13 +1883,13 @@ export class Repo {
         const verdicts = await this.#approvalVerdicts(args.checkpoint);
         if ([...verdicts.values()].includes("request_changes")) {
           const reason = "changes requested by a reviewer";
-          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
           return { verdict: "rejected", reason };
         }
         const approvers = [...verdicts].filter(([, v]) => v === "approve").map(([id]) => id);
         if (approvers.length < prot.requiredApprovals) {
           const reason = `needs ${prot.requiredApprovals} approval(s), have ${approvers.length}`;
-          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+          await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
           return { verdict: "rejected", reason };
         }
         if (prot.requireOwnerApproval) {
@@ -1869,7 +1897,7 @@ export class Repo {
           for (const id of approvers) if (await this.hasRole(id, "maintainer")) { owner = true; break; }
           if (!owner) {
             const reason = "requires an owner (maintainer+) approval";
-            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
             return { verdict: "rejected", reason };
           }
         }
@@ -1883,14 +1911,16 @@ export class Repo {
       const waived = await this.#activeWaivers(view);
       const required = (prot?.requiredChecks ?? []).filter((k) => !waived.has(k));
       const advance = async (headCp: string, evidenceBinding: Integration["evidenceBinding"], resultIsSubmitted = false): Promise<IntegrationResult> => {
-        await this.store.setRef(`head:${view}`, headCp);
+        // The one mutation not funnelled through a helper (#79). Everything else on this path
+        // — the audit record and the reservation release — is already dry-aware.
+        if (!dry) await this.store.setRef(`head:${view}`, headCp);
         const integration = await this.#recordIntegration({
           view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
           resultCheckpoint: resultIsSubmitted ? undefined : headCp,
           verdict: "advanced", evidenceBinding, ...(carriedApprovals ? { carriedApprovals } : {}), by: args.by,
-        });
-        if (resv?.ticketId === ticketId) await this.#writeReservation(view, null);
-        this.logger.info("integrate.advanced", { view, ticketId, head: headCp, evidenceBinding });
+        }, dry);
+        if (resv?.ticketId === ticketId) await this.#writeReservation(view, null, dry);
+        this.logger.info(dry ? "integrate.preview.advanced" : "integrate.advanced", { view, ticketId, head: headCp, evidenceBinding });
         return { verdict: "advanced", head: headCp, integration };
       };
 
@@ -1900,12 +1930,12 @@ export class Repo {
         for (const k of required) {
           if (cp.evidence[k] !== "pass") {
             const reason = `required check ${k} not pass`;
-            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
             return { verdict: "rejected", reason };
           }
           if (prot?.requireBoundEvidence && cp.evidenceBinding?.[k] !== "bound") {
             const reason = `required check ${k} passed but its evidence is not bound to this tree`;
-            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
             return { verdict: "rejected", reason };
           }
         }
@@ -1920,11 +1950,17 @@ export class Repo {
           ? resv.integratedCheckpoint
           : await this.#authorIntegratedCheckpoint(view, integrated, {}, undefined, `integration ${ticketId.slice(0, 12)} (awaiting evidence)`);
         const ttl = prot?.integration?.reserveTtlMs ?? 10 * 60_000;
+        // The draft checkpoint above IS authored under a dry run, deliberately. It is a
+        // content-addressed immutable object — the same inputs yield the same oid — so it is a
+        // reusable derivation rather than a mutation of queue state, and the result has to
+        // name something for the caller to validate against. What a preview must not touch is
+        // the state that DECIDES: no head, no reservation, no audit record. Hence the skip is
+        // here and not one line up.
         await this.#writeReservation(view, {
           ticketId, submittedCheckpoint: args.checkpoint, integratedCheckpoint: draft,
           treeHash: T, requiredChecks: required, by: args.by,
           expiresAt: new Date(Date.now() + ttl).toISOString(),
-        });
+        }, dry);
         // What the submitter is missing locally to reproduce T: the head-side delta ops
         // plus the blobs they reference (determinism does the rest — docs/17 §14.5 fresh).
         const headClosure = await this.#closureOf(curHeads);
@@ -1940,7 +1976,7 @@ export class Repo {
         const integration = await this.#recordIntegration({
           view, ticketId, submittedCheckpoint: args.checkpoint, baseHead,
           resultCheckpoint: draft, verdict: "needs_evidence", by: args.by,
-        });
+        }, dry);
         return { verdict: "needs_evidence", integratedCheckpoint: draft, treeHash: T, requiredChecks: required, missingLocally, ticketId, integration };
       };
 
@@ -1984,7 +2020,7 @@ export class Repo {
         for (const k of required) {
           if (cp.evidence[k] !== "pass") {
             const reason = `required check ${k} not pass`;
-            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by });
+            await this.#recordIntegration({ view, ticketId, submittedCheckpoint: args.checkpoint, baseHead, verdict: "rejected", reason, by: args.by }, dry);
             return { verdict: "rejected", reason };
           }
         }
