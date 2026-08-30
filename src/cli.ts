@@ -1234,6 +1234,10 @@ async function main(): Promise<void> {
       const repo = await Repo.open(cwd);
       const { execFileSync } = await import("node:child_process");
       const git = (a: string[]): string => execFileSync("git", a, { cwd }).toString();
+      // Bytes for content comparison. `git()` above decodes to utf8, which is right for refs
+      // and path listings and wrong for file content: two different binaries both decode to
+      // runs of U+FFFD and compare EQUAL, so "verify before pushing" would pass on nothing.
+      const gitBytes = (a: string[]): Buffer => execFileSync("git", a, { cwd, maxBuffer: 1 << 28 });
       let sha: string;
       try {
         sha = args[1] && !args[1].startsWith("--") ? git(["rev-parse", args[1]]).trim() : git(["rev-parse", "HEAD"]).trim();
@@ -1253,15 +1257,15 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      const { treeHashOk, files } = await repo.checkpointFiles(cp);
-      const avcs = new Map(files.map((f) => [f.path, f.content]));
+      const { treeHashOk, files } = await repo.checkpointBytes(cp);
+      const avcs = new Map(files.map((f) => [f.path, f.bytes]));
       // Compare against git's committed tree, excluding the .avcs/ history itself (committed mode).
       const gitPaths = git(["ls-tree", "-r", "--name-only", sha]).split("\n").filter((p) => p && !p.startsWith(".avcs/"));
       const gitSet = new Set(gitPaths);
       const diffs: string[] = [];
       for (const p of gitSet) if (!avcs.has(p)) diffs.push(`  +git only: ${p}`);
       for (const p of avcs.keys()) if (!gitSet.has(p)) diffs.push(`  -avcs only: ${p}`);
-      for (const p of gitSet) if (avcs.has(p) && git(["show", `${sha}:${p}`]) !== avcs.get(p)) diffs.push(`  ≠ content: ${p}`);
+      for (const p of gitSet) if (avcs.has(p) && !gitBytes(["show", `${sha}:${p}`]).equals(avcs.get(p)!)) diffs.push(`  ≠ content: ${p}`);
       if (!treeHashOk) diffs.push(`  ! checkpoint treeHash no longer reproduces from its frontier`);
       if (diffs.length) {
         console.error(`✗ ${sha.slice(0, 12)} does NOT match checkpoint ${cp.slice(0, 16)}… (${diffs.length} difference(s)):`);

@@ -48,6 +48,29 @@ Git commit = 파일 트리 스냅샷. AVCS checkpoint = **상태 벡터**:
 
 checkpoint 생성 시점(권장): 큰 편집 완료 / 테스트 통과 / build 실패 전후 / 사람 승인 / 머지 전후 / export 직전.
 
+### 투영의 기본형은 bytes다
+
+checkpoint를 파일로 되돌리는(투영) API 는 두 층이다. **bytes 가 본체이고 string 은 그 위의 얇은 래퍼다** — 반대가 아니다.
+
+```ts
+repo.checkpointBytes(cp)  // { treeHash, treeHashOk, files: [{ path, bytes: Buffer }] }
+repo.checkpointFiles(cp)  // 같은 것의 utf8 view. bytes.toString("utf8")
+```
+
+저장 계층은 이미 전부 Buffer 다(`readBlob`, `materializedBytes`, `putBlob` 은 `string | Uint8Array` 를 받는다). string 은 가장 바깥 한 겹에만 있었고, 그 한 겹이 바이너리를 파괴했다:
+
+```
+원본    89504e470d0a1a0afffe0080      12 bytes   PNG 시그니처 + 유효하지 않은 UTF-8
+왕복 후 efbfbd504e470d0a1a0aefbfbd…  20 bytes   유효하지 않은 시퀀스가 전부 U+FFFD
+```
+
+U+FFFD 로의 치환은 되돌릴 수 없다. 그래서 손상의 무게가 호출자마다 다르다:
+
+- **비교하는 쪽**(`avcs verify-git` 등)에서는 서로 다른 두 바이너리가 **같다고** 나온다. "푸시 전에 검증한다"가 아무것도 검증하지 않게 된다.
+- **되돌리는 쪽**(`revert`)이 훨씬 나쁘다. `revert` 는 이전 내용을 **새 op 으로 다시 저자화**하므로, 손상된 바이트가 append-only 그래프에 기록되고 회수할 수 없다.
+
+판단 기준은 하나다 — **투영을 밖으로 내보내면 bytes, 줄 단위로 다루면 string**. `blame`·`diff` hunk·merge3 는 진짜로 줄을 원하므로 string view 를 그대로 쓴다.
+
 ## Release — tag를 대체한다 (설계, Phase 6)
 
 ```ts
