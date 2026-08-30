@@ -32,6 +32,11 @@ export type { FsckReport } from "./store/objectStore.ts";
 // exported for the same reason CorruptObjectError is: a caller has to be able to catch it.
 export { PurgedBlobError } from "./store/applyRedactions.ts";
 export { MassDeleteError } from "./api/repo.ts";
+// A consumer narrowing `catch (e)` needs the constructor, so it must be reachable from HERE —
+// exporting it from `api/repo.ts` alone does not put it on the package surface. Methods ride
+// along on `Repo`; standalone symbols do not. `RepoNotFoundError` shipped without this line
+// and was unreachable from a consumer despite every core gate being green.
+export { RepoNotFoundError } from "./api/repo.ts";
 
 // Hub (server + client) — the replication / trust boundary avcshub productionizes
 export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
