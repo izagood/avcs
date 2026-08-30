@@ -300,6 +300,23 @@ const GITIGNORE_COMMITTED = `# AVCS — committed mode.
 /** The committed-mode ignore entry for the shared-path cache tree (docs/21 §3.3). */
 const SHARED_IGNORE_LINE = "/shared/";
 
+/**
+ * `dir` holds no AVCS repo — a distinct, expected outcome, not a failure.
+ *
+ * `open` used to say this with a plain `Error`, which forced every caller into `catch {}` to
+ * implement "open it, or create one". That catch also swallows permission errors, corruption
+ * and EMFILE, promoting each of them to "absent" — and a caller that then creates an empty
+ * repo has hidden the real one. A type is what lets the caller be narrow.
+ */
+export class RepoNotFoundError extends Error {
+  readonly dir: string;
+  constructor(dir: string) {
+    super(`not an AVCS repo: ${dir} (run \`avcs init\`)`);
+    this.name = "RepoNotFoundError";
+    this.dir = dir;
+  }
+}
+
 /** Which of the two private keystores a key lives in (issue #98). `"repo"` is the
  *  per-checkout override, `"machine"` the default shared by every repo on the box. */
 export type KeyScope = "repo" | "machine";
@@ -352,15 +369,25 @@ export class Repo {
   #persistedBaseOps = new Map<string, number>();
   static readonly AUTO_COMPACT_DELTA = 256;
 
-  private constructor(dir: string, store: ObjectStore) {
+  /**
+   * Where this handle reads and writes machine-level keys, when the caller said so.
+   *
+   * `undefined` means "resolve from the environment as before" — the default path is
+   * untouched. See {@link configHome}: guessing the caller (a runner denylist) cannot be
+   * complete, so a caller that knows its own keystore is allowed to say it instead.
+   */
+  readonly #configHome?: string;
+
+  private constructor(dir: string, store: ObjectStore, configHome?: string) {
     this.dir = dir;
     this.store = store;
+    this.#configHome = configHome;
   }
 
-  static async init(dir: string): Promise<Repo> {
+  static async init(dir: string, opts?: { configHome?: string }): Promise<Repo> {
     const store = new ObjectStore(dir);
     await store.init();
-    const repo = new Repo(dir, store);
+    const repo = new Repo(dir, store, opts?.configHome);
     // Seed the default policy and the `main` view if absent.
     if (!(await store.getRef("policy"))) {
       const policyOid = await store.put(defaultPolicy());
@@ -380,18 +407,34 @@ export class Repo {
     return repo;
   }
 
-  static async open(dir: string): Promise<Repo> {
-    if (!ObjectStore.isRepo(dir)) {
-      throw new Error(`not an AVCS repo: ${dir} (run \`avcs init\`)`);
-    }
+  static async open(dir: string, opts?: { configHome?: string }): Promise<Repo> {
+    if (!ObjectStore.isRepo(dir)) throw new RepoNotFoundError(dir);
     const store = new ObjectStore(dir);
-    const repo = new Repo(dir, store);
+    const repo = new Repo(dir, store, opts?.configHome);
     // Re-seed the Lamport clock past the highest operation we've seen.
     let max = 0;
     for await (const op of store.list<Operation>("operation")) max = Math.max(max, op.lamport);
     repo.#clock = new LamportClock(max);
     await repo.#loadKeyring();
     return repo;
+  }
+
+  /**
+   * Open the repo at `dir`, creating one if — and ONLY if — none is there.
+   *
+   * The distinction is the whole point. A consumer writing this itself reaches for
+   * `try { open } catch { init }`, and that catch cannot tell "absent" from "present but
+   * unreadable"; the second case then gets an empty repo written over it. Here only
+   * {@link RepoNotFoundError} routes to creation and every other failure propagates.
+   */
+  static async openOrInit(dir: string, opts?: { configHome?: string }): Promise<Repo> {
+    try {
+      return await Repo.open(dir, opts);
+    } catch (e) {
+      if (!(e instanceof RepoNotFoundError)) throw e;
+    }
+    await mkdir(dir, { recursive: true });
+    return Repo.init(dir, opts);
   }
 
   async policy(): Promise<Policy> {
@@ -491,7 +534,7 @@ export class Repo {
     assertKeyFilename(actorId);
     const rec: KeyFile = { actorId, privateKey, ...(opts?.actorKind ? { actorKind: opts.actorKind } : {}) };
     if ((opts?.scope ?? "machine") === "machine") {
-      await saveMachineKey(rec);
+      await saveMachineKey(rec, this.#configHome);
       return;
     }
     await mkdir(this.#privateKeysDir(), { recursive: true, mode: 0o700 });
@@ -623,7 +666,7 @@ export class Repo {
    */
   async listLocalKeySources(): Promise<{ actorId: string; source: KeyScope; shadowed?: true }[]> {
     const repoIds = await this.#listKeyDir(this.#privateKeysDir());
-    const machineIds = new Set(await listMachineKeys());
+    const machineIds = new Set(await listMachineKeys(this.#configHome));
     const by = new Map<string, KeyScope>();
     for (const id of machineIds) by.set(id, "machine");
     for (const id of repoIds) by.set(id, "repo"); // repo wins, matching #findLocalKey
@@ -696,7 +739,7 @@ export class Repo {
     }
     const repoKey = await readKeyFile(join(this.#privateKeysDir(), `${actorId}.json`));
     if (repoKey) return { privateKey: repoKey.privateKey, source: "repo" };
-    const machine = await loadMachineKey(actorId);
+    const machine = await loadMachineKey(actorId, this.#configHome);
     return machine ? { privateKey: machine, source: "machine" } : null;
   }
 
@@ -715,18 +758,18 @@ export class Repo {
    */
   async #adoptIntoMachineKeystore(actorId: string, privateKey: string): Promise<void> {
     if (!adoptionEnabled()) return;
-    const existing = await loadMachineKey(actorId);
+    const existing = await loadMachineKey(actorId, this.#configHome);
     if (existing === privateKey) return; // already adopted
     if (existing) {
       this.#note(
         `${actorId}: this checkout holds a private key that differs from the one in the machine keystore ` +
-          `(${machineKeystoreDir()}) — keeping both; this repo keeps signing with its own. Remove one to reconcile.`,
+          `(${machineKeystoreDir(this.#configHome)}) — keeping both; this repo keeps signing with its own. Remove one to reconcile.`,
       );
       return;
     }
     const kind = (await readKeyFile(join(this.#privateKeysDir(), `${actorId}.json`)))?.actorKind ?? kindOfActorId(actorId);
     try {
-      await saveMachineKey({ actorId, privateKey, actorKind: kind });
+      await saveMachineKey({ actorId, privateKey, actorKind: kind }, this.#configHome);
     } catch (e) {
       // Adoption is a convenience on a READ path: `loadLocalKey` is what `#resolveHubSigner`
       // and the MCP decision signer call. A read-only home, a full disk or an odd
@@ -736,7 +779,7 @@ export class Repo {
       return;
     }
     this.#note(
-      `${actorId}: private key adopted from this checkout into the machine keystore (${machineKeyPath(actorId)}); ` +
+      `${actorId}: private key adopted from this checkout into the machine keystore (${machineKeyPath(actorId, this.#configHome)}); ` +
         `other repos on this machine can now sign as ${actorId}. The copy in this repo still takes precedence.`,
     );
   }
@@ -1810,7 +1853,15 @@ export class Repo {
       if (priorRef && (await this.store.has(priorRef))) {
         const prior = await this.store.get<Integration>(priorRef);
         if (prior.verdict === "advanced") {
-          return { verdict: "advanced", head: prior.resultCheckpoint!, integration: priorRef };
+          // `resultCheckpoint` is absent on the fast-forward path — there the submitted
+          // checkpoint IS the result, so nothing is re-authored and nothing is recorded. The
+          // old `!` therefore handed back `undefined` typed as `string`, and resubmission is a
+          // normal path (network retry, agent retry, job rerun), not an exceptional one.
+          return {
+            verdict: "advanced",
+            head: prior.resultCheckpoint ?? prior.submittedCheckpoint,
+            integration: priorRef,
+          };
         }
       }
 

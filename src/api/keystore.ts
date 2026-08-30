@@ -63,7 +63,11 @@ function testRunner(): string | null {
   return null;
 }
 
-export function configHome(): string {
+export function configHome(injected?: string): string {
+  // An explicit argument wins over everything, including the runner guard below. Guessing who
+  // is calling is a denylist and cannot be complete; a caller that SAYS where its keystore is
+  // needs no guess. `Repo.open(dir, { configHome })` is how that argument arrives.
+  if (injected) return injected;
   const explicit = process.env.AVCS_CONFIG_HOME;
   if (explicit) return explicit;
   const xdg = process.env.XDG_CONFIG_HOME;
@@ -97,8 +101,8 @@ export function configHome(): string {
  *  A `private/` subdirectory rather than the config home itself, so the layout matches
  *  a repo's `<store>/private/` exactly and later machine-level config cannot collide
  *  with an actor id. */
-export function machineKeystoreDir(): string {
-  return join(configHome(), "private");
+export function machineKeystoreDir(home?: string): string {
+  return join(configHome(home), "private");
 }
 
 /**
@@ -114,18 +118,18 @@ export function assertKeyFilename(actorId: string): void {
   }
 }
 
-export function machineKeyPath(actorId: string): string {
+export function machineKeyPath(actorId: string, home?: string): string {
   assertKeyFilename(actorId);
-  return join(machineKeystoreDir(), `${actorId}.json`);
+  return join(machineKeystoreDir(home), `${actorId}.json`);
 }
 
 /** Create the keystore with credential modes. `mkdir`'s `mode` is masked by the process
  *  umask and ignored entirely for a directory that already exists, so pin both levels
  *  explicitly — 0700 is part of the contract here, not a nicety. */
-export async function ensureKeystoreDir(): Promise<string> {
-  const dir = machineKeystoreDir();
+export async function ensureKeystoreDir(home?: string): Promise<string> {
+  const dir = machineKeystoreDir(home);
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  for (const d of [configHome(), dir]) {
+  for (const d of [configHome(home), dir]) {
     try {
       await chmod(d, 0o700);
     } catch {
@@ -136,8 +140,8 @@ export async function ensureKeystoreDir(): Promise<string> {
 }
 
 /** Write a private key into the machine keystore, 0600. Returns the path written. */
-export async function saveMachineKey(rec: KeyFile): Promise<string> {
-  const dir = await ensureKeystoreDir();
+export async function saveMachineKey(rec: KeyFile, home?: string): Promise<string> {
+  const dir = await ensureKeystoreDir(home);
   const p = join(dir, `${rec.actorId}.json`);
   assertKeyFilename(rec.actorId);
   await writeFile(p, JSON.stringify(rec), { encoding: "utf8", mode: 0o600 });
@@ -161,9 +165,9 @@ export async function readKeyFile(path: string): Promise<KeyFile | null> {
 }
 
 /** The private key this machine holds for `actorId`, or null. */
-export async function loadMachineKey(actorId: string): Promise<string | null> {
+export async function loadMachineKey(actorId: string, home?: string): Promise<string | null> {
   try {
-    return (await readKeyFile(machineKeyPath(actorId)))?.privateKey ?? null;
+    return (await readKeyFile(machineKeyPath(actorId, home)))?.privateKey ?? null;
   } catch {
     return null; // an id that cannot name a file simply has no key
   }
@@ -171,8 +175,8 @@ export async function loadMachineKey(actorId: string): Promise<string | null> {
 
 /** Actor ids this machine holds a private key for. Ids only — key material must never
  *  travel with a listing, or `key ls` becomes the disclosure it exists to help avoid. */
-export async function listMachineKeys(): Promise<string[]> {
-  const dir = machineKeystoreDir();
+export async function listMachineKeys(home?: string): Promise<string[]> {
+  const dir = machineKeystoreDir(home);
   if (!existsSync(dir)) return [];
   try {
     return (await readdir(dir))
