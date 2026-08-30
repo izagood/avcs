@@ -62,22 +62,29 @@ test("주입한 키스토어에서 다시 읽는다 — 쓰기만 갈라지면 �
   }
 });
 
-// 회귀 방지: 아무것도 주입하지 않으면 예전 그대로다. denylist 도 그대로 살아 있어야 한다 —
-// 이 스위트는 `node --test` 이므로, env 가 없으면 던지는 것이 지금의 계약이다.
+// 회귀 방지: 아무것도 주입하지 않으면 예전 해석 그대로다. denylist 도 그대로 살아 있어야 한다.
+//
+// 가드는 해석 순서의 **세 번째** 다: AVCS_CONFIG_HOME → XDG_CONFIG_HOME/avcs → 러너 가드 →
+// ~/.avcs. 그래서 앞의 둘을 모두 지워야 가드에 닿는다. 하나만 지우면 XDG 가 설정된 환경(리눅스
+// CI 가 그렇다)에서는 그 전에 반환되어 테스트가 조용히 무의미해진다 — 실제로 그렇게 썼다가
+// macOS 에서 초록, CI 에서 빨강을 봤다.
 test("주입이 없으면 예전 해석 그대로 — denylist 포함", async () => {
   const dir = await mkdtemp(join(tmpdir(), "avcs-ks-default-"));
-  const envHome = process.env.AVCS_CONFIG_HOME;
+  const saved = { avcs: process.env.AVCS_CONFIG_HOME, xdg: process.env.XDG_CONFIG_HOME };
   try {
     const repo = await Repo.init(dir);
     delete process.env.AVCS_CONFIG_HOME;
+    delete process.env.XDG_CONFIG_HOME;
     await assert.rejects(
       () => repo.provisionOwnerKey({ kind: "ai_agent", id: "ai:nope" }),
       /refusing to resolve the machine keystore/,
       "말하지 않은 호출자에게는 denylist 가 그대로 선다",
     );
   } finally {
-    if (envHome === undefined) delete process.env.AVCS_CONFIG_HOME;
-    else process.env.AVCS_CONFIG_HOME = envHome;
+    for (const [k, v] of [["AVCS_CONFIG_HOME", saved.avcs], ["XDG_CONFIG_HOME", saved.xdg]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     await rm(dir, { recursive: true, force: true });
   }
 });
