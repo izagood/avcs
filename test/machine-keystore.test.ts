@@ -51,8 +51,12 @@ test("the keystore path is $AVCS_CONFIG_HOME, else $XDG_CONFIG_HOME/avcs, else ~
     delete process.env.AVCS_CONFIG_HOME;
     assert.equal(configHome(), join("/tmp/xdg", "avcs"), "XDG comes next");
 
+    // Under the test runner with neither variable set, resolution now REFUSES rather than
+    // falling back to the developer's real keystore (issue #107). The `~/.avcs` default is
+    // still the contract for ordinary processes — `keystore-test-guard.test.ts` asserts it
+    // from a real child process, which is a truer check than asserting it from in here.
     delete process.env.XDG_CONFIG_HOME;
-    assert.equal(configHome(), join(homedir(), ".avcs"), "and ~/.avcs is the default");
+    assert.throws(() => configHome(), /AVCS_CONFIG_HOME/, "a bare test run must not reach ~/.avcs");
 
     process.env.AVCS_CONFIG_HOME = "/tmp/explicit";
     assert.equal(machineKeystoreDir(), join("/tmp/explicit", "private"));
@@ -220,11 +224,12 @@ test("an actor id that would escape the keystore directory is refused", async ()
 test("the real config home is never touched by these tests", async () => {
   // The isolation guarantee, asserted rather than assumed: snapshot the developer's actual
   // keystore, run the full provision path under the override, and compare.
-  const prev = process.env.AVCS_CONFIG_HOME;
-  delete process.env.AVCS_CONFIG_HOME;
-  const real = configHome();
+  // The real path is computed directly, not via `configHome()`: since #107 that function
+  // refuses to resolve the home default under the test runner, which is exactly the
+  // protection this test exists to verify. Asking for the path is not the same as being
+  // allowed to use it.
+  const real = join(homedir(), ".avcs");
   const before = existsSync(real) ? (await readdir(real)).sort() : null;
-  if (prev !== undefined) process.env.AVCS_CONFIG_HOME = prev;
 
   await withKeystore(async () => {
     const { dir, repo } = await tmpRepo();
