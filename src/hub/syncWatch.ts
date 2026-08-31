@@ -132,12 +132,77 @@ async function watchLoop(repo: Repo, remote: string, url: string, opts: SyncWatc
   let backoff = minBackoff;
   let lastHeads = new Map<string, string>();
 
+  // Early-warning inspection cursor (#55): an index into the LOCAL objlog.
+  //
+  // The alert used to inspect "oids this iteration's long-poll announced that are not yet in
+  // the store". That is a delta of ONE pull — but ops arrive through several: the initial
+  // sync below, the echo iteration's sync, a user's manual `avcs pull`. Whichever of those
+  // got the op first made `store.has` true, dropping it from the delta; and once the shared
+  // pull cursor moved past it, every later long-poll was a heartbeat, which `continue`d
+  // before the alert pass. The alert was not late — it was never coming. Measured before the
+  // fix: 5/5 alerts delivered without a racing pull, 5/5 lost with one.
+  //
+  // The local objlog is the definition that does not care which path delivered the object:
+  // `store.put` appends every newly-written object in arrival order, so "what this replica
+  // has not inspected yet" is exactly `objlog.slice(inspected)`. Snapshot BEFORE the initial
+  // sync so work that predates the watcher (a restart, a late start) is inspected too.
+  // `readObjLog` backfills itself when the file is missing, so the snapshot is never partial
+  // in a way that would leak old history into the first delta.
+  let inspected = (await repo.store.readObjLog()).length;
+
+  /**
+   * Alert on every not-yet-inspected arrival. Grouped per (actor, line) rather than one
+   * `contention()` call per op: the query is keyed on (keys, actor, line) anyway, and per-op
+   * calls made the first pass after a big initial sync quadratic-ish. Grouping keeps the
+   * same warnings — only a same-key duplicate (two fresh ops by one actor on one key)
+   * collapses to the latest op, which is a dedupe rather than a loss.
+   */
+  const alertPass = async (): Promise<void> => {
+    const log = await repo.store.readObjLog();
+    if (log.length <= inspected) return;
+    const fresh = log.slice(inspected);
+    inspected = log.length;
+
+    const groups = new Map<string, { actorId: string; line: string; keys: Set<string>; opByKey: Map<string, string> }>();
+    for (const oid of fresh) {
+      let obj;
+      try { obj = await repo.store.get(oid); } catch { continue; }
+      if (obj.type !== "operation") continue;
+      const op = obj as Operation;
+      if (op.private) continue;
+      // Our own authorings and their hub echoes are not "incoming" — the alert's meaning is
+      // "someone ELSE's op landed on your key". Known only when the daemon says who it is.
+      if (opts.as && op.actor.id === opts.as) continue;
+      const gk = `${op.actor.id}\n${op.line ?? "main"}`;
+      let g = groups.get(gk);
+      if (!g) { g = { actorId: op.actor.id, line: op.line ?? "main", keys: new Set(), opByKey: new Map() }; groups.set(gk, g); }
+      for (const k of keysOf(op)) { g.keys.add(k); g.opByKey.set(k, oid); }
+    }
+
+    for (const g of groups.values()) {
+      const warnings = await repo.contention({ keys: [...g.keys], actorId: g.actorId, line: g.line });
+      for (const w of warnings) {
+        if (!w.theirs.length) continue;
+        const incomingOp = g.opByKey.get(w.key);
+        if (!incomingOp) continue;
+        emit({
+          type: "contention",
+          key: w.key,
+          incomingOp,
+          incomingActor: g.actorId,
+          localOps: w.theirs.map((t) => ({ op: t.op, actor: t.actor, purpose: t.purpose })),
+        });
+      }
+    }
+  };
+
   // Initial full convergence — also seeds the shared objlog cursor for the long-poll.
   try {
     const r = await repo.sync(remote, { as: opts.as });
     emit({ type: "synced", pulled: r.pulled, pushed: r.pushed });
     lastHeads = await headRefs(repo);
     for (const [view, cp] of lastHeads) emit({ type: "head", view, checkpoint: cp });
+    await alertPass(); // work that predates the watcher arrives HERE, not via a long-poll
   } catch (e) {
     emit({ type: "error", error: String((e as Error).message), backoffMs: backoff });
     await sleep(backoff + Math.floor(Math.random() * backoff), signal);
@@ -163,6 +228,12 @@ async function watchLoop(repo: Repo, remote: string, url: string, opts: SyncWatc
         ([name, oid]) => name.startsWith("head:") && lastHeads.get(name.slice("head:".length)) !== oid,
       );
       if (!payload.oids.length && !headsMoved) {
+        // The hub saw nothing new PAST OUR SHARED CURSOR — but a racing pull (the echo
+        // iteration's own sync, a manual `avcs pull`) may have both delivered ops and moved
+        // that cursor past them. Those arrivals exist only in the local objlog now, and this
+        // is the only place they can still be inspected: every later long-poll is another
+        // heartbeat. So look before parking again.
+        await alertPass();
         emit({ type: "heartbeat", cursor: payload.cursor });
         continue;
       }
@@ -171,10 +242,6 @@ async function watchLoop(repo: Repo, remote: string, url: string, opts: SyncWatc
       if (signal?.aborted) break;
     }
 
-    // Which of the announced oids are genuinely new HERE? Decided before the pull so
-    // the contention pass below only inspects actual arrivals (not our own echoes).
-    const incoming: string[] = [];
-    if (payload) for (const oid of payload.oids) if (!(await repo.store.has(oid))) incoming.push(oid);
 
     try {
       const r = await repo.sync(remote, { as: opts.as });
@@ -187,26 +254,9 @@ async function watchLoop(repo: Repo, remote: string, url: string, opts: SyncWatc
 
       // Early conflict warning (Phase 15.3): an incoming op landed on a key that has
       // live local work by someone else — "agent B's op arrived on your key K", raised
-      // at ARRIVAL time instead of at finalize. Perspective is the incoming actor's, so
-      // `theirs` is exactly the local work the arrival did not build on.
-      for (const oid of incoming) {
-        if (!(await repo.store.has(oid))) continue; // announced but not transferred (raced eviction)
-        const obj = await repo.store.get(oid);
-        if (obj.type !== "operation") continue;
-        const op = obj as Operation;
-        if (op.private) continue;
-        const warnings = await repo.contention({ keys: keysOf(op), actorId: op.actor.id, line: op.line });
-        for (const w of warnings) {
-          if (!w.theirs.length) continue;
-          emit({
-            type: "contention",
-            key: w.key,
-            incomingOp: oid,
-            incomingActor: op.actor.id,
-            localOps: w.theirs.map((t) => ({ op: t.op, actor: t.actor, purpose: t.purpose })),
-          });
-        }
-      }
+      // at ARRIVAL time instead of at finalize. Driven by the local objlog delta (#55),
+      // so it holds no matter which path delivered the op.
+      await alertPass();
     } catch (e) {
       if (signal?.aborted) break;
       emit({ type: "error", error: String((e as Error).message), backoffMs: backoff });
