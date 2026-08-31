@@ -27,7 +27,13 @@ test("URL 을 주면 그 서버를 잰다 — 참조 구현을 띄우지 않는�
 });
 
 test("URL 이 없으면 참조 구현을 띄운다 — 기존 커버리지가 유지된다", async () => {
+  // 이 자기검증은 "URL 없음" 조건 자체를 재므로 env 기본값을 명시적으로 끈다 — 스위트를
+  // AVCS_CONFORMANCE_URL 로 외부 서버에 돌리면 env 가 여기까지 주입되어 자기모순이 된다.
+  // 실제로 첫 외부 실행(제3 구현)이 이 버그를 찾았다.
+  const saved = process.env.AVCS_CONFORMANCE_URL;
+  delete process.env.AVCS_CONFORMANCE_URL;
   const t = await openTarget();
+  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
   try {
     assert.equal(t.spawned, true, "URL 이 없으면 참조 구현을 띄워야 한다");
     assert.match(t.base, /^http:\/\/127\.0\.0\.1:\d+$/);
@@ -48,9 +54,13 @@ test("레벨은 누적이다 — 상위가 하위를 포함한다", () => {
 });
 
 test("서버가 광고하지 않는 능력의 레벨은 건너뛴다 — 실패가 아니다", async () => {
-  // 부분 구현 서버가 1급 시민이라는 것이 프로토콜의 약속이다(docs/25 §0). 스위트가 그것을
+  // 부분 구현 서버가 1급 시민이라는 것이 프로토콜의 약속이다(docs/26 §0). 스위트가 그것을
   // 실패로 처리하면 약속을 어기는 쪽이 스위트가 된다.
+  // "참조 구현은 전부 켜져 있다" 를 재므로 env 주입을 끈다 (위 테스트와 같은 이유).
+  const saved = process.env.AVCS_CONFORMANCE_URL;
+  delete process.env.AVCS_CONFORMANCE_URL;
   const t = await openTarget();
+  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
   try {
     const caps = await t.capabilities();
     assert.equal(typeof caps.batch, "boolean");
