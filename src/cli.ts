@@ -795,9 +795,15 @@ async function main(): Promise<void> {
     }
     case "blame": {
       const repo = await Repo.open(cwd);
-      const key = args[1];
-      if (!key) throw new Error("usage: avcs blame <file:path | symbol:path#name>");
+      const raw = args[1];
+      if (!raw) throw new Error("usage: avcs blame <path | file:path | symbol:path#name>");
+      // A bare path is what every git user types first: promote it to the `file:` entity
+      // when one is tracked, and point at the prefix when nothing matches (issue #117).
+      const hasKind = /^[a-z][a-z0-9_-]*:/i.test(raw);
+      const key = !hasKind && (await repo.historyOf(`file:${raw}`)).length ? `file:${raw}` : raw;
       const b = await repo.blame(key, flag("--line") ?? "main");
+      if (!b && key === raw && !hasKind)
+        throw new Error(`no entity '${raw}' — did you mean 'file:${raw}'?`);
       if (!b) console.log("no owner (entity not present)");
       else console.log(`${b.actor.id}  ${b.op.slice(0, 16)}\n  why: ${b.purpose}${b.intentTitle ? `  [intent: ${b.intentTitle}]` : ""}\n  at:  ${b.at}`);
       break;
@@ -1765,7 +1771,7 @@ async function main(): Promise<void> {
           "  workspace project <n> [--out d] | land <n> | list   converging work scopes (docs/16, 20)\n" +
           "  shared ls | add <path> [--key-from f,f] [--mode symlink|copy] | rm <path>|--cache <key>\n" +
           "                              build environments shared across workspaces (docs/21)\n" +
-          "  blame <entityKey> [--line l] who owns an entity and why\n" +
+          "  blame <path | entityKey> [--line l] who owns an entity and why\n" +
           "  diff <viewA> <viewB>        added/removed/modified paths\n" +
           "  log                         operation history\n" +
           "  materialize [view] [--out d]  project the code tree\n" +
