@@ -176,6 +176,7 @@ export class ObjectStore {
     return join(this.root, "indexes", "entity", h.slice(0, 2), `${h.slice(0, 32)}.idx`);
   }
   async appendEntityIndex(key: string, oid: string): Promise<void> {
+    if (this.#batch) { this.#batch.index.push([key, oid]); return; } // flushed grouped per key
     const p = this.#indexPathFor(key);
     await mkdir(dirname(p), { recursive: true });
     await this.#appendDurable(p, `${oid}\n`);
@@ -256,6 +257,15 @@ export class ObjectStore {
     // object KEY, which is hashed material. See `assertInteropSafe`.
     assertInteropSafe(payload, obj.type);
     const oid = computeOid(obj.type, payload as Record<string, unknown>);
+    if (this.#batch) {
+      // Staged, not written: the enclosing batched() flushes via putMany. Skip what disk or
+      // this batch already holds — the same idempotency as the disk path.
+      if (!existsSync(this.#pathFor(oid)) && !this.#batch.byOid.has(oid)) {
+        this.#batch.objs.push(obj);
+        this.#batch.byOid.set(oid, { ...(payload as Record<string, unknown>), oid } as AnyObject);
+      }
+      return oid;
+    }
     const p = this.#pathFor(oid);
     if (!existsSync(p)) {
       await mkdir(dirname(p), { recursive: true });
@@ -289,11 +299,22 @@ export class ObjectStore {
    */
   async readOpLog(): Promise<string[]> {
     const p = join(this.root, "oplog");
-    if (!existsSync(p)) return [];
+
     const seen = new Set<string>();
     const out: string[] = [];
-    for (const line of (await readFile(p, "utf8")).split("\n"))
-      if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    if (existsSync(p)) {
+      for (const line of (await readFile(p, "utf8")).split("\n"))
+        if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    }
+    // Read-your-writes extends to LOG-DERIVED reads, not just get/has. `contention()`'s
+    // closure walks #allOpsTailed ← readOpLog to find "my ops"; if a batch's staged op is
+    // invisible here, the closure misses it, and the very op it BUILT ON surfaces as a
+    // foreign write — a spurious warning the sequential path never produced. Caught by
+    // contention-across-lines.test.ts the first time batched() shipped without this.
+    if (this.#batch) {
+      for (const [oid, obj] of this.#batch.byOid)
+        if (obj.type === "operation" && !seen.has(oid)) { seen.add(oid); out.push(oid); }
+    }
     return out;
   }
 
@@ -306,11 +327,17 @@ export class ObjectStore {
   async readObjLog(): Promise<string[]> {
     const p = join(this.root, "objlog");
     if (!existsSync(p)) await this.#backfillObjLog();
-    if (!existsSync(p)) return [];
+
     const seen = new Set<string>();
     const out: string[] = [];
-    for (const line of (await readFile(p, "utf8")).split("\n"))
-      if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    if (existsSync(p)) {
+      for (const line of (await readFile(p, "utf8")).split("\n"))
+        if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+    }
+    if (this.#batch) { // same read-your-writes rule as readOpLog above
+      for (const oid of this.#batch.byOid.keys())
+        if (!seen.has(oid)) { seen.add(oid); out.push(oid); }
+    }
     return out;
   }
 
@@ -356,6 +383,9 @@ export class ObjectStore {
   }
 
   async get<T extends AnyObject = AnyObject>(oid: string): Promise<T> {
+    // Read-your-writes inside batched(): authoring code reads what it just staged.
+    const staged = this.#batch?.byOid.get(oid);
+    if (staged) return staged as T;
     const p = this.#pathFor(oid);
     if (existsSync(p)) return decodeObject<T>(await readFile(p), oid); // loose shadows packs
     const loc = (await this.#packLocations()).get(oid);
@@ -364,6 +394,7 @@ export class ObjectStore {
   }
 
   async has(oid: string): Promise<boolean> {
+    if (this.#batch?.byOid.has(oid)) return true; // staged counts — read-your-writes
     return existsSync(this.#pathFor(oid)) || (await this.#packLocations()).has(oid);
   }
 
@@ -381,6 +412,51 @@ export class ObjectStore {
    * by a re-added loose copy. Corrupt bodies do not throw here — nothing is read — which is
    * also why negotiation must not: announcing is not vouching, `get` still verifies.
    */
+  /** In-flight authoring batch (see {@link batched}), or null outside one. */
+  #batch: { objs: AnyObject[]; byOid: Map<string, AnyObject>; index: [string, string][] } | null = null;
+
+  /**
+   * Run `fn` with every `put`/`appendEntityIndex` STAGED in memory, then flush the lot as
+   * one group commit (issue #33 / the third site of #55's perf finding).
+   *
+   * The authoring path — `commitWorkingTree` looping blob put + op put + index append per
+   * file — paid the same serial-fsync amplification the transfer paths did: a 100-file
+   * commit measured 4.69s on an idle machine, and the avcs hook stages the WHOLE worktree,
+   * which is how pre-commit ingest reaches 30s under load (#33).
+   *
+   * Semantics:
+   *  - read-your-writes: `has`/`get` serve staged objects, so authoring code that reads
+   *    what it just wrote keeps working.
+   *  - durability AT RETURN is unchanged — the flush is `putMany`'s group commit, so the
+   *    oplog is appended only after every body is durable, exactly as `put` promises.
+   *  - a throw inside `fn` leaves NOTHING on disk: a crash mid-commit becomes a clean
+   *    no-op instead of a partial commit — strictly better than the sequential behavior.
+   *  - lamport quality is unaffected: the in-process clock ticks per staged op, and
+   *    `#maxLamportSeen` is a cross-process ordering QUALITY aid whose absence during the
+   *    batch changes nothing the reducer depends on (it tie-breaks by (lamport, oid)).
+   *  - contention checks inside the batch see pre-batch state only; same-batch ops share
+   *    one actor, which the check never warns about anyway.
+   *
+   * Nesting is refused rather than flattened — a silently flattened inner batch would make
+   * the outer one's "all or nothing" a lie.
+   */
+  async batched<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.#batch) throw new Error("nested batched() is not supported — the outer batch's atomicity would silently stop holding");
+    const b = { objs: [] as AnyObject[], byOid: new Map<string, AnyObject>(), index: [] as [string, string][] };
+    this.#batch = b;
+    let out: T;
+    try {
+      out = await fn();
+    } finally {
+      // Unset BEFORE flushing (putMany must take the disk path), and unconditionally — a
+      // throw discards the staging so nothing lands.
+      this.#batch = null;
+    }
+    if (b.objs.length) await this.putMany(b.objs);
+    if (b.index.length) await this.appendEntityIndexMany(b.index);
+    return out;
+  }
+
   /**
    * Store many objects with GROUP-COMMITTED durability (issue #55's perf follow-up).
    *
