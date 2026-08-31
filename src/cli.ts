@@ -23,7 +23,7 @@ import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
 import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
 import { ObjectStore } from "./store/objectStore.ts";
-import type { Operation, Actor } from "./objects/types.ts";
+import type { Operation, Actor, Undo } from "./objects/types.ts";
 import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
 
 const args = process.argv.slice(2);
@@ -1174,6 +1174,14 @@ async function main(): Promise<void> {
       if (r.retained.length) console.log(`kept ${r.retained.length} blob(s) a still-selected op references`);
       if (!purging) console.log("(reversible: the ops and their bytes remain; --purge evicts the bytes)");
       console.log(`recorded as ${r.undoOid}`);
+      // The working-tree consequence, said last (issue #118): undo changes the VIEW, never
+      // the tree — exactly the moment a git-trained user expects a revert/reset to touch
+      // disk. Skipped when the purge plane already stated its own tree consequence (the
+      // leak warning / git message), where "run checkout" would contradict "fix the leak".
+      if (!r.purged.length && !gitWarned) {
+        const co = r.view === "main" ? "avcs checkout" : `avcs checkout ${r.view}`;
+        console.log(`working tree not touched — run \`${co}\` to re-project ${r.view}`);
+      }
       break;
     }
     case "worktree": {
@@ -1512,10 +1520,19 @@ async function main(): Promise<void> {
       const store = new ObjectStore(cwd);
       const ops = await store.collect<Operation>("operation");
       ops.sort((a, b) => a.lamport - b.lamport);
+      // Undone ops stay listed — undo annotates history, it never rewrites it (docs/23 §6) —
+      // but unmarked they read as if the undo never happened (issue #118). Display-layer
+      // only: the mapping is derived here from the recorded Undo objects.
+      const undoneBy = new Map<string, string>();
+      for (const u of await store.collect<Undo>("undo")) {
+        for (const o of u.ops) if (u.oid) undoneBy.set(o, u.oid);
+      }
       for (const op of ops) {
         const tgt = `${op.target.entityKind}:${op.target.entityId}`;
+        const undone = op.oid && undoneBy.get(op.oid);
         console.log(
           `[${String(op.lamport).padStart(3, "0")}] ${op.actor.id}  ${op.body.kind} ${tgt}` +
+            `${undone ? `  (undone by ${undone.slice(0, 16)}…)` : ""}` +
             `\n        ${op.declaredPurpose}`,
         );
       }
