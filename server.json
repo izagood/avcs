@@ -7,13 +7,13 @@
     "url": "https://github.com/izagood/avcs",
     "source": "github"
   },
-  "version": "0.41.0",
+  "version": "0.42.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@izagood/avcs",
-      "version": "0.41.0",
+      "version": "0.42.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
