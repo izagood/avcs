@@ -14,7 +14,7 @@
 //   avcs show <oid>
 //   avcs mcp [install]
 
-import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -643,6 +643,27 @@ async function main(): Promise<void> {
           const { installed } = await installHooks(hooksDir, cmd, false);
           if (installed.length) console.log(`  installed git hooks (${installed.join(", ")}) — \`git commit\` now auto-syncs AVCS (--no-hooks to skip)`);
         } catch { /* not a git repo — fine; user can `git init` then `avcs install-hooks` */ }
+      }
+      // A non-empty directory means the very next `status` would show `files: 0` with no
+      // explanation (issue #116): init succeeds, the repo starts empty, and nothing names
+      // `import` as the step that brings the existing tree in. Count what `import` would
+      // capture — same skips (.avcs, .git's own dir) and the same gitignore filter — and
+      // name the exact command, the way `land` and `sync` already do for their errors.
+      {
+        const ignored = gitIgnorePredicate(dir);
+        const countFiles = (d: string, prefix: string): number => {
+          let n = 0;
+          for (const ent of readdirSync(d, { withFileTypes: true })) {
+            const rel = prefix ? `${prefix}/${ent.name}` : ent.name;
+            if (rel.startsWith(".avcs") || rel === ".git") continue;
+            if (ignored(rel)) continue;
+            if (ent.isDirectory()) n += countFiles(join(d, ent.name), rel);
+            else if (ent.isFile()) n += 1;
+          }
+          return n;
+        };
+        const untracked = countFiles(dir, "");
+        if (untracked > 0) console.log(`  ${untracked} file(s) present in the working tree are not yet tracked — run \`avcs import . -m "initial import"\` to bring them in`);
       }
       break;
     }
