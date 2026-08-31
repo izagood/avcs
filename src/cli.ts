@@ -1001,7 +1001,7 @@ async function main(): Promise<void> {
     case "clone": {
       const url = args[1];
       const dir = args[2] ?? cwd;
-      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir] [--as <actor-id>] [--key <repo-dir|key-file>]\n  (no --key needed when this machine holds a signing key — see `avcs key ls`)");
+      if (!url || !/^https?:\/\//.test(url)) throw new Error("usage: avcs clone <hub-url> [dir] [--at <checkpoint>] [--as <actor-id>] [--key <repo-dir|key-file>]\n  (no --key needed when this machine holds a signing key — see `avcs key ls`)");
       const repo = await Repo.init(dir);
       // A hub that gates reads refuses an unsigned GET /have. Since #98 the MACHINE holds the
       // identity, so a fresh repo can sign its first read with no flag at all — which is what
@@ -1029,7 +1029,18 @@ async function main(): Promise<void> {
       // it is for `materialize --out <fresh dir>` — and pointed at a repo root it would take
       // `.avcs` with it. (Its non-empty-directory guard catches that, loudly.) `checkoutInto`
       // projects in place, which is what the git bridge already does after a pull.
-      const written = await repo.checkoutInto(dir, "main");
+      // Which tree to land. `--at` names a CHECKPOINT, which is a content address — the
+      // objects the pull just fetched are enough to resolve it. A `--view <name>` flag
+      // cannot work the same way: `view:*` refs stay local and are never transferred, so a
+      // fresh clone has no way to resolve a view name. Advertising views over the protocol
+      // is a separate question.
+      //
+      // Landing the right tree in ONE step also avoids composing clone with a checkout.
+      // That composition used to produce the union of both trees; `checkoutInto` now
+      // removes what a previous projection left behind, so it is no longer wrong — but one
+      // step is still less work and less to reason about.
+      const wantAt = flag("--at");
+      const written = await repo.checkoutInto(dir, "main", wantAt ? { at: wantAt } : undefined);
       console.log(
         `cloned ${r.pulled} object(s) from ${url} into ${dir}, wrote ${written.length} file(s)` +
           `  [remote origin recorded]` + (canSign ? `  [signing as ${signer}]` : ""),
