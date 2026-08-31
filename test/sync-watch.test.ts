@@ -14,6 +14,9 @@ import { runSyncWatch, type SyncWatchEvent } from "../src/hub/syncWatch.ts";
 import type { Actor } from "../src/objects/types.ts";
 // A wall-clock budget cannot tell a false condition from a starved event loop (issue #55).
 import { until } from "./helpers/until.ts";
+// 이벤트 대기는 폴링이 아니라 콜백으로 한다 (issue #55). watch 주기가 부하로 느려지면
+// 고정 예산이 조건의 참·거짓과 무관하게 만료된다 — 실패 로그가 `160 polls / 8001ms` 였다.
+import { collector } from "./helpers/collect.ts";
 
 const aliceActor: Actor = { kind: "ai_agent", id: "ai:alice" };
 const bobActor: Actor = { kind: "ai_agent", id: "ai:bob" };
@@ -40,9 +43,10 @@ test("watch converges live: another replica's push arrives with no manual pull, 
       // Alice has live local work on shared.ts — the key Bob is about to land on.
       await author(alice, "shared.ts", "alice's version\n", aliceActor);
 
-      const events: SyncWatchEvent[] = [];
-      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (ev) => events.push(ev) });
-      await until(async () => events.some((e) => e.type === "synced"), { timeoutMs: 8_000, label: "initial sync" });
+      const ev = collector<SyncWatchEvent>();
+      const events = ev.all;
+      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (e) => ev.push(e) });
+      await ev.waitFor((e) => e.type === "synced", { label: "initial sync" });
 
       // Bob pushes concurrent (causally independent) work on the SAME key.
       const bob = await Repo.init(bobDir);
@@ -53,7 +57,10 @@ test("watch converges live: another replica's push arrives with no manual pull, 
       await until(() => alice.store.has(bobOp), { timeoutMs: 8_000, label: "bob's op to arrive at alice" });
 
       // …and announces the overlap at ARRIVAL time, not at finalize.
-      await until(async () => events.some((e) => e.type === "contention" && e.key === "file:shared.ts" && e.incomingActor === "ai:bob"), { timeoutMs: 8_000, label: "contention alert for the incoming op" });
+      await ev.waitFor(
+        (e) => e.type === "contention" && e.key === "file:shared.ts" && e.incomingActor === "ai:bob",
+        { label: "contention alert for the incoming op" },
+      );
       const alert = events.find((e) => e.type === "contention")!;
       assert.equal(alert.type, "contention");
       if (alert.type === "contention") {
@@ -82,9 +89,10 @@ test("one watcher per repo: a second runSyncWatch on the same store is refused",
     try {
       const repo = await Repo.init(dir);
       await repo.addRemote("origin", hub.url);
-      const events: SyncWatchEvent[] = [];
-      watcher = runSyncWatch(repo, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (ev) => events.push(ev) });
-      await until(async () => events.some((e) => e.type === "started"), { timeoutMs: 8_000, label: "first watcher start" });
+      const ev = collector<SyncWatchEvent>();
+      const events = ev.all;
+      watcher = runSyncWatch(repo, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (e) => ev.push(e) });
+      await ev.waitFor((e) => e.type === "started", { label: "first watcher start" });
 
       await assert.rejects(
         () => runSyncWatch(repo, { remote: "origin", timeoutMs: 500 }),
@@ -113,9 +121,10 @@ test("a watch daemon sees a head advance made on the hub (refs ride the event fe
     try {
       const alice = await Repo.init(aliceDir);
       await alice.addRemote("origin", hub.url);
-      const events: SyncWatchEvent[] = [];
-      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (ev) => events.push(ev) });
-      await until(async () => events.some((e) => e.type === "synced"), { timeoutMs: 8_000, label: "initial sync" });
+      const ev = collector<SyncWatchEvent>();
+      const events = ev.all;
+      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (e) => ev.push(e) });
+      await ev.waitFor((e) => e.type === "synced", { label: "initial sync" });
 
       // Bob lands work through the integration queue — the hub advances head:main.
       const bob = await Repo.init(bobDir);
@@ -126,7 +135,7 @@ test("a watch daemon sees a head advance made on the hub (refs ride the event fe
 
       // The daemon adopts the hub's head ref and reports the advance.
       await until(async () => (await alice.protectedHead("main")) !== null, { timeoutMs: 8_000, label: "head adoption at alice" });
-      await until(async () => events.some((e) => e.type === "head" && e.view === "main"), { timeoutMs: 8_000, label: "head event" });
+      await ev.waitFor((e) => e.type === "head" && e.view === "main", { label: "head event" });
     } finally {
       ac.abort();
       if (watcher) await watcher;
