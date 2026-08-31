@@ -368,6 +368,149 @@ export class ObjectStore {
   }
 
   /** Stream every object of a given type — loose objects first, then packed ones (B2). */
+  /**
+   * Every oid this store holds — WITHOUT reading a single object body.
+   *
+   * An oid is already the filename (loose) or the pack-index key (packed), yet the only
+   * listing this store offered was `list()`, which reads and decodes every object just to
+   * yield it. Callers that need only the set — `GET /have`, push negotiation — paid ~1ms per
+   * object per call, so a no-change re-sync grew linearly with history (measured: 208 objects
+   * 283ms, 3,208 objects 3.5s; a 39k-object repo pays ~40s per watch cycle).
+   *
+   * Same set as `list()` yields: loose shards by filename, plus packed entries not shadowed
+   * by a re-added loose copy. Corrupt bodies do not throw here — nothing is read — which is
+   * also why negotiation must not: announcing is not vouching, `get` still verifies.
+   */
+  /**
+   * Store many objects with GROUP-COMMITTED durability (issue #55's perf follow-up).
+   *
+   * `put` costs 4 serial fsyncs per object (tmp fsync + dir fsync + objlog append's file and
+   * dir fsyncs; +2 more for an operation's oplog entry). On macOS each is milliseconds, so a
+   * transfer paid ~25ms/object — a 1,602-object push took 145s with a 98.4%-idle CPU profile.
+   * The bytes were never the cost; the round trips were.
+   *
+   * This keeps every durability guarantee and reorders the waiting:
+   *
+   *   1. bodies: tmp-write + fsync with bounded parallelism, then rename, then ONE dir
+   *      fsync per distinct shard touched — same "old file or complete new file" atomicity.
+   *   2. oplog: ONE append for the chunk's operations. Order is the contract: the reducer
+   *      trusts every oplog line to resolve, so the append happens only after every body in
+   *      the chunk is durable — the same "AFTER the object is durable" rule `put` documents.
+   *   3. objlog: ONE append for everything new.
+   *
+   * Work is chunked (128) so a crash exposes at most one chunk's window — the same failure
+   * class as a sequential loop dying between an object's rename and its log append, just
+   * bounded instead of per-object. Both logs are rebuildable caches.
+   *
+   * Content addressing is unchanged: the incoming `oid` field is ignored and recomputed, so
+   * a forged object lands at its own address here exactly as it does in `put`.
+   */
+  async putMany(objects: AnyObject[]): Promise<{ oid: string; existed: boolean }[]> {
+    const results: { oid: string; existed: boolean }[] = new Array(objects.length);
+    const CHUNK = 128;
+    const PARALLEL = 8;
+
+    for (let base = 0; base < objects.length; base += CHUNK) {
+      const chunk = objects.slice(base, base + CHUNK);
+      // Plan the chunk: compute addresses, drop what already exists (content-addressed, so
+      // "existing" is decided by the oid alone), and de-dupe repeats within the batch.
+      const plan: { at: number; oid: string; path: string; bytes: Buffer; isOp: boolean }[] = [];
+      const inChunk = new Set<string>();
+      for (let i = 0; i < chunk.length; i++) {
+        const obj = chunk[i]!;
+        const { oid: _ignore, ...payload } = obj as AnyObject & { oid?: string };
+        void _ignore;
+        // The interop-safe gate (docs/24) guards `put` as the single choke point — a second
+        // ingress that skips it would be exactly the "check with a bypass" it exists to avoid.
+        assertInteropSafe(payload, obj.type);
+        const oid = computeOid(obj.type, payload as Record<string, unknown>);
+        const p = this.#pathFor(oid);
+        if (existsSync(p) || inChunk.has(oid)) {
+          results[base + i] = { oid, existed: true };
+          continue;
+        }
+        inChunk.add(oid);
+        results[base + i] = { oid, existed: false };
+        plan.push({ at: base + i, oid, path: p, bytes: encodeCbor({ ...payload, oid }) as Buffer, isOp: obj.type === "operation" });
+      }
+      if (!plan.length) continue;
+
+      // 1. Bodies. Parallel fsyncs overlap in the device queue — the serial latency was the
+      //    whole cost. Renames after every body is synced, then one fsync per shard dir.
+      for (let i = 0; i < plan.length; i += PARALLEL) {
+        await Promise.all(plan.slice(i, i + PARALLEL).map(async (w) => {
+          await mkdir(dirname(w.path), { recursive: true });
+          const tmp = `${w.path}.tmp-${process.pid}-${++this.#wc}`;
+          const fh = await open(tmp, "w");
+          try {
+            await fh.writeFile(w.bytes);
+            if (!NO_FSYNC) await fh.sync();
+          } finally {
+            await fh.close();
+          }
+          await rename(tmp, w.path);
+        }));
+      }
+      const shards = new Set(plan.map((w) => dirname(w.path)));
+      for (const d of shards) await this.#fsyncDir(d);
+
+      // 2. oplog — only now, with every body in the chunk durable.
+      const opLines = plan.filter((w) => w.isOp).map((w) => `${w.oid}
+`).join("");
+      if (opLines) await this.#appendDurable(join(this.root, "oplog"), opLines);
+      // 3. objlog.
+      await this.#appendDurable(join(this.root, "objlog"), plan.map((w) => `${w.oid}
+`).join(""));
+    }
+    return results;
+  }
+
+  /**
+   * Append many entity-index entries with one durable append PER KEY FILE instead of per
+   * entry. A pull indexes every arriving operation, which was 2 more fsyncs each; grouping
+   * by key keeps the per-key ORDER (blame reads it) while a 1,600-op pull touching 25 files
+   * pays 25 appends instead of 1,600.
+   */
+  async appendEntityIndexMany(entries: [key: string, oid: string][]): Promise<void> {
+    const byPath = new Map<string, string[]>();
+    for (const [key, oid] of entries) {
+      const p = this.#indexPathFor(key);
+      let lines = byPath.get(p);
+      if (!lines) { lines = []; byPath.set(p, lines); }
+      lines.push(oid);
+    }
+    for (const [p, lines] of byPath) {
+      await mkdir(dirname(p), { recursive: true });
+      await this.#appendDurable(p, lines.map((o) => `${o}
+`).join(""));
+    }
+  }
+
+  async listOids(type?: ObjectType): Promise<string[]> {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const objectsDir = join(this.root, "objects");
+    if (existsSync(objectsDir)) {
+      for (const shard of await readdir(objectsDir)) {
+        const shardDir = join(objectsDir, shard);
+        if (!(await stat(shardDir)).isDirectory()) continue;
+        for (const file of await readdir(shardDir)) {
+          if (!file.endsWith(".json")) continue;
+          const oid = file.slice(0, -".json".length);
+          if (type && !oid.startsWith(`${type}_`)) continue;
+          seen.add(oid);
+          out.push(oid);
+        }
+      }
+    }
+    for (const [oid] of await this.#packLocations()) {
+      if (seen.has(oid)) continue;
+      if (type && !oid.startsWith(`${type}_`)) continue;
+      out.push(oid);
+    }
+    return out;
+  }
+
   async *list<T extends AnyObject = AnyObject>(type?: ObjectType): AsyncGenerator<T> {
     const seen = new Set<string>();
     const objectsDir = join(this.root, "objects");

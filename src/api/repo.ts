@@ -2522,21 +2522,36 @@ export class Repo {
     let skipped = 0;
     let maxLamport = 0;
     const seen: string[] = [];
-    for await (const obj of objects as AsyncIterable<AnyObject>) {
-      // Address first: `has` on the recomputed oid is what makes a repeat call cheap and
-      // makes "already here" distinguishable from "newly arrived".
-      const { oid: _incoming, ...payload } = obj as AnyObject & { oid?: string };
-      void _incoming;
-      const oid = computeOid(obj.type, payload as Record<string, unknown>);
-      if (await this.store.has(oid)) { skipped++; continue; }
-      await this.store.put(obj as never);
-      if (obj.type === "operation") {
-        for (const k of keysOf(obj as Operation)) await this.store.appendEntityIndex(k, oid);
-        maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
+    // Group-committed in chunks (#55 perf): per-object put + per-op index appends cost 4–6
+    // serial fsyncs each; putMany + appendEntityIndexMany pay one log append per chunk and
+    // one per touched key file. Same addresses, same skip semantics — putMany recomputes
+    // the oid and reports `existed` for what this store already holds.
+    const CHUNK = 128;
+    let buffer: AnyObject[] = [];
+    const flush = async (): Promise<void> => {
+      if (!buffer.length) return;
+      const chunk = buffer;
+      buffer = [];
+      const put = await this.store.putMany(chunk);
+      const indexEntries: [string, string][] = [];
+      for (let i = 0; i < chunk.length; i++) {
+        const { oid, existed } = put[i]!;
+        if (existed) { skipped++; continue; }
+        const obj = chunk[i]!;
+        if (obj.type === "operation") {
+          for (const k of keysOf(obj as Operation)) indexEntries.push([k, oid]);
+          maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
+        }
+        seen.push(oid);
+        imported++;
       }
-      seen.push(oid);
-      imported++;
+      if (indexEntries.length) await this.store.appendEntityIndexMany(indexEntries);
+    };
+    for await (const obj of objects as AsyncIterable<AnyObject>) {
+      buffer.push(obj);
+      if (buffer.length >= CHUNK) await flush();
     }
+    await flush();
     if (imported) {
       const { applyRedactions } = await import("../store/applyRedactions.ts");
       await applyRedactions(this.store);

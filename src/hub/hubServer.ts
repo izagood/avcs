@@ -525,9 +525,10 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
 
   // GET /have → all oids the hub holds (full set; initial clone / older clients).
   if (method === "GET" && path === "/have") {
-    const oids: string[] = [];
-    for await (const obj of store.list()) oids.push(obj.oid as string);
-    sendJson(res, 200, oids);
+    // Names only — `list()` reads and decodes every object body to answer a question the
+    // filename already answers. Measured: this made a no-change re-sync linear in history
+    // (~1ms/object), which every watch cycle pays. `listOids` touches no bodies.
+    sendJson(res, 200, await store.listOids());
     return;
   }
 
@@ -635,13 +636,65 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
         return;
       }
     }
-    const results: { oid: string | null; status: "stored" | "rejected"; reason?: string }[] = [];
-    for (const o of objects) {
-      const v = await ingestObject(store, o, gated, ops);
-      if (v.status === "stored") results.push({ oid: v.oid, status: "stored" });
-      // `invalid` and `rejected` are both "this hub did not take it": a batch reports them
-      // per oid so the rest of the chunk still lands, where a single POST answers 400/403.
-      else results.push({ oid: oidOf(o), status: "rejected", reason: v.reason });
+    // Group-committed ingest (#55 perf): `ingestObject` per object cost 6–8 serial fsyncs
+    // (body 4 + audit 2), which made a 1,602-object batch take minutes with a 98%-idle CPU
+    // profile. Validation stays per object and IN ORDER — authorizePush, the integration
+    // refusal — but storage goes through `putMany` (one oplog/objlog append per chunk) and
+    // the audit log gets ONE append for the whole batch. Redactions keep the sequential
+    // path: they take a cross-process lock and rewrite blob bytes, and batching a
+    // destructive rarity buys nothing.
+    const results: { oid: string | null; status: "stored" | "rejected"; reason?: string }[] = new Array(objects.length);
+    const accepted: { at: number; obj: AnyObject }[] = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      if (typeof o !== "object" || o === null || typeof (o as { type?: unknown }).type !== "string") {
+        results[i] = { oid: oidOf(o), status: "rejected", reason: "object must have a string `type`" };
+        continue;
+      }
+      const isRedaction = (o as AnyObject).type === "redaction";
+      if (gated || isRedaction) {
+        const verdict = await authorizePush(store, o as AnyObject);
+        if (!verdict.ok) { results[i] = { oid: oidOf(o), status: "rejected", reason: verdict.reason ?? "unauthorized push" }; continue; }
+      }
+      if ((o as AnyObject).type === "integration") {
+        results[i] = { oid: oidOf(o), status: "rejected", reason: "integration objects are authored by the integration queue; they cannot be pushed" };
+        continue;
+      }
+      if (isRedaction) {
+        const v = await ingestObject(store, o, gated, ops);
+        results[i] = v.status === "stored" ? { oid: v.oid, status: "stored" } : { oid: oidOf(o), status: "rejected", reason: v.reason };
+        continue;
+      }
+      accepted.push({ at: i, obj: o as AnyObject });
+    }
+    if (accepted.length) {
+      let put: { oid: string; existed: boolean }[];
+      try {
+        put = await store.putMany(accepted.map((a) => a.obj));
+      } catch (e) {
+        // A refused object (the interop gate) fails the whole chunk with per-oid verdicts —
+        // falling back to one-by-one keeps the "rest of the batch still lands" contract.
+        put = [];
+        for (const a of accepted) {
+          try { put.push({ oid: await store.put(a.obj), existed: false }); }
+          catch (inner) { results[a.at] = { oid: oidOf(a.obj), status: "rejected", reason: String((inner as Error).message) }; put.push({ oid: "", existed: false }); }
+        }
+        void e;
+      }
+      const auditLines: string[] = [];
+      for (let j = 0; j < accepted.length; j++) {
+        const { at, obj } = accepted[j]!;
+        const oid = put[j]?.oid;
+        if (!oid) continue; // per-object fallback already recorded the rejection
+        results[at] = { oid, status: "stored" };
+        auditLines.push(`${JSON.stringify({ ts: new Date().toISOString(), action: "put", type: obj.type, oid, actor: attributedActor(obj) })}\n`);
+      }
+      // One durable append for the whole batch — same records, one round trip.
+      if (auditLines.length) {
+        try { await store.appendAux("hub-audit.log", auditLines.join("")); }
+        catch { /* audit is best-effort, same as ops.audit */ }
+      }
+      ops.events.wake(); // once per batch: waiters re-snapshot regardless of count
     }
     metrics.inc("hub.batch.objects", objects.length);
     sendJson(res, 200, { results });

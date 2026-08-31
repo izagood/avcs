@@ -382,9 +382,13 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
   try {
     let chunk: ChunkItem[] = [];
     let bytes = 2; // the enclosing `[]`
-    for await (const obj of store.list()) {
-      const oid = obj.oid as string;
+    // Names first, bodies only for what actually travels. `list()` decoded every local
+    // object — including the ones `have` says the hub already holds, which on a no-change
+    // push (the watcher's echo re-sync) is ALL of them. That made the no-op push linear in
+    // history. Deciding on oids costs nothing; the `get` below reads only the delta.
+    for (const oid of await store.listOids()) {
       if (have.has(oid)) continue;
+      const obj = await store.get(oid);
       if (obj.type === "operation" && (obj as Operation).private) continue; // stash stays local
       const json = JSON.stringify(obj);
       // Chunked by BYTES, not object count: a single large blob must not blow the request
@@ -422,7 +426,8 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
 type ChunkItem = { oid: string; json: string; isOp: boolean };
 
 /**
- * Fetch `wanted` into `store` in as few requests as the hub allows, calling `onObject` for each
+ * Fetch `wanted` into `store` in as few requests as the hub allows. Persistence and the
+ * entity index are handled HERE (group-committed, #55 perf); `onObject` is an observer for each
  * object that arrives (the caller owns indexing, clock observation and counting).
  *
  * `POST /objects/fetch` when the hub advertises batching, else the original
@@ -465,13 +470,21 @@ async function fetchObjects(
         const j = (await res.json()) as { objects?: unknown; truncated?: unknown };
         const got = Array.isArray(j.objects) ? (j.objects as AnyObject[]) : [];
         const arrived = new Set<string>();
-        for (const obj of got) {
-          // put() recomputes the content address, so a hub returning something other than
-          // what was asked for lands it at its own oid rather than poisoning ours.
-          const oid = await store.put(obj as never);
+        // Group-committed (#55 perf): putMany recomputes every content address exactly as
+        // put() does — a hub returning something other than what was asked for still lands
+        // at its own oid — but the chunk pays one oplog/objlog append instead of two fsyncs
+        // per object. The entity index is batched the same way (one append per key file);
+        // per-op appendEntityIndex was 2 more fsyncs each on precisely this path.
+        const put = await store.putMany(got as never[]);
+        const indexEntries: [string, string][] = [];
+        for (let g = 0; g < got.length; g++) {
+          const obj = got[g]!;
+          const oid = put[g]!.oid;
           arrived.add(oid);
-          await onObject(obj, oid);
+          if (obj.type === "operation") for (const k of keysOf(obj as Operation)) indexEntries.push([k, oid]);
         }
+        if (indexEntries.length) await store.appendEntityIndexMany(indexEntries);
+        for (let g = 0; g < got.length; g++) await onObject(got[g]!, put[g]!.oid);
         if (j.truncated !== true) break;
         const remaining = ask.filter((o) => !arrived.has(o));
         if (remaining.length === ask.length) break; // no progress on what we asked for — don't spin
@@ -487,8 +500,9 @@ async function fetchObjects(
       if (res.status === 404) continue; // raced eviction; skip
       if (!res.ok) throw new Error(`GET /objects/${oid} failed: ${res.status} ${res.statusText}`);
       const obj = (await res.json()) as AnyObject;
-      await store.put(obj as never);
-      await onObject(obj, oid);
+      const landed = await store.put(obj as never);
+      await indexIfOperation(store, obj, landed);
+      await onObject(obj, landed);
     }
   }
 }
@@ -514,8 +528,10 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string, signWith
   for (const oid of oids) if (!(await store.has(oid))) wanted.push(oid);
   let pulled = 0;
   let maxLamport = 0;
-  await fetchObjects(store, base, wanted, signWith, caps.batch, opts, async (obj, oid) => {
-    await indexIfOperation(store, obj, oid);
+  // fetchObjects owns persistence AND indexing (batched appends, #55 perf); this callback
+  // only observes. Indexing here too would append every op's index entry a second time —
+  // reads dedup, but the duplicate durable appends are exactly the cost being removed.
+  await fetchObjects(store, base, wanted, signWith, caps.batch, opts, async (obj, _oid) => {
     if (obj.type === "operation") maxLamport = Math.max(maxLamport, (obj as Operation).lamport);
     pulled++;
   });
@@ -579,9 +595,8 @@ export async function integrateWithHub(
       wanted.push(oid);
     }
     const caps = await hubCaps(base, args.signWith);
-    await fetchObjects(store, base, wanted, args.signWith, caps.batch, undefined, async (obj, oid) => {
-      await indexIfOperation(store, obj, oid);
-    });
+    // Indexing is fetchObjects' job now — nothing left to do per object here.
+    await fetchObjects(store, base, wanted, args.signWith, caps.batch, undefined, async () => {});
   }
   return { status: res.status, verdict: j.verdict ?? "rejected", ...j };
 }
