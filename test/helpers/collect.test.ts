@@ -62,6 +62,8 @@ test("타임아웃은 진짜 hang 에만 쓰이고, 무엇을 기다렸는지 �
       const m = String((e as Error).message);
       assert.match(m, /n=99/, "라벨이 있어야 한다");
       assert.match(m, /1 event/, `본 이벤트 수를 말해야 한다 — got: ${m}`);
+      // 수만으로는 "느려서 못 잡았다" 와 "다른 것만 왔다" 가 구분되지 않는다.
+      assert.match(m, /number×1|:\s*\S/, `무엇이 왔는지도 말해야 한다 — got: ${m}`);
       return true;
     },
   );

@@ -269,3 +269,100 @@ test("syncIfStale blocks only when stale: it syncs a lapsed remote and skips a f
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ── #55 의 진짜 결함: 다른 경로로 먼저 도착한 op 는 경보를 받지 못한다 ──────────────
+//
+// 경보 대상(incoming)이 "이번 롱폴이 알린 oid 중 store 에 없는 것" 이었다. op 는 여러 경로로
+// 들어온다 — 초기 sync, echo 반복의 sync, 사용자의 수동 pull. 그 중 하나가 먼저 가져오면
+// has=true 라 incoming 에서 빠지고, 그 pull 이 공유 커서를 op 너머로 전진시키면 다음 롱폴은
+// heartbeat 라 경보 패스 앞에서 continue 한다. 경보는 영원히 없다.
+//
+// 실측(수정 전): 대조군(경합 없음) 5/5 경보 도착 · 실험군(수동 pull 경합) 5/5 경보 소실.
+// CI 플레이크의 실체는 echo 반복의 sync 가 bob 의 푸시와 겹치는 부하 경합이었다.
+
+test("watch alerts on work that arrived BEFORE the watcher started (late start / restart)", async () => {
+  // 결정적 재현: 데몬 재시작·늦은 기동. 도착은 초기 sync 가 시킨다 — 롱폴이 알려줄 기회가
+  // 없던 op 에도 경보가 나야 한다.
+  const hubDir = await mkdtemp(join(tmpdir(), "avcs-w55a-hub-"));
+  const aliceDir = await mkdtemp(join(tmpdir(), "avcs-w55a-a-"));
+  const bobDir = await mkdtemp(join(tmpdir(), "avcs-w55a-b-"));
+  const ac = new AbortController();
+  let watcher: Promise<void> | null = null;
+  try {
+    const hub = await startHub({ repoDir: hubDir });
+    try {
+      const alice = await Repo.init(aliceDir);
+      await alice.addRemote("origin", hub.url);
+      await author(alice, "shared.ts", "alice's version\n", aliceActor);
+
+      // watcher 가 뜨기 전에 bob 이 이미 푸시해 뒀다.
+      const bob = await Repo.init(bobDir);
+      const bobOp = await author(bob, "shared.ts", "bob's version\n", bobActor);
+      await bob.pushHub(hub.url);
+
+      const ev = collector<SyncWatchEvent>();
+      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (e) => ev.push(e) });
+
+      const alert = await ev.waitFor(
+        (e) => e.type === "contention" && e.key === "file:shared.ts" && e.incomingActor === "ai:bob",
+        { label: "alert for work that predates the watcher" },
+      );
+      assert.equal(alert.type, "contention");
+      if (alert.type === "contention") assert.equal(alert.incomingOp, bobOp);
+    } finally {
+      ac.abort();
+      await watcher?.catch(() => {});
+      await hub.close();
+    }
+  } finally {
+    await rm(hubDir, { recursive: true, force: true });
+    await rm(aliceDir, { recursive: true, force: true });
+    await rm(bobDir, { recursive: true, force: true });
+  }
+});
+
+test("watch alerts even when a manual pull races the push (arrival via another path)", async () => {
+  // 실사용의 `avcs pull` 이 데몬과 경합하는 상황. 수정 전 실측으로 5/5 경보가 사라졌다.
+  const hubDir = await mkdtemp(join(tmpdir(), "avcs-w55b-hub-"));
+  const aliceDir = await mkdtemp(join(tmpdir(), "avcs-w55b-a-"));
+  const bobDir = await mkdtemp(join(tmpdir(), "avcs-w55b-b-"));
+  const ac = new AbortController();
+  let watcher: Promise<void> | null = null;
+  try {
+    const hub = await startHub({ repoDir: hubDir });
+    try {
+      const alice = await Repo.init(aliceDir);
+      await alice.addRemote("origin", hub.url);
+      await author(alice, "shared.ts", "alice's version\n", aliceActor);
+
+      const ev = collector<SyncWatchEvent>();
+      watcher = runSyncWatch(alice, { remote: "origin", timeoutMs: 2_000, signal: ac.signal, onEvent: (e) => ev.push(e) });
+      await ev.waitFor((e) => e.type === "synced", { label: "initial sync" });
+
+      const bob = await Repo.init(bobDir);
+      const bobOp = await author(bob, "shared.ts", "bob's version\n", bobActor);
+
+      // 푸시와 동시에 잠깐 연속 pull — 데몬이 아닌 경로가 op 를 먼저 가져가게 만든다.
+      const pusher = bob.pushHub(hub.url);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 600) {
+        try { await alice.pullHub(hub.url); } catch { /* 경합은 무시 */ }
+      }
+      await pusher;
+      await until(() => alice.store.has(bobOp), { timeoutMs: 8_000, label: "bob's op present" });
+
+      await ev.waitFor(
+        (e) => e.type === "contention" && e.key === "file:shared.ts" && e.incomingActor === "ai:bob",
+        { label: "alert despite the racing manual pull" },
+      );
+    } finally {
+      ac.abort();
+      await watcher?.catch(() => {});
+      await hub.close();
+    }
+  } finally {
+    await rm(hubDir, { recursive: true, force: true });
+    await rm(aliceDir, { recursive: true, force: true });
+    await rm(bobDir, { recursive: true, force: true });
+  }
+});

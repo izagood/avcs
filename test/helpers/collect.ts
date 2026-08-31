@@ -69,8 +69,19 @@ export function collector<T>(): Collector<T> {
         const timer = setTimeout(() => {
           // Drop the waiter, or a later `push` wakes a promise nobody is holding.
           waiters.delete(waiter);
+          // 무엇이 왔는지 함께 보고한다. "느려서 못 잡았다" 와 "다른 것만 왔다" 는 다른
+          // 사건이고, 수만 세면 둘이 구분되지 않는다 — `saw 19 event(s)` 로는 19개가
+          // 무엇이었는지 알 수 없어 CI 로그만으로 원인을 좁힐 수 없었다.
+          const kinds = new Map<string, number>();
+          for (const e of all) {
+            const k = typeof e === "object" && e !== null && "type" in e
+              ? String((e as { type: unknown }).type)
+              : typeof e;
+            kinds.set(k, (kinds.get(k) ?? 0) + 1);
+          }
+          const summary = [...kinds].map(([k, n]) => `${k}×${n}`).join(" ") || "(none)";
           reject(new Error(
-            `timed out waiting for ${label} after ${timeoutMs}ms; saw ${all.length} event(s)`,
+            `timed out waiting for ${label} after ${timeoutMs}ms; saw ${all.length} event(s): ${summary}`,
           ));
         }, timeoutMs);
         // NOT unref'd. An unref'd timer does not fire when the loop has nothing else to do,
