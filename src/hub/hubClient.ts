@@ -38,12 +38,53 @@ function scopeOf(hubUrl: string): string {
   }
 }
 
-/** Build fetch headers for a hub write, attaching an AVCS-Sig Authorization header when a
- *  signer is supplied. `path` must equal the server's pathname or the signature won't verify. */
-function writeHeaders(signer: HubSigner | undefined, method: string, path: string, body: string, scope = ""): Record<string, string> {
+/**
+ * The token a keyless reader may present, from the environment.
+ *
+ * Named after what it is rather than who uses it: any process that can read a private
+ * hub without holding a signing key wants this — a CI job, a short-lived container, a
+ * sandbox. Empty or whitespace means "unset" (that is how an unset shell variable
+ * arrives), and a value carrying a line break is refused outright: it lands in an HTTP
+ * header, and the environment it comes from is not necessarily the caller's own.
+ */
+export const HUB_TOKEN_ENV = "AVCS_HUB_TOKEN";
+
+function usableToken(token: string | undefined): string | null {
+  if (token === undefined) return null;
+  const trimmed = token.trim();
+  if (trimmed === "") return null;
+  // Header injection: a token is data, and CRLF in a header value is not.
+  if (/[\r\n]/.test(token)) return null;
+  return trimmed;
+}
+
+/**
+ * Build fetch headers for a hub write. An AVCS-Sig signature is the ONLY credential a
+ * write accepts, and there is deliberately **no token parameter**: the absence is the
+ * enforcement. A parameter that took a token and ignored it would invite a later reader
+ * to "finish" it.
+ *
+ * A token reaches a process through its environment, which is exactly the channel an
+ * ephemeral, less-trusted reader has. Letting it mutate would mean a leaked env var can
+ * push objects, finalize a view, or rewrite policy — none of which a signature-covered
+ * request allows without the actor's key.
+ *
+ * `path` must equal the server's pathname or the signature won't verify.
+ */
+export function writeAuthHeaders(
+  signer: HubSigner | undefined,
+  method: string,
+  path: string,
+  body: string,
+  scope = "",
+): Record<string, string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (signer) headers["authorization"] = buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method, path, body, scope });
   return headers;
+}
+
+function writeHeaders(signer: HubSigner | undefined, method: string, path: string, body: string, scope = ""): Record<string, string> {
+  return writeAuthHeaders(signer, method, path, body, scope);
 }
 
 /**
@@ -57,9 +98,25 @@ function writeHeaders(signer: HubSigner | undefined, method: string, path: strin
  * Best-effort by design: no signer, no header, and a read-public hub is unaffected. The
  * signature covers the method, so a captured GET credential cannot be replayed as a write.
  */
+export function readAuthHeaders(
+  signer: HubSigner | undefined,
+  path: string,
+  scope = "",
+  token: string | undefined = process.env[HUB_TOKEN_ENV],
+): Record<string, string> {
+  // A key wins. The signature covers the method and the body, so it is the stronger
+  // credential; preferring the token would silently downgrade every signed reader that
+  // happens to run with the variable set.
+  if (signer) {
+    return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "", scope }) };
+  }
+  const bearer = usableToken(token);
+  // Keyless and tokenless stays bare — a read-public hub is unaffected, as before.
+  return bearer === null ? {} : { authorization: `Bearer ${bearer}` };
+}
+
 function readHeaders(signer: HubSigner | undefined, path: string, scope = ""): Record<string, string> {
-  if (!signer) return {};
-  return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "", scope }) };
+  return readAuthHeaders(signer, path, scope);
 }
 
 // ── Batched transfer + throttle handling (issue #99) ──────────────────────────

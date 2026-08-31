@@ -325,8 +325,13 @@ It reports which levels apply — `core` (the three endpoints, and a clone that 
 source treeHash), then `sync`, `governance`, `queue` as your capability flags allow. A level
 you do not advertise is **skipped, not failed**: a partial server is a legitimate one.
 
-The reference server is `startHub` in this repository — single-repo, no multi-tenancy, and it
-serves the whole protocol. Read it as an example, or run it with `avcs serve`.
+Two implementations to start from:
+
+- **[avcs-server](https://github.com/izagood/avcs-server)** — a standalone, self-hostable,
+  multi-repo server built on this library. Conformance-verified at `core`; run it, read it,
+  or fork it as the starting point for your own deployment.
+- **`startHub` in this repository** — the reference: single-repo, no multi-tenancy, but it
+  serves the whole protocol. Read it as the spec's executable form, or run it with `avcs serve`.
 
 ## Quick start
 
