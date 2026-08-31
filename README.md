@@ -253,6 +253,42 @@ Entry points: `.` (root barrel) · `./hub` · `./hub/client` · `./store` · `./
 
 Releasing: bump `package.json`'s `version` in a PR and merge it to `main` — `.github/workflows/release.yml` detects the new version, runs `npm publish` (with provenance), tags the commit `vX.Y.Z`, and cuts a GitHub Release. The publish steps are guarded by a registry check, so package.json edits that don't change the version are no-ops. Every PR also runs a release dry run (`npm run build` + `npm pack --dry-run`) in CI to catch packaging regressions before merge. Requires an `NPM_TOKEN` repository secret with publish rights to the `@izagood` scope.
 
+## Build your own server
+
+AVCS is a protocol, not a service. **A conforming server needs three endpoints:**
+
+```
+GET  /have            the oids you hold        → ["operation_ab12…", …]
+GET  /objects/:oid    one object as JSON       → { … }  (404 if absent)
+POST /objects         take one object          → { "oid": "operation_ab12…" }
+```
+
+Everything else is optional. The client reads capability flags from `GET /version`, and when a
+flag is absent — or an endpoint answers `404`/`405`/`501` — it falls back on its own. A
+read-only mirror serving only the first two is a legitimate server; so is one without the
+integration queue, without batching, without long-poll.
+
+That is deliberate: avcs is a public client against deployments it does not control.
+
+Two documents are the contract:
+
+- **[26 — Hub protocol](docs/26-hub-protocol.md)** — every endpoint's request/response shape,
+  status codes, capability negotiation, the SSH-style request signature, and a table of the
+  mistakes server authors actually make.
+- **[24 — Canonical interop](docs/24-canonical-interop.md)** — how an oid is computed. Read
+  this first if you are not writing JavaScript: an object's identity is the sha256 of its
+  canonical JSON, and three parts of that canonicalization are easy to get subtly wrong.
+  Diverge and you do not get an error — you get two honest implementations that never
+  converge.
+
+Validate your canonicalizer against [`spec/canonical-vectors.json`](spec/canonical-vectors.json)
+(10 accepted, 4 rejected, each with the expected canonical bytes and oid) before anything else.
+
+The reference server is `startHub` in this repository — single-repo, no multi-tenancy, and it
+serves the whole protocol. Read it as an example, or run it with `avcs serve`.
+
+## Quick start
+
 ## Running from a checkout
 
 Hacking on AVCS itself? Every command runs straight from the checkout with `node`:
@@ -328,6 +364,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [23 — Local undo: the pre-share escape hatch](docs/23-local-undo.md)
 - [24 — Canonical interop: the language-neutral canonicalization subset](docs/24-canonical-interop.md)
 - [25 — Agent quickstart: driving AVCS from Claude Code (MCP)](docs/25-agent-quickstart.md)
+- [26 — Hub protocol: what a conforming server must serve](docs/26-hub-protocol.md)
 
 ## Contributing
 
