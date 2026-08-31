@@ -151,6 +151,7 @@ avcs status                        # operation / conflict summary
 avcs log                           # operation history
 avcs blame file:src/math.js        # who owns this file and why (entity key = file:<path>)
 avcs conflicts                     # decisions a human still owes
+avcs decide <conflict-id> --choose <op-oid> --reason "…"   # …and pay one: a signed decision
 
 avcs undo --last                   # take the last operation back out of the view…
 avcs checkout                      # …and re-project the working tree from it
