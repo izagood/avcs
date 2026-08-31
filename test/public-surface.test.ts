@@ -27,6 +27,15 @@ for (const name of ERRORS) {
 
 // 회귀 방지: 클래스 메서드는 클래스를 따라간다. 이건 원래도 통과한다 — 위 실패와 대비해
 // "왜 메서드는 되고 심볼은 안 됐는지" 를 코드로 남기는 것이 목적이다.
+// 에러 타입만이 아니다 — 독립 함수도 같은 이유로 누락된다. `assertInteropSafe` 는 제3자
+// 구현이 가장 먼저 쓰는 것이라(docs/24), 없으면 명세를 읽은 사람이 첫 줄에서 막힌다.
+test("상호운용 검사 함수가 진입점을 통해 도달한다", () => {
+  assert.equal(
+    typeof (pkg as Record<string, unknown>).assertInteropSafe, "function",
+    'import { assertInteropSafe } from "@izagood/avcs" 가 되어야 한다',
+  );
+});
+
 test("Repo 에 붙은 것은 Repo 를 따라간다", () => {
   assert.equal(typeof pkg.Repo.openOrInit, "function");
   assert.equal(typeof pkg.Repo.prototype.checkpointBytes, "function");
