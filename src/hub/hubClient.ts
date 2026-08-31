@@ -103,12 +103,21 @@ export function readAuthHeaders(
   path: string,
   scope = "",
   token: string | undefined = process.env[HUB_TOKEN_ENV],
+  method = "GET",
+  body = "",
 ): Record<string, string> {
+  // `method`/`body` because **a read is not always a GET**. `POST /objects/fetch` asks
+  // for objects by oid and mutates nothing; it is a POST only because the oid list does
+  // not fit in a query string. Splitting the credential by HTTP verb rather than by what
+  // the request DOES leaves that endpoint unable to present a token, and a keyless clone
+  // dies partway: `GET /have` succeeds, then the fetch returns 401.
+  //
   // A key wins. The signature covers the method and the body, so it is the stronger
   // credential; preferring the token would silently downgrade every signed reader that
-  // happens to run with the variable set.
+  // happens to run with the variable set. The signed method must be the one actually
+  // sent, or no verifier accepts it.
   if (signer) {
-    return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method: "GET", path, body: "", scope }) };
+    return { authorization: buildAuthHeader({ keyId: signer.keyId, privateKey: signer.privateKey, method, path, body, scope }) };
   }
   const bearer = usableToken(token);
   // Keyless and tokenless stays bare — a read-public hub is unaffected, as before.
@@ -518,7 +527,12 @@ async function fetchObjects(
         const raw = JSON.stringify({ oids: ask });
         const res = await hubFetch(`${base}/objects/fetch`, {
           method: "POST",
-          headers: writeHeaders(signWith, "POST", "/objects/fetch", raw, scope),
+          // A read that happens to be a POST: it fetches objects and changes nothing, so
+          // it takes the READ credential (a token is enough) with the JSON content type.
+          headers: {
+            "content-type": "application/json",
+            ...readAuthHeaders(signWith, "/objects/fetch", scope, undefined, "POST", raw),
+          },
           body: raw,
         }, retry);
         // Advertised but absent: redo this slice with the per-oid protocol.
