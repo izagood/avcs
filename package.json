@@ -20,8 +20,14 @@
     "operation-graph",
     "ai-native",
     "deterministic",
-    "agentic"
+    "agentic",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ai-agent",
+    "agents"
   ],
+  "mcpName": "io.github.izagood/avcs",
   "bin": {
     "avcs": "dist/cli.js"
   },
