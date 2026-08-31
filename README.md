@@ -325,7 +325,13 @@ It reports which levels apply — `core` (the three endpoints, and a clone that 
 source treeHash), then `sync`, `governance`, `queue` as your capability flags allow. A level
 you do not advertise is **skipped, not failed**: a partial server is a legitimate one.
 
-Two implementations to start from:
+Three implementations to start from:
+
+- **[`examples/server.py`](examples/server.py)** — a complete conforming core-level server in
+  one stdlib-only Python file. No JS, no avcs library: its only dependencies are
+  [docs/24](docs/24-canonical-interop.md) and the golden vectors, which is the point — run
+  `python3 examples/server.py --selftest` to see the vectors check its canonicalizer, then
+  point the conformance suite at it.
 
 - **[avcs-server](https://github.com/izagood/avcs-server)** — a standalone, self-hostable,
   multi-repo server built on this library. Conformance-verified at `core`; run it, read it,
