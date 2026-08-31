@@ -140,7 +140,7 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 - **Local undo** ([docs/23](docs/23-local-undo.md)) — `avcs undo [--last | <op-oid>…] [--purge] [--no-git]`: drop local ops from the view, and with `--purge` evict the bytes they uniquely reference. Refuses once the ops have been pushed, because that case belongs to admin-gated `redact`. In a git-bridged repo `--purge` clears the **git** copy too — but only where it can prove the rewrite is safe and local (nothing on a remote, the commits at the tip, no other work in them, a clean tree); anywhere else it still does the AVCS side and names precisely what is left and the one command that fits, up to and including "rotate the credential, it is already published"
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (36 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the hub runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the hub re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 360-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (36 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the server runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the server re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 360-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -161,7 +161,7 @@ npx @izagood/avcs version
 ### Your first five minutes (no server, no git required)
 
 AVCS is local-first: a repo on your disk is a complete VCS — history, blame, undo,
-releases — with no hub and no git anywhere. In an existing project directory:
+releases — with no server and no git anywhere. In an existing project directory:
 
 ```bash
 avcs init .                        # create the repo (inside a git repo is fine — .avcs is git-ignored)
@@ -303,7 +303,7 @@ That is deliberate: avcs is a public client against deployments it does not cont
 
 Two documents are the contract:
 
-- **[26 — Hub protocol](docs/26-hub-protocol.md)** — every endpoint's request/response shape,
+- **[26 — Server protocol](docs/26-hub-protocol.md)** — every endpoint's request/response shape,
   status codes, capability negotiation, the SSH-style request signature, and a table of the
   mistakes server authors actually make.
 - **[24 — Canonical interop](docs/24-canonical-interop.md)** — how an oid is computed. Read
@@ -370,7 +370,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/validation/runner.ts`, `repair.ts` | Validation runner · RepairContext (Phase 3) |
 | `src/concurrency/lease.ts` | WorkLease (Phase 3) |
 | `src/release/sbom.ts` | SBOM generation (Phase 6) |
-| `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync hub (Phase 7) |
+| `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync server (Phase 7; API names keep the legacy “hub” term) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
 | `src/api/keystore.ts` | Machine-level private keystore (`~/.avcs/private`) |
 | `src/mcp/server.ts` | Agent-facing MCP interface (36 tools) |
@@ -405,7 +405,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [23 — Local undo: the pre-share escape hatch](docs/23-local-undo.md)
 - [24 — Canonical interop: the language-neutral canonicalization subset](docs/24-canonical-interop.md)
 - [25 — Agent quickstart: driving AVCS from Claude Code (MCP)](docs/25-agent-quickstart.md)
-- [26 — Hub protocol: what a conforming server must serve](docs/26-hub-protocol.md)
+- [26 — Server protocol: what a conforming server must serve](docs/26-hub-protocol.md)
 
 ## Contributing
 
