@@ -119,3 +119,30 @@ jobs:
 
       - name: Pack (verify the release tarball contents)
         run: npm pack --dry-run
+
+  conformance-python-example:
+    # examples/server.py 가 살아 있는 적합 구현으로 남는지 지킨다: 벡터 자기검증 →
+    # 실제 push 로 시드 → core 적합성. 이 잡이 빨간데 conformance 가 초록이면
+    # 스펙(docs/24·26)이 바뀌고 예제가 못 따라온 것이다.
+    name: conformance (python example)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+      - run: npm ci
+      - name: Vector selftest
+        run: python3 examples/server.py --selftest
+      - name: Conformance against the example server
+        run: |
+          python3 examples/server.py --data /tmp/pydata --port 8431 &
+          sleep 1
+          mkdir /tmp/seed && cd /tmp/seed
+          node --experimental-strip-types $GITHUB_WORKSPACE/src/cli.ts init .
+          echo seed > a.txt
+          node --experimental-strip-types $GITHUB_WORKSPACE/src/cli.ts commit -m seed
+          node --experimental-strip-types $GITHUB_WORKSPACE/src/cli.ts push http://127.0.0.1:8431
+          cd $GITHUB_WORKSPACE
+          AVCS_CONFORMANCE_URL=http://127.0.0.1:8431 npm run conformance
