@@ -176,6 +176,7 @@ avcs blame file:src/math.js        # who owns this file and why (entity key = fi
 avcs conflicts                     # decisions a human still owes
 avcs decide <conflict-id> --choose <op-oid> --reason "…"   # …and pay one: a signed decision
 
+
 avcs undo --last                   # take the last operation back out of the view…
 avcs checkout                      # …and re-project the working tree from it
 ```
@@ -313,6 +314,16 @@ Two documents are the contract:
 
 Validate your canonicalizer against [`spec/canonical-vectors.json`](spec/canonical-vectors.json)
 (10 accepted, 4 rejected, each with the expected canonical bytes and oid) before anything else.
+
+Then point the conformance suite at your server:
+
+```bash
+AVCS_CONFORMANCE_URL=https://your.hub/acme/web npm run conformance
+```
+
+It reports which levels apply — `core` (the three endpoints, and a clone that reproduces the
+source treeHash), then `sync`, `governance`, `queue` as your capability flags allow. A level
+you do not advertise is **skipped, not failed**: a partial server is a legitimate one.
 
 The reference server is `startHub` in this repository — single-repo, no multi-tenancy, and it
 serves the whole protocol. Read it as an example, or run it with `avcs serve`.
