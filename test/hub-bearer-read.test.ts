@@ -23,7 +23,9 @@ import { readAuthHeaders, writeAuthHeaders, type HubSigner } from "../src/hub/hu
 
 // A real keypair: `buildAuthHeader` actually signs, so a placeholder key makes the
 // "a key wins" cases fail for the wrong reason.
-const SIGNER: HubSigner = { keyId: "alice", privateKey: generateKeypair().privateKey };
+const KP = generateKeypair();
+const SIGNER: HubSigner = { keyId: "alice", privateKey: KP.privateKey };
+const PUBLIC_KEY = KP.publicKey;
 
 test("a read sends a bearer when there is no key", () => {
   const h = readAuthHeaders(undefined, "/have", "acme/web", "tok-abc");
@@ -139,4 +141,48 @@ test("a keyless read sends the bearer on the real client path", async () => {
     await new Promise<void>((r) => server.close(() => r()));
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ── A read is not always a GET ────────────────────────────────────────────────
+//
+// `POST /objects/fetch` asks for a list of objects by oid. It is a POST only because
+// the oid list does not fit in a query string — it mutates nothing, and the reference
+// server guards it as a read.
+//
+// Splitting the credential by HTTP method rather than by what the request DOES leaves
+// that endpoint with no way to present a token, and a keyless clone dies partway:
+// `GET /have` succeeds, then `POST /objects/fetch` returns 401. Measured against a
+// real server before this case existed.
+
+test("a read-shaped POST carries the bearer", () => {
+  const h = readAuthHeaders(undefined, "/objects/fetch", "acme/web", "tok-abc", "POST");
+  assert.equal(h["authorization"], "Bearer tok-abc");
+  // The body is posted as JSON, so the caller still needs the content type from
+  // `writeAuthHeaders`; this helper only supplies the credential.
+});
+
+test("a read-shaped POST still prefers a key", () => {
+  const h = readAuthHeaders(SIGNER, "/objects/fetch", "acme/web", "tok-abc", "POST");
+  assert.ok(h["authorization"]?.startsWith("AVCS-Sig "), `got ${h["authorization"]}`);
+});
+
+test("the signature over a read-shaped POST verifies AS a POST", async () => {
+  // The signed material includes the method, so this is the case that actually matters:
+  // a helper that hardcodes "GET" produces a header the server rejects when the request
+  // goes out as POST. `parseAuthHeader` alone would not catch it — the header parses
+  // either way. Only verification against the real method does.
+  const { verifyAuth } = await import("../src/hub/transportAuth.ts");
+  const body = '{"oids":["a"]}';
+  // The body is part of the signed material, so it must be the body actually sent.
+  const h = readAuthHeaders(SIGNER, "/objects/fetch", "acme/web", undefined, "POST", body);
+  const ok = await verifyAuth({
+    header: h["authorization"],
+    method: "POST",
+    path: "/objects/fetch",
+    body,
+    resolvePublicKey: async () => PUBLIC_KEY,
+    now: Date.now(),
+    expectedScope: "acme/web",
+  });
+  assert.equal(ok.ok, true, `a POST read must verify as a POST: ${JSON.stringify(ok)}`);
 });
