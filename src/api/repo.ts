@@ -3889,6 +3889,12 @@ export class Repo {
       await this.#assertCapturable(path, disk.get(path)!);
     }
 
+    // The whole authoring section runs STAGED (store.batched, #33): each propose below is
+    // blob put + op put + index appends, which serially fsync'd per file — a 100-file commit
+    // measured 4.69s idle, and the avcs hook stages the whole worktree. Batched, the bodies
+    // group-commit at the end; a throw mid-way (MassDeleteError, a capture guard) now leaves
+    // NOTHING on disk instead of a partial commit.
+    return this.store.batched(async () => {
     const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
     const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
     const deps = res.headOps;
@@ -3944,6 +3950,7 @@ export class Repo {
       ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...ws, ...warn }));
     }
     return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), renamed, intent, contention };
+    });
   }
 
   // ── git bridge (docs/14) ───────────────────────────────────────────────────
