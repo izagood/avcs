@@ -32,9 +32,10 @@ decision rather than conflict markers.
 ## What it costs an agent to land work
 
 The demo also **measures** the difference, by running git and AVCS through the same races and
-counting the bytes each forces through the model. This is the everyday one: your PR has been
-open a while, someone else's merged first, and yours must be rebased onto the moved base and
-force-pushed.
+counting the bytes each forces through the model. On the everyday one — your PR has been open
+a while, someone else's merged first, and yours must be rebased onto the moved base and
+force-pushed — that is **18,922 tokens under git versus 279 under AVCS on a 30 KB module: a
+99% saving**, and 37–99% across the file sizes measured.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rebase-token-cost-dark.svg">
