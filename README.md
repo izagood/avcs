@@ -103,17 +103,30 @@ Or run it without installing, straight from the registry:
 npx @izagood/avcs version
 ```
 
-Once installed:
+### Your first five minutes (no server, no git required)
+
+AVCS is local-first: a repo on your disk is a complete VCS — history, blame, undo,
+releases — with no hub and no git anywhere. In an existing project directory:
 
 ```bash
-avcs version      # confirm it's on your PATH
-avcs help         # list every command
+avcs init .                        # create the repo (inside a git repo is fine — .avcs is git-ignored)
+avcs import . -m "initial import"  # bring the existing tree in as operations
 
-avcs init .       # create a repo in the current directory
-avcs status       # operation / conflict summary
-avcs conflicts    # decisions a human still owes
-avcs log          # operation history
+# …edit files as usual, then record the change:
+avcs commit -m "add mul()"         # authors operations for your working-tree changes
+
+avcs status                        # operation / conflict summary
+avcs log                           # operation history
+avcs blame file:src/math.js        # who owns this file and why (entity key = file:<path>)
+avcs conflicts                     # decisions a human still owes
+
+avcs undo --last                   # take the last operation back out of the view…
+avcs checkout                      # …and re-project the working tree from it
 ```
+
+Two things to notice: `commit` is not a git commit — it authors semantic *operations*,
+the real history; and the working tree is a *projection* you re-materialize with
+`checkout`, not the source of truth. `avcs help` lists every command.
 
 ### Signing identity
 
@@ -214,9 +227,9 @@ Entry points: `.` (root barrel) · `./hub` · `./hub/client` · `./store` · `./
 
 Releasing: bump `package.json`'s `version` in a PR and merge it to `main` — `.github/workflows/release.yml` detects the new version, runs `npm publish` (with provenance), tags the commit `vX.Y.Z`, and cuts a GitHub Release. The publish steps are guarded by a registry check, so package.json edits that don't change the version are no-ops. Every PR also runs a release dry run (`npm run build` + `npm pack --dry-run`) in CI to catch packaging regressions before merge. Requires an `NPM_TOKEN` repository secret with publish rights to the `@izagood` scope.
 
-## Quick start
+## Running from a checkout
 
-If you'd rather not install, every command runs straight from the checkout with `node`:
+Hacking on AVCS itself? Every command runs straight from the checkout with `node`:
 
 ```bash
 # Walk all four merge scenarios end to end
