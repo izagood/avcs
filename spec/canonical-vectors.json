@@ -1,0 +1,188 @@
+{
+  "_": "avcs 정규 직렬화 골든 벡터. 비-JS 구현이 자기 정규화를 이 파일로 검증한다. 값은 손으로 적혔고 test/canonical-golden.test.ts 가 구현과 대조한다 — 생성하지 않는다.",
+  "_rules": [
+    "정규 형태는 JSON: 삽입 공백 없음, 객체 키는 코드포인트 오름차순, undefined 필드는 탈락.",
+    "oid = \"<type>_\" + sha256(canonical) 앞 32 hex. type 은 페이로드의 type 필드가 아니라 별도 인자다.",
+    "수는 정수만, ±(2^53-1) 이내. 부동소수는 언어별 표기가 달라 허용하지 않는다.",
+    "객체 키: astral 문자(U+10000 이상) 금지, NFC 정규화 필수, lone surrogate 금지.",
+    "문자열 값: astral·비-ASCII 허용(정렬에 참여하지 않는다). lone surrogate 만 금지.",
+    "이스케이프: JSON 필수만 — \\\" \\\\ \\n \\r \\t 및 U+0000..U+001F 의 \\u00XX. 나머지는 UTF-8 그대로.",
+    "lone surrogate 거부 벡터는 이 파일에 없다 — 유효한 UTF-8 로 표현할 수 없어 파일 형식이 담지 못한다. 구현은 자기 테스트에서 직접 만들어 검증해야 한다."
+  ],
+  "accepted": [
+    {
+      "name": "key-order",
+      "note": "정렬은 코드포인트 오름차순 — '10'(0x31) < 'A'(0x41) < '_c'(0x5F) < 'a'(0x61) < 'b'. 대문자가 소문자보다 앞이고 밑줄이 그 사이다. '알파벳 순'으로 구현하면 A 와 a 가 뒤집힌다.",
+      "type": "operation",
+      "payload": {
+        "10": 4,
+        "b": 1,
+        "A": 2,
+        "_c": 3,
+        "a": 5
+      },
+      "canonical": "{\"10\":4,\"A\":2,\"_c\":3,\"a\":5,\"b\":1}",
+      "oid": "operation_1ac8f836e609cd5644ebd71664d35ed0"
+    },
+    {
+      "name": "integers",
+      "note": "0·음수·안전 정수 경계 ±(2^53-1). 지수 표기로 새지 않아야 한다.",
+      "type": "operation",
+      "payload": {
+        "zero": 0,
+        "neg": -42,
+        "big": 9007199254740991,
+        "small": -9007199254740991
+      },
+      "canonical": "{\"big\":9007199254740991,\"neg\":-42,\"small\":-9007199254740991,\"zero\":0}",
+      "oid": "operation_d685cb99032f55959b820cdc1690dd11"
+    },
+    {
+      "name": "nesting",
+      "note": "배열은 순서 보존, 중첩 객체도 각자 정렬. null 은 값으로 남는다.",
+      "type": "operation",
+      "payload": {
+        "arr": [
+          1,
+          [
+            2,
+            [
+              3
+            ]
+          ],
+          {
+            "k": null
+          }
+        ],
+        "obj": {
+          "z": 1,
+          "a": {
+            "y": 2
+          }
+        }
+      },
+      "canonical": "{\"arr\":[1,[2,[3]],{\"k\":null}],\"obj\":{\"a\":{\"y\":2},\"z\":1}}",
+      "oid": "operation_97f0154652ed0eb940a2e9c689cce15f"
+    },
+    {
+      "name": "escapes",
+      "note": "필수 이스케이프만. 탭은 \\t 이고 \\u0009 가 아니다 — 둘 다 유효한 JSON 이지만 바이트가 달라 oid 가 갈린다.",
+      "type": "operation",
+      "payload": {
+        "s": "line\nbreak \"quoted\" back\\slash tab\there"
+      },
+      "canonical": "{\"s\":\"line\\nbreak \\\"quoted\\\" back\\\\slash tab\\there\"}",
+      "oid": "operation_20a2304e1bf0e465499e9eaa619615cf"
+    },
+    {
+      "name": "unicode-values",
+      "note": "값의 비-ASCII 는 이스케이프하지 않고 UTF-8 그대로. \\uXXXX 로 escape 하는 구현은 다른 oid 를 낸다.",
+      "type": "operation",
+      "payload": {
+        "ko": "한글",
+        "emoji": "배포 🚀",
+        "mixed": "path/이름 🚀.md"
+      },
+      "canonical": "{\"emoji\":\"배포 🚀\",\"ko\":\"한글\",\"mixed\":\"path/이름 🚀.md\"}",
+      "oid": "operation_19b44b925e741bd1ab44ea72164f27c7"
+    },
+    {
+      "name": "nfc-value",
+      "note": "값에는 NFC 를 강제하지 않는다 — 사용자 텍스트를 조용히 고치면 안 된다. 키에만 강제한다.",
+      "type": "operation",
+      "payload": {
+        "composed": "é",
+        "note": "이 값은 NFD 다. 값은 그대로 보존된다."
+      },
+      "canonical": "{\"composed\":\"é\",\"note\":\"이 값은 NFD 다. 값은 그대로 보존된다.\"}",
+      "oid": "operation_fe883eec7910da5235b613581a9b5649"
+    },
+    {
+      "name": "empty",
+      "note": "빈 객체도 유효한 페이로드다.",
+      "type": "operation",
+      "payload": {},
+      "canonical": "{}",
+      "oid": "operation_c02771151b24a9f2c8d155588806c0b4"
+    },
+    {
+      "name": "booleans-null",
+      "note": "true/false/null 은 소문자 리터럴이다.",
+      "type": "operation",
+      "payload": {
+        "t": true,
+        "f": false,
+        "n": null
+      },
+      "canonical": "{\"f\":false,\"n\":null,\"t\":true}",
+      "oid": "operation_4006c9cb710c340cc458e454cdfbb1d3"
+    },
+    {
+      "name": "real-op",
+      "note": "실제 Operation 모양. 페이로드에 type 필드가 있어도 oid 접두사는 별도 인자에서 온다.",
+      "type": "operation",
+      "payload": {
+        "type": "operation",
+        "lamport": 7,
+        "path": "src/a.ts",
+        "declaredPurpose": "seed",
+        "causalDeps": [
+          "operation_ab",
+          "operation_cd"
+        ]
+      },
+      "canonical": "{\"causalDeps\":[\"operation_ab\",\"operation_cd\"],\"declaredPurpose\":\"seed\",\"lamport\":7,\"path\":\"src/a.ts\",\"type\":\"operation\"}",
+      "oid": "operation_72ce4832d5269054295da5563dea32b3"
+    },
+    {
+      "name": "real-checkpoint",
+      "note": "evidence 는 맵이고 그 키가 사용자 이름일 수 있다('custom:deploy'). 그래서 키 규칙이 사용자 입력에 적용된다.",
+      "type": "checkpoint",
+      "payload": {
+        "type": "checkpoint",
+        "treeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "headOps": [
+          "operation_ab"
+        ],
+        "evidence": {
+          "unit_test": "pass",
+          "custom:deploy": "pass"
+        },
+        "status": "verified"
+      },
+      "canonical": "{\"evidence\":{\"custom:deploy\":\"pass\",\"unit_test\":\"pass\"},\"headOps\":[\"operation_ab\"],\"status\":\"verified\",\"treeHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"type\":\"checkpoint\"}",
+      "oid": "checkpoint_c5ad92b0f3738d9302c80ebc02f02ce3"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "float",
+      "note": "부동소수 표기가 언어마다 다르다. 1.0 을 '1' 로 쓰는 런타임과 '1.0' 으로 쓰는 런타임이 있다.",
+      "payload": {
+        "n": 1.5
+      }
+    },
+    {
+      "name": "unsafe-integer",
+      "note": "2^53 이상은 배정도에서 정확히 표현되지 않는다.",
+      "payload": {
+        "n": 9007199254740992
+      }
+    },
+    {
+      "name": "astral-key",
+      "note": "UTF-16 정렬과 코드포인트 정렬이 갈리는 유일한 지점. 거부하면 두 정렬이 일치하므로 규칙을 '코드포인트 순' 하나로 단정할 수 있다.",
+      "payload": {
+        "🚀deploy": 1,
+        "x": 2
+      }
+    },
+    {
+      "name": "nfd-key",
+      "note": "같은 글자의 두 표현이 두 oid 를 만든다. 반드시 \\u0301 이스케이프로 적어야 한다 — 리터럴로 적으면 편집기·셸이 NFC 로 정규화해 벡터가 아무것도 재지 못한다(실제로 그렇게 됐다).",
+      "payload": {
+        "café": 1
+      }
+    }
+  ]
+}

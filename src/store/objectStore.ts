@@ -14,7 +14,7 @@ import { mkdir, readFile, readdir, stat, open, rename, appendFile, rm } from "no
 import { existsSync, statSync, readFileSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 import { Buffer } from "node:buffer";
-import { computeOid, sha256hex } from "../core/canonical.ts";
+import { computeOid, sha256hex, assertInteropSafe } from "../core/canonical.ts";
 import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
 import { withLock, type LockOptions } from "./lock.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
@@ -249,6 +249,12 @@ export class ObjectStore {
   async put<T extends AnyObject>(obj: T): Promise<string> {
     const { oid: _ignore, ...payload } = obj as T & { oid?: string };
     void _ignore;
+    // THE gate for the interop-safe subset, placed here because this is the single choke
+    // point every object passes through — authoring, pull, importBundle, importObjects, a
+    // hub push. A check on the authoring APIs alone would be a check with a bypass, and
+    // `custom:<name>` evidence puts a user-chosen string into `Checkpoint.evidence` as an
+    // object KEY, which is hashed material. See `assertInteropSafe`.
+    assertInteropSafe(payload, obj.type);
     const oid = computeOid(obj.type, payload as Record<string, unknown>);
     const p = this.#pathFor(oid);
     if (!existsSync(p)) {
