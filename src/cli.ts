@@ -15,7 +15,7 @@
 //   avcs show <oid>
 //   avcs mcp [install]
 
-import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -665,9 +665,25 @@ async function main(): Promise<void> {
           const gp = execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
           const { isAbsolute, join } = await import("node:path");
           const hooksDir = isAbsolute(gp) ? gp : join(dir, gp);
-          const cmd = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
-          const { installed } = await installHooks(hooksDir, cmd, false);
-          if (installed.length) console.log(`  installed git hooks (${installed.join(", ")}) — \`git commit\` now auto-syncs AVCS (--no-hooks to skip)`);
+          // …but only when this store IS the git working tree's root (issue #133). Both
+          // searches involved go UPWARD and only one of them can win: `--git-path hooks`
+          // ascends from `dir` to the nearest `.git`, while the installed hook later ascends
+          // from the COMMIT's cwd looking for `.avcs`. Init a level down and the hooks land on
+          // the outer repo while the store sits below it, so every later `git commit` there
+          // dies with `not an AVCS repo: <outer>` — far from the init that caused it. A store
+          // below the root is not the thing that repo should be bridged to; say so and stop.
+          const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+          // realpath both sides: on macOS `git` reports `/private/var/…` where the caller
+          // passed `/var/…`, and a symlinked checkout would otherwise read as "not the root".
+          const same = realpathSync(top) === realpathSync(resolve(dir));
+          if (!same) {
+            console.log(`  no git hooks installed: this store is below the root of the git repo at ${top} — hooks there would fire for commits this store cannot see (issue #133)`);
+            console.log(`    run \`avcs init\` in ${top} to bridge that repo, or \`avcs install-hooks\` there once it has a store`);
+          } else {
+            const cmd = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(process.argv[1])}`;
+            const { installed } = await installHooks(hooksDir, cmd, false);
+            if (installed.length) console.log(`  installed git hooks (${installed.join(", ")}) — \`git commit\` now auto-syncs AVCS (--no-hooks to skip)`);
+          }
         } catch { /* not a git repo — fine; user can `git init` then `avcs install-hooks` */ }
       }
       // A non-empty directory means the very next `status` would show `files: 0` with no
@@ -1568,7 +1584,17 @@ async function main(): Promise<void> {
       const author = process.env.AVCS_AUTHOR ?? "human:cli";
       // cwd is the working tree (possibly a linked git worktree); the store may live in
       // the main checkout. Opening the store can itself block under contention, so bound it.
-      const opened = await withDeadline(() => Repo.open(storeDirFor(cwd)), hookMs);
+      const storeDir = storeDirFor(cwd);
+      // No store at all ⇒ this hook has no other half. Fail open, exactly as a timeout does
+      // above: a bridge that cannot find what it bridges to must be inert, not fatal. Hooks
+      // installed on the wrong repo (issue #133, fixed at the source in `init`) are already
+      // out there, and hard-failing here means the repo cannot commit until someone finds and
+      // deletes five files. Deliberately narrow — only "no repo", resolved by the same
+      // predicate `Repo.open` uses. Every other refusal, the pre-commit conflict gate (docs/14)
+      // above all, still exits non-zero and still blocks the commit.
+      if (!ObjectStore.isRepo(storeDir))
+        failOpen(`avcs: no AVCS repo at or above ${cwd} — skipping git-hook ${phase} and letting git proceed. Run \`avcs init\` here to bridge this repo, or delete the avcs hooks in .git/hooks.`);
+      const opened = await withDeadline(() => Repo.open(storeDir), hookMs);
       if (!opened.ok)
         failOpen(`avcs: opening the store exceeded ${hookMs}ms — skipping git-hook ${phase} (#33). Another avcs process may be holding it; set AVCS_HOOK_TIMEOUT_MS=0 to wait.`);
       const repo = opened.value;
