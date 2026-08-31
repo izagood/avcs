@@ -21,6 +21,32 @@ The same objects + the same policy + the same materializer produce the same tree
 
 > **Status:** research prototype. The implementation is real and test-covered, but every phase is built to a *working-MVP depth* (language-neutral text 3-way merge, ed25519 signing). Structure-aware merge, semantic-break detection, multi-signature trust, and hardened distributed sync are tracked on the [roadmap](docs/07-roadmap.md).
 
+**Jump in:** [install](#install) · [your first five minutes](#your-first-five-minutes-no-server-no-git-required) · [connect an agent over MCP](#connect-agents-mcp) · [agent quickstart walkthrough](docs/25-agent-quickstart.md)
+
+## Why not a layer on top of git?
+
+Every "AI + git" tool eventually stores the agent's context *beside* the history — commit
+trailers, PR comments, sidecar JSON. AVCS exists because these objects have to be
+**load-bearing** — consumed by the merge machinery itself — and bolted onto git they can't be:
+
+- **Evidence must gate merging.** git happily merges a behavior change with no passing
+  test. In AVCS that change is graded **L3 — blocked** by the reducer until *trusted*
+  evidence lands, and an operation's own author vouching for it does not count.
+- **Decisions must outlive the merge.** `git merge` resolves a conflict by emitting bytes;
+  the choice and its rationale evaporate. An AVCS `decision` is a signed object —
+  recallable later, and prior decisions bias future auto-resolution.
+- **Concurrent edits must not degrade into conflict markers.** Two agents editing one
+  file meet a deterministic policy reduction (L0–L4 below), not `<<<<<<<` in the tree
+  plus a human holding the pieces.
+- **Intent must travel with the work.** A trailer is inert text. An `intent` (goal +
+  constraints + allowed scope) is what sessions open against, what leases and contention
+  checks are scoped by, and what `avcs.context.build` hands the next agent.
+
+git stores snapshots and leaves the merge to text selection; AVCS stores the operation
+graph and makes the merge a computation over intent, evidence, and decisions. That is why
+it is deliberately git-**incompatible** — these objects are the engine, not metadata.
+(git interop still exists, as a bridge: [docs/14](docs/14-git-bridge.md), [docs/20](docs/20-workspace-bridge.md).)
+
 ## Core principles
 
 | # | Principle | Contrast with Git |
@@ -300,6 +326,8 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 - [21 — shared-paths: build environments shared across workspaces](docs/21-shared-paths.md)
 - [22 — Region policy arbitration (design)](docs/22-region-arbitration.md)
 - [23 — Local undo: the pre-share escape hatch](docs/23-local-undo.md)
+- [24 — Canonical interop: the language-neutral canonicalization subset](docs/24-canonical-interop.md)
+- [25 — Agent quickstart: driving AVCS from Claude Code (MCP)](docs/25-agent-quickstart.md)
 
 ## Contributing
 
