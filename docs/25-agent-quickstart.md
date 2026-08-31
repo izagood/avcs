@@ -127,3 +127,11 @@ change to the agent's code.
 4. On a conflict, produce options for a human; do not silently overwrite.
 5. Stay inside the intent's allowed scopes; widen the intent instead of exceeding it.
 6. Read a failure's `nextActions` and follow them; do not improvise recovery from the message text.
+
+## Run the same story yourself
+
+[`izagood/avcs-demo`](https://github.com/izagood/avcs-demo) is the runnable counterpart to
+this document: `./demo.sh` plays two humans through the identical scenario — a stale-head
+land that is absorbed, a disjoint auto-merge, and a same-line collision resolved by a signed
+decision — and its `agent-session.md` shows what that collision looks like from the agent's
+side of the loop, including why rule 4 above means the agent stops and hands it to a human.
