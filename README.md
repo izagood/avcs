@@ -23,6 +23,12 @@ The same objects + the same policy + the same materializer produce the same tree
 
 **Jump in:** [install](#install) · [your first five minutes](#your-first-five-minutes-no-server-no-git-required) · [connect an agent over MCP](#connect-agents-mcp) · [agent quickstart walkthrough](docs/25-agent-quickstart.md)
 
+**See it run first:** [`izagood/avcs-demo`](https://github.com/izagood/avcs-demo) — a runnable
+demo of the question this design answers: *what happens when two agents edit the same file at
+the same time?* One `./demo.sh` walks a stale-head land that is absorbed instead of rejected,
+a same-file auto-merge with no rebase, and a same-line collision that becomes a signed
+decision rather than conflict markers.
+
 ## Why not a layer on top of git?
 
 Every "AI + git" tool eventually stores the agent's context *beside* the history — commit
