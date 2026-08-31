@@ -29,7 +29,7 @@ avcs git-mode committed        # 전환 (.gitignore/.gitattributes 재작성)
 
 ### 자동 (권장) — git 훅
 
-`avcs init`은 git 레포 안이면 훅 5종을 자동 설치한다(`--no-hooks`로 생략, 나중에 `avcs install-hooks`). 그러면 **평소처럼 git만 써도** AVCS가 따라온다:
+`avcs init`은 그 디렉터리가 git 워킹트리의 **루트일 때만** 훅 5종을 자동 설치한다(`--no-hooks`로 생략, 나중에 `avcs install-hooks`). 그러면 **평소처럼 git만 써도** AVCS가 따라온다:
 
 ```bash
 # 파일 편집 (사람이든 에이전트든)
@@ -47,6 +47,7 @@ git worktree add ../feat -b feat   # post-checkout: 새 working tree를 메인 �
 
 - 열린(needs-human) 충돌이 있으면 pre-commit이 커밋을 **중단**한다. `avcs conflicts`로 선택지를 보고 `avcs decide <conflict-id> --choose <op-oid>`로 결정을 기록한 뒤 다시 커밋.
 - `git commit --no-verify`는 훅을 건너뛴다(그 경우 AVCS 캡처가 누락됨 — 피할 것).
+- 하위 디렉터리에서 `avcs init` 하면 훅을 설치하지 **않는다**(#133). 훅은 위로 올라가 바깥 레포의 `.git/hooks`에 붙는데 스토어는 아래에 있어, 그 레포의 모든 커밋이 스토어를 못 찾고 죽기 때문이다. 이미 그렇게 설치된 훅을 위해 훅 쪽도 완화했다 — 스토어를 못 찾으면 타임아웃과 똑같이 **fail open**(경고 후 커밋 통과). 충돌 게이트 등 다른 거부는 그대로 커밋을 막는다.
 
 ### 수동 — 포slin 명령
 
