@@ -64,6 +64,32 @@ jobs:
         env:
           AVCS_VERIFY_INCREMENTAL: '1'
 
+  conformance:
+    # 적합성 스위트를 참조 구현에 대고 돌린다. 이것이 초록이어야 스위트가 스스로 검증된다 —
+    # 제3자가 자기 서버에 대고 돌리는 것과 **같은 명령**이고, 다른 것은 URL 하나뿐이다:
+    #   AVCS_CONFORMANCE_URL=https://your.hub/acme/web npm run conformance
+    #
+    # 별도 잡인 이유: node 의 테스트 러너 안에서 러너를 다시 부를 수 없다
+    # (`run() is being called recursively within a test file. skipping running files.`).
+    # 테스트로 흉내내면 초록이 나되 아무 파일도 돌지 않는다.
+    name: conformance (reference server)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Conformance suite
+        run: npm run conformance
+
   release-dry-run:
     name: release dry run (build + pack)
     runs-on: ubuntu-latest

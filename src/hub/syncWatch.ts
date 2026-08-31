@@ -243,6 +243,7 @@ async function watchLoop(repo: Repo, remote: string, url: string, opts: SyncWatc
     }
 
 
+
     try {
       const r = await repo.sync(remote, { as: opts.as });
       emit({ type: "synced", pulled: r.pulled, pushed: r.pushed });
