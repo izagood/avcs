@@ -3606,7 +3606,13 @@ export class Repo {
     workDir: string,
     view = "main",
     opts?: { workspace?: string; at?: string },
-  ): Promise<{ written: string[]; shared: SharedPathLink[]; skipped: string[] }> {
+  ): Promise<{
+    written: string[];
+    shared: SharedPathLink[];
+    skipped: string[];
+    /** path → blob oid, for the caller that records what it projected (see checkoutInto). */
+    tree: Map<string, string>;
+  }> {
     const res = opts?.at
       ? await this.materializeAt((await this.#checkpointAt(opts.at)).headOps)
       : await this.materialize(view, opts?.workspace ? { workspace: opts.workspace } : undefined);
@@ -3636,7 +3642,14 @@ export class Repo {
       written.push(path);
     }
     if (skipped.length) this.logger.warn("shared.projection.skipped", { count: skipped.length, sample: skipped.slice(0, 5) });
-    return { written: written.sort(), shared: await this.linkSharedPaths(workDir, res.tree), skipped: skipped.sort() };
+    // `written` lists the view's paths; `tree` carries the blob oid each one came from, so
+    // a caller can later tell "the bytes I wrote" from "the user edited it".
+    return {
+      written: written.sort(),
+      shared: await this.linkSharedPaths(workDir, res.tree),
+      skipped: skipped.sort(),
+      tree: new Map([...res.tree].filter(([p]) => !(shared.length && inShared(p)))),
+    };
   }
 
   /**
@@ -3659,10 +3672,91 @@ export class Repo {
     return obj as Checkpoint;
   }
 
-  /** Write a view's materialized files into `workDir` (alongside .avcs, like git).
-   *  `at` pins the projection to a checkpoint — see {@link projectInto}. */
+  /**
+   * Write a view's materialized files into `workDir` (alongside .avcs, like git), and
+   * REMOVE the ones a previous projection put there that this view does not contain.
+   *
+   * The working tree is derived, so the view must decide what is in it. Writing without
+   * removing makes two projections layer into their union — which is exactly what
+   * `clone` (default view) followed by `checkout` (target view) produced.
+   *
+   * git does this with the index: it knows which files are its own. The equivalent here is
+   * a record of what the last projection wrote, which {@link projectInto} already computes
+   * and used to discard. `#readProjection`/`#writeProjection` persist it.
+   *
+   * Only the repo's own working tree is cleaned. `projectInto` stays a pure write so that
+   * `materialize --out` / `workspace project` (exports into a caller's directory) neither
+   * delete nor disturb the record.
+   *
+   * `at` pins the projection to a checkpoint — see {@link projectInto}.
+   */
   async checkoutInto(workDir: string, view = "main", opts?: { workspace?: string; at?: string }): Promise<string[]> {
-    return (await this.projectInto(workDir, view, opts)).written;
+    const before = await this.#readProjection();
+    const res = await this.projectInto(workDir, view, opts);
+    const now = new Set(res.written);
+
+    // (previously projected) − (this view) = stale. Anything absent from `before` is not
+    // ours: node_modules, ignored files, a file the user just created.
+    const stale = [...before].filter(([path]) => !now.has(path));
+    const kept: string[] = [];
+    for (const [path, blobOid] of stale) {
+      const full = join(workDir, path);
+      let current: Buffer;
+      try {
+        current = await readFile(full);
+      } catch {
+        continue; // already gone — nothing to do
+      }
+      // An edit that has not been captured is WORK. Deleting it to make the projection
+      // exact would trade one stale file for lost work, which is the worse failure.
+      let mine = false;
+      try {
+        mine = current.equals(Buffer.from(await this.#treeEntryBytes(path, blobOid, undefined)));
+      } catch {
+        /* the blob is gone (gc/redact) — treat as not-ours and keep the file */
+      }
+      if (!mine) {
+        kept.push(path);
+        continue;
+      }
+      await rm(full, { force: true });
+    }
+    if (kept.length) {
+      this.logger.warn("projection.stale.kept", { count: kept.length, sample: kept.slice(0, 5) });
+      this.#note(
+        `${kept.length} file(s) the previous view had are NOT in ${view} but differ from what was projected — left in place (uncaptured edits): ${kept.slice(0, 3).join(", ")}`,
+      );
+    }
+    await this.#writeProjection(res.tree);
+    return res.written;
+  }
+
+  /** The last in-place projection: path → the blob oid we wrote there. */
+  async #readProjection(): Promise<Map<string, string>> {
+    const raw = await this.store.readAux("projection.json");
+    if (!raw) return new Map();
+    try {
+      const parsed = JSON.parse(raw.toString("utf8")) as unknown;
+      if (parsed === null || typeof parsed !== "object") return new Map();
+      const files = (parsed as { files?: unknown }).files;
+      if (files === null || typeof files !== "object") return new Map();
+      return new Map(
+        Object.entries(files as Record<string, unknown>).filter(
+          (e): e is [string, string] => typeof e[1] === "string",
+        ),
+      );
+    } catch {
+      // A damaged record must not break a checkout; it degrades to "clean nothing", which
+      // is the behavior that existed before this record did.
+      return new Map();
+    }
+  }
+
+  async #writeProjection(tree: Map<string, string>): Promise<void> {
+    await this.store.writeAux(
+      "projection.json",
+      JSON.stringify({ version: 1, files: Object.fromEntries(tree) }),
+    );
   }
 
   /**
