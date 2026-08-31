@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.izagood/avcs",
   "title": "AVCS",
-  "description": "Agentic Version Control System — an AI-native VCS where intent, operation, evidence and decision are first-class objects; agents propose, validate and land changes through 36 MCP tools.",
+  "description": "AI-native version control where intent, operation, evidence and decision are first-class objects.",
   "repository": {
     "url": "https://github.com/izagood/avcs",
     "source": "github"
