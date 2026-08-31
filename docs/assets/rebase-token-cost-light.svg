@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="404" viewBox="0 0 820 404" role="img" aria-label="Agent tokens to land a change after another PR merged: git grows with file size, AVCS stays flat">
+<style>
+  .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .title { font-size: 17px; font-weight: 650; fill: #0b0b0b; }
+  .sub { font-size: 12.5px; fill: #52514e; }
+  .axis { font-size: 11.5px; fill: #52514e; }
+  .val { font-size: 12px; font-weight: 600; fill: #0b0b0b; }
+  .lg { font-size: 12.5px; fill: #0b0b0b; }
+  .note { font-size: 11.5px; fill: #52514e; }
+</style>
+<rect width="820" height="404" rx="10" fill="#fcfcfb"/>
+<g class="t">
+<text class="title" x="28" y="34">Someone else's PR merged first. Now land yours.</text>
+<text class="sub" x="28" y="55">Agent tokens on the recovery path — rebase, resolve, force-push — measured by running both systems</text>
+<rect x="28" y="68" width="10" height="10" rx="2" fill="#eb6834"/>
+<text class="lg" x="44" y="77">git</text>
+<rect x="80" y="68" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text class="lg" x="96" y="77">AVCS</text>
+<line x1="64" x2="792" y1="316" y2="316" stroke="#e6e5e1" stroke-width="1"/>
+<text class="axis" x="54" y="320" text-anchor="end">0</text>
+<line x1="64" x2="792" y1="263.1514639044499" y2="263.1514639044499" stroke="#e6e5e1" stroke-width="1"/>
+<text class="axis" x="54" y="267.1514639044499" text-anchor="end">5k</text>
+<line x1="64" x2="792" y1="210.3029278088997" y2="210.3029278088997" stroke="#e6e5e1" stroke-width="1"/>
+<text class="axis" x="54" y="214.3029278088997" text-anchor="end">10k</text>
+<line x1="64" x2="792" y1="157.45439171334957" y2="157.45439171334957" stroke="#e6e5e1" stroke-width="1"/>
+<text class="axis" x="54" y="161.45439171334957" text-anchor="end">15k</text>
+<path d="M138.33333333333331 316 L138.33333333333331 315.28591058027695 Q138.33333333333331 311.28591058027695 142.33333333333331 311.28591058027695 L180.33333333333331 311.28591058027695 Q184.33333333333331 311.28591058027695 184.33333333333331 315.28591058027695 L184.33333333333331 316 Z" fill="#eb6834"/><path d="M186.33333333333331 316 L186.33333333333331 317.0510516858683 Q186.33333333333331 313.0510516858683 190.33333333333331 313.0510516858683 L228.33333333333331 313.0510516858683 Q232.33333333333331 313.0510516858683 232.33333333333331 317.0510516858683 L232.33333333333331 316 Z" fill="#2a78d6"/><text class="val" x="161.33333333333331" y="303.28591058027695" text-anchor="middle" fill="#0b0b0b">446</text>
+<text class="val" x="209.33333333333331" y="305.0510516858683" text-anchor="middle" fill="#0b0b0b">279</text>
+<text class="axis" x="185.33333333333331" y="338" text-anchor="middle">0.7 KB file</text>
+<path d="M380.99999999999994 316 L380.99999999999994 264.51960680689143 Q380.99999999999994 260.51960680689143 384.99999999999994 260.51960680689143 L422.99999999999994 260.51960680689143 Q426.99999999999994 260.51960680689143 426.99999999999994 264.51960680689143 L426.99999999999994 316 Z" fill="#eb6834"/><path d="M428.99999999999994 316 L428.99999999999994 317.0510516858683 Q428.99999999999994 313.0510516858683 432.99999999999994 313.0510516858683 L470.99999999999994 313.0510516858683 Q474.99999999999994 313.0510516858683 474.99999999999994 317.0510516858683 L474.99999999999994 316 Z" fill="#2a78d6"/><text class="val" x="403.99999999999994" y="252.51960680689143" text-anchor="middle" fill="#0b0b0b">5,249</text>
+<text class="val" x="451.99999999999994" y="305.0510516858683" text-anchor="middle" fill="#0b0b0b">279</text>
+<text class="axis" x="427.99999999999994" y="338" text-anchor="middle">8 KB file</text>
+<path d="M623.6666666666666 316 L623.6666666666666 120.00000000000003 Q623.6666666666666 116.00000000000003 627.6666666666666 116.00000000000003 L665.6666666666666 116.00000000000003 Q669.6666666666666 116.00000000000003 669.6666666666666 120.00000000000003 L669.6666666666666 316 Z" fill="#eb6834"/><path d="M671.6666666666666 316 L671.6666666666666 317.0510516858683 Q671.6666666666666 313.0510516858683 675.6666666666666 313.0510516858683 L713.6666666666666 313.0510516858683 Q717.6666666666666 313.0510516858683 717.6666666666666 317.0510516858683 L717.6666666666666 316 Z" fill="#2a78d6"/><text class="val" x="646.6666666666666" y="108.00000000000003" text-anchor="middle" fill="#0b0b0b">18,922</text>
+<text class="val" x="694.6666666666666" y="305.0510516858683" text-anchor="middle" fill="#0b0b0b">279</text>
+<text class="axis" x="670.6666666666666" y="338" text-anchor="middle">30 KB file</text>
+<line x1="64" x2="792" y1="316" y2="316" stroke="#e6e5e1" stroke-width="1"/>
+<text class="note" x="28" y="360">git's cost follows the size of the FILE — it reads and rewrites the whole thing. AVCS's follows the</text>
+<text class="note" x="28" y="376">size of the CHANGE: flat 279 tokens at every size, 68× less on a 30 KB file.</text>
+<text class="note" x="28" y="392">Round trips: git 7 vs AVCS 4 — and this is ONE cycle, repeated for every PR that merges ahead of yours.</text>
+</g></svg>

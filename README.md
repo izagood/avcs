@@ -29,6 +29,28 @@ the same time?* One `./demo.sh` walks a stale-head land that is absorbed instead
 a same-file auto-merge with no rebase, and a same-line collision that becomes a signed
 decision rather than conflict markers.
 
+## What it costs an agent to land work
+
+The demo also **measures** the difference, by running git and AVCS through the same races and
+counting the bytes each forces through the model. This is the everyday one: your PR has been
+open a while, someone else's merged first, and yours must be rebased onto the moved base and
+force-pushed.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rebase-token-cost-dark.svg">
+  <img alt="Agent tokens to land a change after another PR merged first: git costs 446, 5,249 and 18,922 tokens on 0.7 KB, 8 KB and 30 KB files, while AVCS stays flat at 279" src="docs/assets/rebase-token-cost-light.svg" width="820">
+</picture>
+
+git's recovery cost tracks the size of the **file** — a conflict is bytes inside it, so the
+agent reads the whole module and writes the whole module back to change one line. AVCS's
+tracks the size of the **change**: a conflict is an object naming the two contending
+operations, so it stays flat as the file grows. There is also no branch to rewrite and
+nothing to force-push, which is why the round trips differ (7 vs 4) — and that is one cycle,
+repeated for every PR that merges ahead of yours.
+
+Method, caveats and the harness that produced these numbers:
+[avcs-demo → what it costs an agent in tokens](https://github.com/izagood/avcs-demo#what-it-costs-an-agent-in-tokens).
+
 ## Why not a layer on top of git?
 
 Every "AI + git" tool eventually stores the agent's context *beside* the history — commit
