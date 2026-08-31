@@ -45,7 +45,7 @@ git pull                    # post-merge: reindex(op-log 재구축) + 재투영 
 git worktree add ../feat -b feat   # post-checkout: 새 working tree를 메인 스토어에 attach
 ```
 
-- 열린(needs-human) 충돌이 있으면 pre-commit이 커밋을 **중단**한다. `avcs conflicts`로 해결 후 다시 커밋.
+- 열린(needs-human) 충돌이 있으면 pre-commit이 커밋을 **중단**한다. `avcs conflicts`로 선택지를 보고 `avcs decide <conflict-id> --choose <op-oid>`로 결정을 기록한 뒤 다시 커밋.
 - `git commit --no-verify`는 훅을 건너뛴다(그 경우 AVCS 캡처가 누락됨 — 피할 것).
 
 ### 수동 — 포slin 명령

@@ -113,7 +113,7 @@ intent.read → context.build → lease.request → operation.propose
 |------|------|
 | `avcs.view.materialize` | 연산 그래프 → treeHash + 파일 목록 + status + conflicts + dropped (내 작업이 병합되는지 확인; 파일 **내용**은 `object.show`로) |
 | `avcs.conflict.list` | 사람이 결정할 충돌 목록 |
-| `avcs.decision.record` | 충돌 해결 기록. **사람 전용** — 로컬 서명 키 + elicitation 확인 요구 |
+| `avcs.decision.record` | 충돌 해결 기록. **사람 전용** — 로컬 서명 키 + elicitation 확인 요구. CLI 대응물은 `avcs decide <conflict-id> --choose <op-oid>`(호출자가 사람이므로 elicitation 대신 서명 자체가 게이트) |
 
 **checkpoint / release / 통합**
 

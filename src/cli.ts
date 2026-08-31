@@ -8,6 +8,7 @@
 //   avcs init [dir]
 //   avcs status [view]
 //   avcs conflicts [view]
+//   avcs decide <conflict-id> --choose <op-oid>
 //   avcs log
 //   avcs materialize [view] [--out <dir>]
 //   avcs checkpoint <view> [-m <summary>]
@@ -23,6 +24,7 @@ import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
 import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
 import { ObjectStore } from "./store/objectStore.ts";
+import { conflictIdFor } from "./reducer/reducer.ts";
 import type { Operation, Actor, Undo } from "./objects/types.ts";
 import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
 
@@ -158,6 +160,30 @@ async function scopeFor(repo: Repo, dir: string, explicitLine?: string): Promise
   const branch = gitCmd(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
   const hasExistingLine = !!branch && !!(await repo.store.getRef(`line:${branch}`));
   return scopeForBranch(branch, await repo.trunkBranches(), { hasExistingLine });
+}
+
+/** One conflict option, with the author and purpose filled in from its operation. */
+type ConflictOption = Awaited<ReturnType<Repo["materialize"]>>["conflicts"][number]["options"][number];
+
+/**
+ * A conflict's options, with `actor`/`purpose` recovered from the operations themselves
+ * where the conflict object leaves them blank.
+ *
+ * An overlapping-edit conflict (docs/22) is minted from the text merge rather than from the
+ * policy pass, so its options carry an empty actor and a generic purpose. Printed verbatim
+ * that asks a human to choose between two opaque hashes — which is the same dead end as
+ * having no command at all. The operations hold both facts already; this reads them.
+ */
+async function attributedOptions(repo: Repo, options: ConflictOption[]): Promise<ConflictOption[]> {
+  return Promise.all(
+    options.map(async (o) => {
+      if (o.actor) return o;
+      // A missing/unreadable op must not take the listing down with it — the oid is still
+      // the thing the human decides on, so fall back to it rather than throwing.
+      const op = await repo.store.get<Operation>(o.opOid).catch(() => undefined);
+      return op ? { ...o, actor: op.actor?.id ?? o.actor, purpose: op.declaredPurpose || o.purpose } : o;
+    }),
+  );
 }
 
 /** How to name a scope in output meant for a human. */
@@ -796,7 +822,7 @@ async function main(): Promise<void> {
       for (const c of res.conflicts) {
         console.log(`\n● ${c.id}  [${c.kind}]  @ ${c.key}`);
         console.log(`  ${c.reason}`);
-        for (const o of c.options) {
+        for (const o of await attributedOptions(repo, c.options)) {
           const tags = [o.blocked && "blocked", o.requiresHuman && "needs-human"]
             .filter(Boolean)
             .join(",");
@@ -804,8 +830,98 @@ async function main(): Promise<void> {
           console.log(`     ${o.actor} :: ${o.purpose}  (score ${o.score}${tags ? ", " + tags : ""})`);
         }
         if (c.recommendedOp) console.log(`  → recommended: ${c.recommendedOp}`);
-        console.log(`  decide via MCP avcs.decision.record or the API`);
+        console.log(`  decide: avcs decide ${c.id} --choose <op-oid> --reason "…"`);
       }
+      break;
+    }
+    case "decide": {
+      // Issue #129: the counterpart to `conflicts`. Listing the decisions a human owes and
+      // giving them no way to record one left the CLI naming a debt it could not pay — the
+      // one place it demanded an action and had no verb for it, so the only way past an L2
+      // conflict was a script against the library API.
+      //
+      // The MCP tool (avcs.decision.record) additionally gates on an elicitation, because
+      // there the CALLER is an agent and the actor id is self-declared. Here the caller is
+      // the person at the keyboard, so the gate is the signature itself: the decision is
+      // signed with the actor's own local private key, which an agent that does not hold it
+      // cannot produce — and an unsigned or forged one is dropped by the reducer's trust
+      // gate, leaving the conflict open (test/decision-signing.test.ts).
+      const repo = await Repo.open(cwd);
+      const conflictId = args[1] && !args[1].startsWith("--") ? args[1] : undefined;
+      if (!conflictId)
+        throw new Error('usage: avcs decide <conflict-id> [--choose <op-oid>] [--reason "…"] [--as <actor-id>] [--policy "…"]\n  run `avcs conflicts` for the open conflicts and their options');
+
+      const scope = await scopeFor(repo, cwd, valueFlag("--view"));
+      const view = scope.line ?? "main";
+      const workspace = valueFlag("--workspace") ?? scope.workspace;
+      const { conflicts } = await repo.materialize(view, workspace ? { workspace } : undefined);
+      const matches = conflicts.filter((c) => c.id === conflictId || c.id.startsWith(conflictId));
+      if (matches.length !== 1) {
+        const open = conflicts.length
+          ? conflicts.map((c) => `  ${c.id}  @ ${c.key}`).join("\n")
+          : "  (none — nothing in this view needs a human)";
+        throw new Error(
+          `${matches.length ? `ambiguous conflict id '${conflictId}'` : `no open conflict '${conflictId}'`} in ${scopeLabel(scope)}\nopen conflicts:\n${open}`,
+        );
+      }
+      const conflict = matches[0]!;
+
+      // Identity first: a decision nobody can sign is not one worth composing. Resolution is
+      // the repo's (--as → AVCS_ACTOR → config.json → the sole held key), so this stays one
+      // chain rather than a second, shorter copy of it (issue #95).
+      const actorId = await repo.localActorId(valueFlag("--as"));
+      if (!actorId)
+        throw new Error("no actor identity to decide as — pass --as <actor-id>, set AVCS_ACTOR, record `actorId` in .avcs/config.json, or run `avcs key provision <actor-id>`");
+      const privateKey = await repo.loadLocalKey(actorId);
+      if (!privateKey)
+        throw new Error(
+          `no local signing key for ${actorId} — run \`avcs key provision ${actorId}\`\n` +
+            "  an unsigned decision is dropped by the trust gate: the conflict would stay open with nothing to show for it",
+        );
+
+      const options = await attributedOptions(repo, conflict.options);
+      const describe = (o: ConflictOption): string => `${o.opOid}\n     ${o.actor || "(unknown actor)"} :: ${o.purpose}`;
+      const choose = valueFlag("--choose");
+      if (!choose) {
+        // Deliberately NOT a prompt. A CLI verb that blocks on stdin cannot be used from a
+        // script or CI — and this one has to be, since it is the only way past a conflict.
+        // Handing back a runnable command per option is complete non-interactively, and
+        // leaves the choice reviewable before it is made.
+        throw new Error(
+          `--choose is required: name the operation that wins ${conflict.key}\n` +
+            options.map((o) => `   - ${describe(o)}\n     avcs decide ${conflict.id} --choose ${o.opOid} --reason "…"`).join("\n") +
+            (conflict.recommendedOp ? `\n  → policy's provisional recommendation: ${conflict.recommendedOp}` : ""),
+        );
+      }
+      // Abbreviations, because a human types what they read off `avcs conflicts` and these
+      // oids are 42 characters. An ambiguous prefix is refused rather than resolved to the
+      // first hit: silently deciding the wrong way is the one outcome worse than not deciding.
+      const hits = options.filter((o) => o.opOid === choose || o.opOid.startsWith(choose));
+      if (hits.length !== 1)
+        throw new Error(
+          `${hits.length ? `ambiguous --choose '${choose}'` : `no option of ${conflict.id} matches --choose '${choose}'`}\n` +
+            options.map((o) => `   - ${describe(o)}`).join("\n"),
+        );
+      const chosen = hits[0]!;
+      const rejected = options.filter((o) => o.opOid !== chosen.opOid);
+
+      // The rest of the contest is rejected, not merely un-chosen: leaving the losers
+      // unjudged would let them keep contending on the next reduce, and the same conflict
+      // would come back after the land it was supposed to unblock.
+      const oid = await repo.recordDecision({
+        conflictId: conflict.id,
+        chosenOps: [chosen.opOid],
+        rejectedOps: rejected.map((o) => o.opOid),
+        reason: valueFlag("--reason") ?? `${actorId} chose ${chosen.actor || chosen.opOid.slice(0, 16)}'s change: "${chosen.purpose}"`,
+        decidedBy: { kind: kindOfActorId(actorId), id: actorId },
+        futurePolicy: valueFlag("--policy"),
+        signWith: { keyId: actorId, privateKey },
+      });
+      console.log(`${oid} recorded — ${conflict.id} @ ${conflict.key} settled by ${actorId}`);
+      console.log(`  chose  ${chosen.actor || "(unknown actor)"} :: ${chosen.purpose}`);
+      for (const r of rejected) console.log(`  reject ${r.actor || "(unknown actor)"} :: ${r.purpose}`);
+      console.log(`\nrun \`avcs land --as ${actorId}\` to land the work this conflict was blocking`);
+      printKeystoreNotices(repo);
       break;
     }
     case "metrics": {
@@ -990,11 +1106,27 @@ async function main(): Promise<void> {
         break;
       }
       console.error(`✗ not landed (${r.reason}) after ${r.attempts} attempt(s)${r.detail ? ` — ${r.detail}` : ""}`);
-      for (const c of (r.conflicts ?? []) as { key?: string; reason?: string }[]) {
-        console.error(`  ● ${c.key ?? "?"} — ${c.reason ?? ""}`);
-      }
+      // Which conflicts to name: the local path returns full Conflict objects, the hub path
+      // only the repair packet. Both carry the contended key, and the conflict id is a pure
+      // function of it — so either shape can be pointed at a command.
+      const packet = r.packet as import("./api/repo.ts").ConflictPacket | undefined;
+      const listed = (r.conflicts ?? []) as { id?: string; key?: string; reason?: string }[];
+      const open: { id?: string; key?: string; reason?: string }[] = listed.length
+        ? listed
+        : (packet?.conflicts ?? []).map((c) => ({ key: c.key, reason: c.reason }));
+      for (const c of open) console.error(`  ● ${c.key ?? "?"} — ${c.reason ?? ""}`);
       console.error("  next:");
-      for (const a of r.nextActions) console.error(`    - ${a}`);
+      if (r.reason === "conflict") {
+        // `land`'s next actions come from the shared land loop, which speaks MCP tool names
+        // because an agent is its usual caller. A human at the CLI needs the CLI's verbs —
+        // this is the same courtesy `land` already extends to its other errors (issue #129).
+        console.error("    - avcs conflicts    (the options on each conflict, and who wrote them)");
+        for (const c of open)
+          if (c.key) console.error(`    - avcs decide ${c.id ?? conflictIdFor(c.key)} --choose <op-oid> --reason "…"`);
+        console.error("    - avcs land …       (the same command again, once the decision is recorded)");
+      } else {
+        for (const a of r.nextActions) console.error(`    - ${a}`);
+      }
       process.exitCode = 1;
       break;
     }
@@ -1019,7 +1151,9 @@ async function main(): Promise<void> {
             for (const o of c.options) console.error(`     - ${o.op.slice(0, 24)}… ${o.actor} :: ${o.purpose}`);
             for (const d of c.priorDecisions) console.error(`     ↩ precedent (${d.decidedBy}): ${d.reason}`);
           }
-          console.error(`  decide via MCP avcs.decision.record, then resubmit.`);
+          for (const c of packet?.conflicts ?? [])
+            console.error(`  decide: avcs decide ${conflictIdFor(c.key)} --choose <op-oid> --reason "…"`);
+          console.error(`  …then resubmit.`);
           process.exitCode = 1;
           break;
         }
@@ -1771,6 +1905,8 @@ async function main(): Promise<void> {
           "  key provision <actor-id> | key import <src> | key ls\n" +
           "                              machine-level signing identity (~/.avcs/private; decisions, hub writes)\n" +
           "  conflicts [view] [--workspace w]  list decisions a human owes (defaults to this branch's scope)\n" +
+          "  decide <conflict-id> [--choose <op-oid>] [--reason r] [--as <id>] [--policy p]\n" +
+          "                              record a signed decision that settles a conflict (omit --choose to see the options)\n" +
           "  import <dir> [-m msg]       import an existing tree (e.g. a git repo) as ops\n" +
           "  gc [--dry-run] [--shared]   reclaim orphan blobs + expired quarantine ops (--shared: unused build caches)\n" +
           "  pack                        fold loose objects into a packfile (blobs stay loose)\n" +
