@@ -18,6 +18,24 @@ async function requireLevel(t: Target, level: string): Promise<boolean> {
   return true;
 }
 
+/** 살아 있는 서버는 정지해 있지 않다 — 외부 URL 로 재면 다른 테스트 파일(병렬 실행)이나
+ *  실제 트래픽이 커서 뒤에 객체를 덧붙일 수 있다. "따라잡은 커서" 를 요구하는 단언은 그래서
+ *  한 번의 스냅샷이 아니라 수렴으로 잰다: 비어 있을 때까지 새 커서로 따라간다. 수렴하지
+ *  못하면 그것대로 결함이다(커서가 증분을 만들지 못한다는 뜻). */
+async function catchUp(base: string, path: "/sync" | "/events", start: number): Promise<{ cursor: number; oids: string[]; refs?: unknown }> {
+  let cursor = start;
+  for (let i = 0; i < 20; i++) {
+    const extra = path === "/events" ? "&timeoutMs=50" : "";
+    const res = await fetch(`${base}${path}?since=${cursor}${extra}`);
+    assert.equal(res.status, 200);
+    const j = await res.json() as { oids: string[]; cursor: number; refs?: unknown };
+    if (j.oids.length === 0) return j; // 이 응답이 곧 "따라잡은 커서의 빈 답" 이다 — 재요청하면 창이 다시 열린다
+    assert.ok(j.cursor > cursor, "oid 를 줬는데 커서가 안 늘면 영원히 따라잡지 못한다");
+    cursor = j.cursor;
+  }
+  assert.fail("20회 안에 따라잡지 못했다 — 커서가 증분을 만들지 못한다");
+}
+
 test("sync: GET /sync 가 oids 와 cursor 를 주고, 커서가 실제로 증분을 만든다", async () => {
   const t = await openTarget();
   try {
@@ -27,15 +45,18 @@ test("sync: GET /sync 가 oids 와 cursor 를 주고, 커서가 실제로 증분
     assert.ok(Array.isArray(first.oids), "oids 는 배열이다");
     assert.equal(typeof first.cursor, "number", "cursor 는 수다");
 
-    // 커서 뒤로 물으면 그 이후만 온다. 같은 커서로 다시 물으면 비어야 한다 —
-    // 이것이 "증분" 의 뜻이고, 안 지키면 클라이언트가 매번 전량을 받는다.
-    const again = await (await fetch(`${t.base}/sync?since=${first.cursor}`)).json() as { oids: string[]; cursor: number };
-    assert.deepEqual(again.oids, [], "커서 이후에 추가된 것이 없으면 비어야 한다");
-    assert.equal(again.cursor, first.cursor, "커서는 그대로다");
+    // 커서 뒤로 물으면 그 이후만 온다. 따라잡은 커서로 다시 물으면 비어야 한다 —
+    // 이것이 "증분" 의 뜻이고, 안 지키면 클라이언트가 매번 전량을 받는다. 살아 있는 서버는
+    // 그 사이 다른 쓰기가 있을 수 있으므로(병렬 테스트 파일, 실제 트래픽) 수렴으로 잰다.
+    const caught = await catchUp(t.base, "/sync", first.cursor);
+    assert.deepEqual(caught.oids, [], "따라잡은 커서 이후는 비어야 한다");
+    assert.ok(caught.cursor >= first.cursor, "커서는 뒤로 가지 않는다");
 
     // 범위를 벗어난 커서는 전량으로 떨어진다(docs/26 §4-2) — 정확성이 커서에 의존하지 않는다.
+    // 전량은 first 시점 이후 자랄 수 있으니 "first 를 포함하는가" 로 잰다.
     const wild = await (await fetch(`${t.base}/sync?since=999999999`)).json() as { oids: string[] };
-    assert.deepEqual(wild.oids, first.oids, "범위 밖 커서는 전량을 준다");
+    const wildSet = new Set(wild.oids);
+    assert.ok(first.oids.every((o) => wildSet.has(o)), "범위 밖 커서는 전량(그 시점까지의 모든 oid)을 준다");
   } finally {
     await t.close();
   }
@@ -115,12 +136,11 @@ test("queue: /events 는 커서를 존중하고 하트비트를 준다", async (
   const t = await openTarget();
   try {
     if (!(await requireLevel(t, "queue"))) return;
-    // 따라잡은 커서로 짧은 타임아웃을 주면 빈 목록 하트비트가 와야 한다.
+    // 따라잡은 커서로 짧은 타임아웃을 주면 빈 목록 하트비트가 와야 한다. "따라잡음" 은
+    // 살아 있는 서버에서는 수렴으로 잰다 — /events 자체가 커서를 따라간다.
     const sync = await (await fetch(`${t.base}/sync?since=0`)).json() as { cursor: number };
-    const res = await fetch(`${t.base}/events?since=${sync.cursor}&timeoutMs=300`);
-    assert.equal(res.status, 200);
-    const j = await res.json() as { cursor: number; oids: string[]; refs?: unknown };
-    assert.deepEqual(j.oids, [], "따라잡았으면 빈 목록이다");
+    const j = await catchUp(t.base, "/events", sync.cursor);
+    assert.deepEqual(j.oids, [], "따라잡았으면 빈 목록 하트비트다");
     assert.equal(typeof j.cursor, "number");
     // 매 응답이 거버넌스 ref 전체를 담는다(docs/26 §6-3) — 객체 없이 head 만 움직여도 보이게.
     assert.ok(j.refs !== undefined, "응답에 refs 가 함께 와야 한다");
