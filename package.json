@@ -88,7 +88,8 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "bench": "node --experimental-strip-types bench/materialize-bench.ts",
-    "bench:incremental": "node --experimental-strip-types bench/incremental-bench.ts"
+    "bench:incremental": "node --experimental-strip-types bench/incremental-bench.ts",
+    "conformance": "node --experimental-strip-types --import ./test/_isolate-keystore.ts --test test/conformance/*.test.ts"
   },
   "engines": {
     "node": ">=22.6"
