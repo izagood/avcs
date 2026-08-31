@@ -15,6 +15,11 @@ export type { GitMode, RemoteConfig, ContentionWarning, UndoResult, SharedPathEn
 // silently breaks interop with avcs clients. Exposed so the canonical implementation is
 // importable instead of copied. Also available as `@izagood/avcs/canonical`.
 export { canonicalize, computeOid, sha256hex } from "./core/canonical.ts";
+// The interop-safe subset (docs/24). A non-JS implementation validates its own canonicalizer
+// against `spec/canonical-vectors.json`; a JS consumer checks its own payloads with this
+// before authoring. It is the FIRST thing a third-party implementer reaches for, so leaving
+// it off the surface would stop them at line one — the same omission `RepoNotFoundError` had.
+export { assertInteropSafe } from "./core/canonical.ts";
 
 // Deterministic reduce/materialize core (also `@izagood/avcs/reducer`)
 export { reduce, snapshotReduce, reduceIncremental, keysOf, conflictIdFor, detectFileConflicts, arbitrateFileConflicts, buildOpScorer } from "./reducer/reducer.ts";
