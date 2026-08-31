@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.izagood/avcs",
+  "title": "AVCS",
+  "description": "Agentic Version Control System — an AI-native VCS where intent, operation, evidence and decision are first-class objects; agents propose, validate and land changes through 36 MCP tools.",
+  "repository": {
+    "url": "https://github.com/izagood/avcs",
+    "source": "github"
+  },
+  "version": "0.40.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@izagood/avcs",
+      "version": "0.40.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "description": "start the stdio MCP server (target repo = $AVCS_REPO, else the cwd)"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "AVCS_REPO",
+          "description": "absolute path of the AVCS repo to serve; defaults to the client cwd",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
