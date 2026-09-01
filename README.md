@@ -200,6 +200,20 @@ The keystore is `$AVCS_CONFIG_HOME`, else `$XDG_CONFIG_HOME/avcs`, else `~/.avcs
 keep its own key in `<store>/private/` to sign as a *different* actor (a CI checkout, a second
 identity); that override is read first. See [12 — Local production](docs/12-local-production.md#개인키-보관소-machine-level-keystore).
 
+Your **id** is your identity — trust, keys and governance key on it. For attribution and
+contact, set a display name and email the git way; they ride in every operation you author
+(so blame and history can show and reach you) but never gate anything:
+
+```bash
+avcs config user.name  "Ada Lovelace"
+avcs config user.email "ada@example.com"
+avcs config actor      "human:ada"      # the id commits author as (else your sole key / AVCS_ACTOR)
+avcs config                              # show what is set
+```
+
+These live in `.avcs/config.json`; `AVCS_AUTHOR_NAME` / `AVCS_AUTHOR_EMAIL` / `AVCS_ACTOR`
+override per invocation.
+
 ### Connect agents (MCP)
 
 Agents drive AVCS through its MCP server. Once `avcs` is installed, register it with the Claude Code CLI:

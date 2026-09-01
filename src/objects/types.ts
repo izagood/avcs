@@ -55,10 +55,18 @@ export interface BaseObject {
 export type ActorKind = "human" | "ai_agent" | "ci_bot";
 export interface Actor {
   kind: ActorKind;
-  /** Stable id, e.g. "human:jinbin" or "ai:claude-code". */
+  /** Stable id, e.g. "human:jinbin" or "ai:claude-code". This is IDENTITY — trust checks,
+   *  keys and governance key on it, never on the name/email below. */
   id: string;
   /** For ai_agent: model identifier. */
   model?: string;
+  /** Display name of the author, git-style (`git config user.name`). Attribution and contact
+   *  only — never identity. Optional: an actor with just an id is still valid. */
+  name?: string;
+  /** Contact email, git-style (`git config user.email`). Like `name`, this rides in the
+   *  operation content (so blame/history can show and reach the author) but is NEVER what a
+   *  trust check consults — a mismatched or absent email cannot grant or deny anything. */
+  email?: string;
 }
 
 // ── blob ────────────────────────────────────────────────────────────────────
