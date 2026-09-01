@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
 import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
+import { storeOpenTimeoutMessage, preCommitTimeoutMessage } from "./git/hookTimeoutMessage.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import { conflictIdFor } from "./reducer/reducer.ts";
 import type { Operation, Actor, Undo } from "./objects/types.ts";
@@ -1641,7 +1642,7 @@ async function main(): Promise<void> {
         failOpen(`avcs: no AVCS repo at or above ${cwd} — skipping git-hook ${phase} and letting git proceed. Run \`avcs init\` here to bridge this repo, or delete the avcs hooks in .git/hooks.`);
       const opened = await withDeadline(() => Repo.open(storeDir), hookMs);
       if (!opened.ok)
-        failOpen(`avcs: opening the store exceeded ${hookMs}ms — skipping git-hook ${phase} (#33). Another avcs process may be holding it; set AVCS_HOOK_TIMEOUT_MS=0 to wait.`);
+        failOpen(storeOpenTimeoutMessage(phase, hookMs));
       const repo = opened.value;
       switch (phase) {
         case "pre-commit": {
@@ -1656,7 +1657,7 @@ async function main(): Promise<void> {
             return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
           if (!res.ok)
-            failOpen(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
+            failOpen(preCommitTimeoutMessage(hookMs));
           const r = res.value;
           reportContention(r.contention);
           if (r.conflicts.length) {
