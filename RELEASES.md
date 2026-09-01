@@ -11,6 +11,13 @@ particular every change to the **reduce/merge algorithm** or the **operation for
   that **adds/removes/renames an `OperationKind`** or object field, is **breaking** for
   consumers that persist materialized state. It MUST be at least a **minor** bump
   (pre-1.0) — never a patch — and MUST appear here with a migration note.
+- **The release automation derives the level from the commit SUBJECT** (`.github/workflows/release.yml`):
+  `fix:`/`perf:` → patch, `feat:` → minor, `<type>!:` or `BREAKING CHANGE` → minor. So a
+  determinism-affecting change committed as a plain `fix:` gets released as a **patch**, which
+  this section forbids. Such a change MUST carry `!` in its subject (`fix(merge)!: …`) or set
+  `package.json#version` above the latest tag in the PR (the workflow's manual-override path).
+  Learned the hard way: v0.48.1 shipped a `treeHash`-changing fix as a patch because its
+  subject was `fix(merge):` — see the v0.49.0 entry.
 - The merge algorithm carries its own identity: `MERGE3_VERSION` (in `src/merge/merge3.ts`)
   flows into `MATERIALIZER_VERSION` (in `src/reducer/policy.ts`), which is stamped into
   every materialize result (`materializerVersion`) and surfaced by the hub `/` endpoint.
@@ -21,7 +28,15 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 **Fixed (determinism) — a pure deletion no longer leaves a blank line behind.
 `MERGE3_VERSION` `text3/0.3.0` → `text3/0.3.1`. This CHANGES `treeHash` for any op set that
-contains a pure deletion, so it needs at least a MINOR bump. Migration note below.**
+contains a pure deletion.**
+
+**Version note, honestly: the code shipped in `v0.48.1` as a PATCH, which this file forbids.**
+The automation derives the level from the commit subject, and the fix was committed as
+`fix(merge):` rather than `fix(merge)!:`. `v0.49.0` re-publishes the same code under a correct
+MINOR boundary — if you are already on `v0.48.1` you have the fix, and the version number is
+the only difference. **Do not use the version number alone to decide whether you are across
+the boundary; use `materializerVersion`** (`text3/0.3.0` before, `text3/0.3.1` after), which is
+stamped on every materialize result precisely because it cannot drift from the algorithm.
 
 - `merge3` was not the identity on a single variant: a span the variant deleted entirely came
   back as ONE BLANK LINE. `renderSpan` returned joined text and the caller re-split it, but
