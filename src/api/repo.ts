@@ -827,6 +827,46 @@ export class Repo {
     }
     return actorId;
   }
+
+  /**
+   * The local author for a new operation — id plus git-style name/email. The id resolves by
+   * the usual chain (explicit → AVCS_ACTOR → config.actorId → sole key); name and email
+   * resolve independently by the SAME shape (explicit → AVCS_AUTHOR_NAME/EMAIL →
+   * config.authorName/authorEmail), because a person's display name and contact are set once
+   * per machine/repo like `git config user.name`/`user.email`, not passed per commit.
+   *
+   * name/email are attribution and contact only — they ride in the operation content so
+   * blame and history can show and reach the author, and are NEVER consulted by a trust
+   * check. Returns undefined id when nothing resolves (the caller decides if that is fatal).
+   */
+  async localAuthor(explicit?: { id?: string; name?: string; email?: string }): Promise<Actor | undefined> {
+    const id = await this.localActorId(explicit?.id);
+    if (id === undefined) return undefined;
+    const cfg = await this.#readConfig();
+    const name = explicit?.name ?? process.env.AVCS_AUTHOR_NAME ?? (typeof cfg.authorName === "string" ? cfg.authorName : undefined);
+    const email = explicit?.email ?? process.env.AVCS_AUTHOR_EMAIL ?? (typeof cfg.authorEmail === "string" ? cfg.authorEmail : undefined);
+    return {
+      kind: kindOfActorId(id),
+      id,
+      ...(name !== undefined && name !== "" ? { name } : {}),
+      ...(email !== undefined && email !== "" ? { email } : {}),
+    };
+  }
+
+  /** Persist a config.json value (author identity, git mode, …). A thin, git-config-like
+   *  setter over the same aux file the readers use. Deleting is passing undefined. */
+  async setConfigValue(key: "actorId" | "authorName" | "authorEmail", value: string | undefined): Promise<void> {
+    const cfg = await this.#readConfig();
+    if (value === undefined || value === "") delete cfg[key];
+    else cfg[key] = value;
+    await this.store.writeAux("config.json", JSON.stringify(cfg, null, 2) + "\n");
+  }
+
+  /** Read a config.json value (or undefined). */
+  async getConfigValue(key: string): Promise<string | undefined> {
+    const v = (await this.#readConfig())[key];
+    return typeof v === "string" ? v : undefined;
+  }
   /**
    * Provision an owner key: mint a keypair, register the public half as trusted, and
    * store the private half in the LOCAL keystore so the MCP server can sign the
