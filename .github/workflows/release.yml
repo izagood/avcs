@@ -24,6 +24,13 @@ name: release
 # mid-flight with no manual cleanup. main is unprotected, so the bot can push the
 # bump commit + tag directly.
 #
+# `concurrency` below serializes release RUNS, but the push-back races something it
+# cannot hold back: a MERGE into main while this run is publishing. main is then
+# ahead, `git push` is rejected non-fast-forward, and the release stops one step from
+# done. So the push-back rebases the one-commit bump onto whatever landed and retries
+# — a merge that arrives mid-release is the normal case, not an error, and no one
+# should have to pace their merges around this workflow.
+#
 # Publishing requires an `NPM_TOKEN` repo secret (npm automation token with
 # publish rights to the @izagood scope). `npm publish` runs `prepublishOnly`
 # (typecheck + test + build), so a release can only ship green, freshly-built
@@ -116,17 +123,35 @@ jobs:
 
       - name: Commit the version bump back to main (if it lags)
         if: steps.v.outputs.release == 'true'
+        env:
+          BRANCH: ${{ github.ref_name }}
+          TAG: ${{ steps.v.outputs.tag }}
+          TARGET: ${{ steps.v.outputs.target }}
         run: |
           set -eu
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain package.json package-lock.json)" ]; then
-            git add package.json package-lock.json
-            git commit -m "release: ${{ steps.v.outputs.tag }} [skip ci]"
-            git push origin "HEAD:${{ github.ref_name }}"
-          else
-            echo "::notice::package.json already at ${{ steps.v.outputs.target }} — nothing to commit."
+          if [ -z "$(git status --porcelain package.json package-lock.json)" ]; then
+            echo "::notice::package.json already at $TARGET — nothing to commit."
+            exit 0
           fi
+          git add package.json package-lock.json
+          git commit -m "release: $TAG [skip ci]"
+          # A merge landing on $BRANCH while we published is expected, not a failure. The bump
+          # is one commit touching two files, so rebasing it onto what landed is always the
+          # right answer; anything else (force, --ours) would discard someone's merge.
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            echo "::notice::push rejected (attempt $attempt) — $BRANCH moved; rebasing the bump onto it."
+            git fetch origin "$BRANCH"
+            # A conflict here means two releases raced on package.json — that needs a human,
+            # and `set -e` stops the step loudly instead of guessing.
+            git rebase "origin/$BRANCH"
+          done
+          echo "::error::could not push $TAG after 5 attempts — $BRANCH is moving faster than the release."
+          exit 1
 
       - name: Tag the release commit (if absent)
         if: steps.v.outputs.release == 'true'
