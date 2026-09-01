@@ -85,6 +85,27 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   의존하지 않고, 무효화 트리거(gc 삭제·redaction/pull의 바이트 덮어쓰기)에서만 비움. **측정(N=3000): +1op
   708→220ms(3.2x), warm 333→92ms(3.6x), cold 변화 없음.** 잔여 220ms는 디스크 IO가 아닌 **여러 O(N) 컴퓨트
   패스**(sig 빌드·reliability·2-pass ancestry·reduce). warm==cold 동치를 저작·gc·redaction에 대해 테스트.
+- **A6d — op-log 레코드(뷰가 안 쓸 op 를 읽지 않는다).** ✅ #164. op-log 한 줄이 bare oid 였는데,
+  `materialize` 가 거부하는 두 필드(`op.line`·`op.workspace`)와 Lamport 재시드가 원하는
+  `lamport` 를 함께 적는다: `<oid>\t<lamport>\t<line>\t<workspace>` (line·workspace 는 구분자
+  이스케이프). 그래서 뷰가 버릴 op 는 **읽지도 디코드하지도 않는다.**
+  - **프리필터일 뿐 권위가 아니다** — 본문 단계 필터가 그대로 최종 판정을 한다. 프리필터를
+    무력화해도 결과가 같다는 것을 테스트로 고정했다(그때 성능 테스트만 빨개진다).
+  - **마이그레이션은 append-only.** 로그는 oid 로 dedup 하고 **첫 등장**이 순서를 정하므로,
+    이미 bare 줄로 있는 oid 의 레코드를 그냥 덧붙이면 순서는 옛 줄에서·메타데이터는 새 줄에서
+    온다. 재작성이 없으니 다른 프로세스의 append 를 잃지 않고 first-write order 도 안 건드린다.
+    레거시 로그를 읽어야 했던 materialize 가 그 자리에서 채운다(best-effort).
+  - `#maxLamportSeen` 도 로그만 읽는다(객체 0회). 예전에는 **lamport 하나를 발급하는 비용이
+    전체 이력에 비례**했다 — materialize 가 캐시를 데워 놓아 가려져 있었을 뿐이다.
+  - `#inheritedOps` 는 fork frontier 에서 닿는 것만 읽는다(전체 op 를 인덱싱하려고 받던 인자 제거).
+  - 인과 완결성 검사의 `present` 는 후보와 그 직접 dep 에 대해서만 존재 확인한다.
+  - **측정(operation 14,339 / 91MB, cold disk, 2회 교차):** op 읽기 **14,339 → 429**,
+    cold materialize **1385·1392ms → 325·380ms**. treeHash 동일(`4478f0c4…`, 파일 76).
+- **A6e — 스냅샷 거부가 보이게.** ✅ #165. `snapshot.cold.rejected` 가 카운터만 올렸다.
+  거부는 설계된 무효화지만, 그 뒤로 그 뷰는 cold start 마다 full reduce 다 —
+  그리고 `AUTO_COMPACT_DELTA` 미만인 뷰는 베이스를 다시 만들지 않는다(필요가 없으므로).
+  카운터만으로는 그 상태와 "이 저장소는 베이스가 필요 없다" 가 구별되지 않았다. 이유를 로그에 적는다.
+  (조사 중 확인: auto-compaction 자체는 정상 동작한다 — 뷰가 256 op 를 넘으면 영속한다.)
 - **A6c — cold 경로(open 순회 제거 + tail 병렬 읽기).** ✅ A6가 남긴 "cold 변화 없음"을 닫는다.
   (1) `Repo.open`이 Lamport 시드를 위해 `list("operation")` 전체를 읽고 버리던 것을 제거 — 시드는 propose
   직전 `#maxLamportSeen`이 이미 하고 있어 중복이었고(13.2), 정확성은 애초에 시드에 비의존(oid tie-break).
