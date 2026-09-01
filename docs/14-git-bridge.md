@@ -59,6 +59,10 @@ git pull                    # post-merge: reindex(op-log 재구축) + 재투영 
 git worktree add ../feat -b feat   # post-checkout: 새 working tree를 메인 스토어에 attach
 ```
 
+- pre-commit의 re-stage는 **인덱스가 고른 범위 안에서만** 일어난다(#149). `git add <path>`로 일부만
+  올렸다면 그 커밋에는 그 경로만 들어간다 — 스테이징하지 않은 편집은 워킹트리에 그대로 남는다.
+  브리지는 정규 내용을 커밋에 반영할 뿐, 커밋의 범위를 넓히지 않는다. 캡처는 별개다: 스토어에는
+  워킹트리 전체가 op으로 들어가므로, 커밋에 없는 편집도 감사 이력에서는 누락되지 않는다.
 - 열린(needs-human) 충돌이 있으면 pre-commit이 커밋을 **중단**한다. `avcs conflicts`로 선택지를 보고 `avcs decide <conflict-id> --choose <op-oid>`로 결정을 기록한 뒤 다시 커밋.
 - `git commit --no-verify`는 훅을 건너뛴다(그 경우 AVCS 캡처가 누락됨 — 피할 것).
 - 하위 디렉터리에서 `avcs init` 하면 훅을 설치하지 **않는다**(#133). 훅은 위로 올라가 바깥 레포의 `.git/hooks`에 붙는데 스토어는 아래에 있어, 그 레포의 모든 커밋이 스토어를 못 찾고 죽기 때문이다. 이미 그렇게 설치된 훅을 위해 훅 쪽도 완화했다 — 스토어를 못 찾으면 타임아웃과 똑같이 **fail open**(경고 후 커밋 통과). 충돌 게이트 등 다른 거부는 그대로 커밋을 막는다.
