@@ -85,6 +85,15 @@ reliability + 불변 policy/intent)에만 의존. 위 dirty 규칙이 이 입력
   의존하지 않고, 무효화 트리거(gc 삭제·redaction/pull의 바이트 덮어쓰기)에서만 비움. **측정(N=3000): +1op
   708→220ms(3.2x), warm 333→92ms(3.6x), cold 변화 없음.** 잔여 220ms는 디스크 IO가 아닌 **여러 O(N) 컴퓨트
   패스**(sig 빌드·reliability·2-pass ancestry·reduce). warm==cold 동치를 저작·gc·redaction에 대해 테스트.
+- **A6c — cold 경로(open 순회 제거 + tail 병렬 읽기).** ✅ A6가 남긴 "cold 변화 없음"을 닫는다.
+  (1) `Repo.open`이 Lamport 시드를 위해 `list("operation")` 전체를 읽고 버리던 것을 제거 — 시드는 propose
+  직전 `#maxLamportSeen`이 이미 하고 있어 중복이었고(13.2), 정확성은 애초에 시드에 비의존(oid tie-break).
+  읽기 전용 소비자가 이력 크기만큼 내던 비용이 사라진다. (2) `#allOpsTailed`가 oid마다 `has`+`get`을 하나씩
+  await하던 직렬 루프를 `mapLimit`(bounded fan-out, `Repo.OP_READ_CONCURRENCY`)로 교체 — oid는 미리 알고
+  각 읽기는 독립이므로 직렬성에 이득이 없었고, cold materialize 벽시계의 대부분이 여기서 대기였다.
+  GC된 op-log 엔트리 skip은 `has` 대신 ENOENT로 판별(디코드 실패는 삼키지 않고 throw).
+  **측정(14.3k op, 91MB, warm page cache): open 1.5s→1ms, 합계 3.1s→0.69s (4.5x).**
+  op-log 순서(첫 기록 순)와 cold≡warm treeHash를 테스트로 고정.
 - **A6b — reduceIncremental opt-in 배선 + 자가검증 가드.** ✅ 메인 `materialize`가 `AVCS_INCREMENTAL=1`일 때
   마지막 스냅샷에서 delta만 `reduceIncremental`(전제 미충족 시 full `snapshotReduce` fallback). 키 불필요 —
   reduceIncremental은 **임의 append-superset에 정확**(하니스 증명)하고 아니면 throw→fallback. 서브셋 reducer
