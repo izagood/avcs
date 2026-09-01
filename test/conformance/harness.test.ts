@@ -84,3 +84,51 @@ test("능력을 광고하지 않는 서버는 상위 레벨이 적용 대상에�
     await t.close();
   }
 });
+
+test("게이트된 서버: 자격 env 가 있으면 쓰기 검사가 실제로 잰다 — 없으면 401 조기 반환 경로", async () => {
+  // 참조 구현을 gated 로 띄우고 멤버 키를 등록한 뒤, writeHeaders 로 서명해 밀어 본다.
+  // 이것이 초록이어야 "스위트가 게이트된 상용 배포도 잴 수 있다" 가 성립한다.
+  const { generateKeypair } = await import("../../src/core/identity.ts");
+  const { ObjectStore } = await import("../../src/store/objectStore.ts");
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { startHub } = await import("../../src/hub/hubServer.ts");
+  const { writeHeaders } = await import("./target.ts");
+
+  const dir = await mkdtemp(join(tmpdir(), "avcs-conf-gated-"));
+  const kp = generateKeypair();
+  const store = new ObjectStore(dir);
+  await store.init();
+  const memberOid = await store.put({ type: "membership", actorId: "human:ci", role: "maintainer", status: "active", publicKey: kp.publicKey, grantedBy: "human:ci", grantedAt: new Date().toISOString() } as never);
+  await store.setRef("member:human:ci", memberOid);
+  const hub = await startHub({ repoDir: dir, gated: true, auth: { required: true } });
+
+  const saved = {
+    keyId: process.env.AVCS_CONFORMANCE_KEYID,
+    key: process.env.AVCS_CONFORMANCE_PRIVATE_KEY,
+    file: process.env.AVCS_CONFORMANCE_PRIVATE_KEY_FILE,
+  };
+  try {
+    const body = JSON.stringify({ type: "intent", title: "gated write", owner: "human:ci", status: "open" });
+
+    // 음성 대조 — 자격 없이 밀면 401 (쓰기 검사들이 조기 반환하는 바로 그 경로)
+    delete process.env.AVCS_CONFORMANCE_KEYID;
+    delete process.env.AVCS_CONFORMANCE_PRIVATE_KEY;
+    delete process.env.AVCS_CONFORMANCE_PRIVATE_KEY_FILE;
+    const bare = await fetch(`${hub.url}/objects`, { method: "POST", headers: writeHeaders(hub.url, "POST", "/objects", body), body });
+    assert.equal(bare.status, 401, "자격 없는 쓰기는 401 — 조기 반환 경로");
+
+    // 양성 — env 자격으로 서명하면 잰다
+    process.env.AVCS_CONFORMANCE_KEYID = "human:ci";
+    process.env.AVCS_CONFORMANCE_PRIVATE_KEY = kp.privateKey;
+    const signed = await fetch(`${hub.url}/objects`, { method: "POST", headers: writeHeaders(hub.url, "POST", "/objects", body), body });
+    assert.equal(signed.status, 200, `서명된 쓰기는 저장돼야 한다: ${await signed.clone().text()}`);
+  } finally {
+    if (saved.keyId === undefined) delete process.env.AVCS_CONFORMANCE_KEYID; else process.env.AVCS_CONFORMANCE_KEYID = saved.keyId;
+    if (saved.key === undefined) delete process.env.AVCS_CONFORMANCE_PRIVATE_KEY; else process.env.AVCS_CONFORMANCE_PRIVATE_KEY = saved.key;
+    if (saved.file === undefined) delete process.env.AVCS_CONFORMANCE_PRIVATE_KEY_FILE; else process.env.AVCS_CONFORMANCE_PRIVATE_KEY_FILE = saved.file;
+    await hub.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
