@@ -51,7 +51,7 @@ if (cmd === "--help" || cmd === "-h") cmd = "help";
  */
 const VALUED_FLAGS = new Set([
   "--as", "--at", "--author", "--cache", "--choose", "--freshness-ms", "--key", "--key-from",
-  "--kind", "--line", "--max-attempts", "--message", "--mode", "--out", "--policy", "--port",
+  "--intent", "--kind", "--line", "--max-attempts", "--message", "--mode", "--out", "--policy", "--port",
   "--profile", "--reason", "--remote", "--repo", "--scope", "--to", "--view", "--workspace",
   "-m", "-s",
 ]);
@@ -82,6 +82,22 @@ if (cmd && cmd !== "help" && asksForHelp()) cmd = "help";
 function flag(name: string): string | undefined {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
+}
+
+/**
+ * The intent a capture should JOIN, when one was already declared (issue #167).
+ *
+ * Two ways in because the two capture paths can reach different things: a person or agent
+ * typing the command passes `--intent`, while `git commit` runs the hook with an argv this
+ * CLI does not control, leaving the environment as the only channel. Flag over env is the
+ * same precedence `--author` has over `AVCS_AUTHOR`.
+ *
+ * Spread into the options — `{}` when nothing was declared — so the default path reaches the
+ * core exactly as it did before, and keeps opening an intent of its own.
+ */
+function declaredIntent(): { intentOid?: string } {
+  const oid = flag("--intent") ?? process.env.AVCS_INTENT;
+  return oid ? { intentOid: oid } : {};
 }
 
 /**
@@ -1377,7 +1393,7 @@ async function main(): Promise<void> {
     case "commit": {
       const repo = await Repo.open(cwd);
       const message = flag("-m") ?? flag("--message");
-      if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>] [--allow-mass-delete]");
+      if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>] [--intent <oid>] [--allow-mass-delete]");
       // localAuthor 가 id + git 스타일 name/email 을 config/env 체인에서 해석한다.
       const author = (await repo.localAuthor({ id: flag("--author") })) ?? { kind: "human" as const, id: "human:cli" };
       // Same branch → scope mapping as the git bridge, so a capture is in the same place
@@ -1385,7 +1401,7 @@ async function main(): Promise<void> {
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
       const r = await repo.commitWorkingTree(cwd, {
-        message, actor: author, ...scope,
+        message, actor: author, ...scope, ...declaredIntent(),
         allowMassDelete: args.includes("--allow-mass-delete"),
       });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
@@ -1483,11 +1499,11 @@ async function main(): Promise<void> {
     case "git-sync": {
       const repo = await Repo.open(storeDirFor(cwd));
       const message = flag("-m") ?? flag("--message");
-      if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--no-add]");
+      if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--intent <oid>] [--no-add]");
       const author = (await repo.localAuthor({ id: flag("--author") })) ?? { kind: "human" as const, id: "human:cli" };
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
-      const r = await repo.gitSync({ message, actor: author, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+      const r = await repo.gitSync({ message, actor: author, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd) });
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
@@ -1695,7 +1711,7 @@ async function main(): Promise<void> {
             // captures into that branch's workspace, where it stays isolated until it lands.
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
           if (!res.ok)
             failOpen(preCommitTimeoutMessage(hookMs));
@@ -1777,7 +1793,7 @@ async function main(): Promise<void> {
             const outcome = await landMergedWorkspace(repo, cwd);
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd) });
             return { outcome, scope, sync };
           }, hookMs);
           if (!res.ok) failOpen(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
@@ -2047,14 +2063,16 @@ async function main(): Promise<void> {
           "  unbundle <file>             import a bundle into this repo\n" +
           "  checkout [view] [--at <cp>] write the view's files into the working dir\n" +
           "                              --at pins it to a checkpoint (what a CI job needs)\n" +
-          "  commit -m <msg> [--author id]  author ops for working-tree changes\n" +
+          "  commit -m <msg> [--author id] [--intent <oid>]  author ops for working-tree changes\n" +
+          "                              --intent joins an intent already declared (else one is opened per commit);\n" +
+          "                              AVCS_INTENT does the same for the git-hook path\n" +
           "  undo [--last | <op-oid>…] [--purge] [--no-git] [--reason r]  drop local ops from the view;\n" +
           "                              --purge also evicts the bytes they uniquely reference (irreversible),\n" +
           "                              and in a git repo removes the commit(s) holding them too — only when\n" +
           "                              nothing is pushed, they are at the tip, and no other work would be\n" +
           "                              lost. Otherwise it says what is left. --no-git skips the git half.\n" +
           "                              Refuses once the ops have been pushed — that case is `redact` (admin)\n" +
-          "  git-sync -m <msg> [--commit]   capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
+          "  git-sync -m <msg> [--commit] [--intent <oid>]  capture edits → checkpoint → reproject → git add (--commit: also commit w/ trailer)\n" +
           "  git-mode [sidecar|committed]   show/set how AVCS history relates to git\n" +
           "  verify-git [<commit>]       check a git commit is a faithful projection of its AVCS checkpoint\n" +
           "  install-hooks [--force]     install git hooks so `git commit`/`pull` auto-sync AVCS\n" +

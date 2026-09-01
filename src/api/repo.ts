@@ -929,6 +929,28 @@ export class Repo {
     return this.store.put(intent);
   }
 
+  /**
+   * Refuse an `--intent` / `AVCS_INTENT` value that is not a usable intent oid (issue #167).
+   *
+   * Both failures are input mistakes a caller can fix, and both would otherwise surface as
+   * something unreadable: a missing oid reaches the store as a bare ENOENT, and an oid of the
+   * wrong type would author ops under an object that is not an intent at all — a session oid
+   * is the easy confusion, since callers hold both.
+   */
+  async #assertIntent(oid: string): Promise<void> {
+    if (!(await this.store.has(oid))) {
+      throw new Error(
+        `no such intent: ${oid}\n  check the oid passed as --intent (or AVCS_INTENT), or drop it to open a fresh intent for this commit`,
+      );
+    }
+    const obj = await this.store.get(oid);
+    if (obj.type !== "intent") {
+      throw new Error(
+        `${oid} is a ${obj.type}, not an intent — --intent (or AVCS_INTENT) takes the oid of an intent`,
+      );
+    }
+  }
+
   async startSession(args: {
     intentOid: string;
     actor: Actor;
@@ -3974,6 +3996,11 @@ export class Repo {
       line?: string;
       workspace?: string;
       ignorePredicate?: (rel: string) => boolean;
+      /** JOIN an intent that was already declared (issue #167) instead of opening a new one.
+       *  Intent is the object that carries WHY; minting a fresh one per capture collapses
+       *  that back into the commit message, which is the WHAT. Omitted, the behaviour is
+       *  unchanged: a capture with no declared intent opens one titled with its message. */
+      intentOid?: string;
       /** Author a deletion that covers (almost) the whole tree. Off by default — see
        *  {@link MassDeleteError} for why that is not paranoia. */
       allowMassDelete?: boolean;
@@ -4053,6 +4080,9 @@ export class Repo {
     for (const path of [...added, ...modified, ...renamed.map((r) => r.to)].sort()) {
       await this.#assertCapturable(path, disk.get(path)!);
     }
+    // Same rule for a declared intent: check it out here, where nothing has been authored
+    // yet, rather than inside the batch where a throw would already have staged ops.
+    if (opts.intentOid) await this.#assertIntent(opts.intentOid);
 
     // The whole authoring section runs STAGED (store.batched, #33): each propose below is
     // blob put + op put + index appends, which serially fsync'd per file — a 100-file commit
@@ -4060,7 +4090,7 @@ export class Repo {
     // group-commit at the end; a throw mid-way (MassDeleteError, a capture guard) now leaves
     // NOTHING on disk instead of a partial commit.
     return this.store.batched(async () => {
-    const intent = await this.createIntent({ title: opts.message, owner: opts.actor.id });
+    const intent = opts.intentOid ?? (await this.createIntent({ title: opts.message, owner: opts.actor.id }));
     const sess = await this.startSession({ intentOid: intent, actor: opts.actor });
     const deps = res.headOps;
     // Collect the early warnings each propose raises, de-duplicated per entity key.
@@ -4318,7 +4348,7 @@ export class Repo {
    * Git invocation (`git add`) is intentionally left to the caller/CLI so this core stays
    * git-agnostic; `.avcs/.gitignore` (ensured here) makes a plain `git add -A` mode-correct.
    */
-  async gitSync(opts: { message: string; actor: Actor; line?: string; workspace?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean }): Promise<{
+  async gitSync(opts: { message: string; actor: Actor; line?: string; workspace?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean; intentOid?: string }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; renamed: { from: string; to: string }[]; intent: string };
     /** Cross-line early warnings the capture raised (docs/17 §15.3): another branch/session
@@ -4340,7 +4370,7 @@ export class Repo {
     // this working tree oscillate between two different trees.
     const wsOpt = opts.workspace ? { workspace: opts.workspace } : undefined;
     // 1. Capture direct working-tree edits as ops before anything else.
-    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(wsOpt ?? {}), ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}) });
+    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(wsOpt ?? {}), ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}), ...(opts.intentOid ? { intentOid: opts.intentOid } : {}) });
     const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, renamed: cap.renamed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
