@@ -23,7 +23,12 @@
 // callback that answers from the policy engine's score, so a verified change can no longer
 // lose a region to an unverified one. An op set whose hunks never overlap produces no
 // ConflictRegion, never calls the arbiter, and materializes byte-identically.
-export const MERGE3_VERSION = "text3/0.3.0";
+// 0.3.1 — pure deletions no longer leave a blank line. `renderSpan` returns lines instead of
+// joined text: `"".split("\n")` is `[""]`, so a fully deleted span used to materialize as one
+// empty line. An op set whose changes are all replacements/insertions is byte-identical either
+// way; one containing a pure deletion materializes DIFFERENTLY (correctly) now, so the stamp
+// moves — a replica on the older substrate must not silently disagree about that tree.
+export const MERGE3_VERSION = "text3/0.3.1";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
@@ -186,40 +191,46 @@ export function merge3(base: string, variants: string[], opts: Merge3Opts = {}):
     cursor = cl.start;
 
     const sidesInCluster = [...new Set(cl.members.flatMap((m) => m.sides))].sort((a, b) => a - b);
-    // Each side's rendering of the cluster's base span [cl.start, cl.end).
-    const renders = new Map<string, number[]>(); // text → contributing sides
+    // Each side's rendering of the cluster's base span [cl.start, cl.end), as LINES.
+    // The key must distinguish zero lines from one empty line, so it carries the count —
+    // joined text alone cannot ("" is both).
+    const renders = new Map<string, { lines: string[]; sides: number[] }>();
     for (const side of sidesInCluster) {
-      const txt = renderSpan(baseLines, cl.start, cl.end, cl.members.filter((m) => m.sides.includes(side)));
-      const e = renders.get(txt);
-      if (e) e.push(side);
-      else renders.set(txt, [side]);
+      const lines = renderSpan(baseLines, cl.start, cl.end, cl.members.filter((m) => m.sides.includes(side)));
+      const key = `${lines.length}:${joinLines(lines)}`;
+      const e = renders.get(key);
+      if (e) e.sides.push(side);
+      else renders.set(key, { lines, sides: [side] });
     }
-    const distinctRenders = [...renders.entries()];
+    const distinctRenders = [...renders.values()];
 
     if (distinctRenders.length === 1) {
       // Agreement (or a single contributing variant): apply the change.
-      out.push(...splitLines(distinctRenders[0]![0]));
+      out.push(...distinctRenders[0]!.lines);
     } else {
       // Genuine contention: offer the options and let the caller's arbiter decide. Undecided
       // ⇒ record a conflict and emit either base or the first option.
       const mergedStart = out.length;
+      // `ConflictOption.text` stays joined text (public shape), but we keep the lines beside
+      // it so an arbitrated deletion emits zero lines instead of one blank one.
       const options = distinctRenders
-        .map(([text, sides]) => ({ sides: sides.sort((a, b) => a - b), text }))
+        .map(({ lines, sides }) => ({ sides: sides.sort((a, b) => a - b), text: joinLines(lines), lines }))
         .sort((a, b) => Math.min(...a.sides) - Math.min(...b.sides));
       const region: ConflictRegion = {
         baseStart: cl.start,
         baseEnd: cl.end,
         base: joinLines(baseLines.slice(cl.start, cl.end)),
         mergedStart,
-        options,
+        options: options.map(({ sides, text }) => ({ sides, text })),
       };
       const pick = opts.arbitrate?.(region) ?? null;
       const decided = pick !== null && Number.isInteger(pick) && pick >= 0 && pick < options.length;
       if (decided) {
-        out.push(...splitLines(options[pick]!.text));
+        out.push(...options[pick]!.lines);
       } else {
-        const emit = onConflict === "first" ? options[0]!.text : joinLines(baseLines.slice(cl.start, cl.end));
-        out.push(...splitLines(emit));
+        // Base is already lines — no round trip through text here either.
+        const emit = onConflict === "first" ? options[0]!.lines : baseLines.slice(cl.start, cl.end);
+        out.push(...emit);
         conflicts.push(region);
       }
     }
@@ -234,8 +245,13 @@ export function merge3(base: string, variants: string[], opts: Merge3Opts = {}):
  * Render one variant's version of base span [start,end): apply that variant's hunks
  * (already restricted to this cluster) onto base[start:end). Hunks are non-overlapping
  * within a single variant, so a left-to-right splice is exact.
+ *
+ * Returns LINES, not joined text. A span that a variant deletes entirely renders as zero
+ * lines, and `""` cannot say that — `"".split("\n")` is `[""]`, one empty line. Round-tripping
+ * through a string turned every pure deletion into "replace with one blank line" (the blank
+ * lines then accumulated on every reprojection).
  */
-function renderSpan(baseLines: string[], start: number, end: number, members: Hunk[]): string {
+function renderSpan(baseLines: string[], start: number, end: number, members: Hunk[]): string[] {
   const sorted = [...members].sort((a, b) => a.start - b.start);
   const out: string[] = [];
   let cur = start;
@@ -246,7 +262,7 @@ function renderSpan(baseLines: string[], start: number, end: number, members: Hu
     cur = Math.max(cur, Math.min(h.end, end));
   }
   for (let i = cur; i < end; i++) out.push(baseLines[i]!);
-  return joinLines(out);
+  return out;
 }
 
 /**
