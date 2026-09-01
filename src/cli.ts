@@ -618,6 +618,39 @@ async function main(): Promise<void> {
       console.log(`avcs ${pkgVersion()}`);
       break;
     }
+    case "config": {
+      // git config user.name / user.email 의 대응. name/email 은 저자 귀속·연락용이지
+      // 정체가 아니다(정체는 actorId). actorId 도 여기서 볼 수 있다.
+      const KEYS: Record<string, "actorId" | "authorName" | "authorEmail"> = {
+        "actor": "actorId", "actorid": "actorId",
+        "user.name": "authorName", "author.name": "authorName", "authorname": "authorName", "name": "authorName",
+        "user.email": "authorEmail", "author.email": "authorEmail", "authoremail": "authorEmail", "email": "authorEmail",
+      };
+      const rawKey = args[1];
+      const canon = rawKey ? KEYS[rawKey.toLowerCase()] : undefined;
+      if (!rawKey || !canon) {
+        // No/unknown key → list what is set.
+        const repo = await Repo.open(cwd);
+        for (const k of ["actorId", "authorName", "authorEmail"] as const) {
+          const v = await repo.getConfigValue(k);
+          if (v !== undefined) console.log(`${k} = ${v}`);
+        }
+        if (rawKey && !canon) throw new Error(`unknown config key "${rawKey}" — try user.name, user.email, or actor`);
+        break;
+      }
+      const repo = await Repo.open(cwd);
+      const value = args[2] && !args[2].startsWith("--") ? args[2] : undefined;
+      if (value === undefined && !args.includes("--unset")) {
+        // Read one key.
+        const v = await repo.getConfigValue(canon);
+        if (v !== undefined) console.log(v);
+        break;
+      }
+      await repo.setConfigValue(canon, args.includes("--unset") ? undefined : value);
+      console.log(args.includes("--unset") ? `unset ${canon}` : `${canon} = ${value}`);
+      break;
+    }
+
     case "init": {
       const dir = args[1] && !args[1].startsWith("--") ? args[1] : cwd;
       // A linked working tree whose main checkout already has a store almost never wants a
@@ -1228,13 +1261,13 @@ async function main(): Promise<void> {
       const src = args[1];
       if (!src) throw new Error("usage: avcs import <source-dir> [-m message] [--author id]");
       const message = flag("-m") ?? flag("--message") ?? `import ${src}`;
-      const author = flag("--author") ?? "human:cli";
+      const author = (await repo.localAuthor({ id: flag("--author") })) ?? { kind: "human" as const, id: "human:cli" };
       // Apply the repo's ignore rules, as `git-sync` already does (issue #48). Without this
       // the same tree captured very differently depending on which command you reached for —
       // `import` pulled node_modules/ and dist/ into history.
       const r = await repo.commitWorkingTree(src, {
         message,
-        actor: { kind: "human", id: author },
+        actor: author,
         ignorePredicate: gitIgnorePredicate(src),
       });
       console.log(`imported ${r.ops.length} file(s) from ${src} (${r.added.length} new)`);
@@ -1303,13 +1336,14 @@ async function main(): Promise<void> {
       const repo = await Repo.open(cwd);
       const message = flag("-m") ?? flag("--message");
       if (!message) throw new Error("usage: avcs commit -m <message> [--author <id>] [--line <line>] [--allow-mass-delete]");
-      const author = flag("--author") ?? "human:cli";
+      // localAuthor 가 id + git 스타일 name/email 을 config/env 체인에서 해석한다.
+      const author = (await repo.localAuthor({ id: flag("--author") })) ?? { kind: "human" as const, id: "human:cli" };
       // Same branch → scope mapping as the git bridge, so a capture is in the same place
       // whichever command made it. Outside git this resolves to the base view, as before.
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
       const r = await repo.commitWorkingTree(cwd, {
-        message, actor: { kind: "human", id: author }, ...scope,
+        message, actor: author, ...scope,
         allowMassDelete: args.includes("--allow-mass-delete"),
       });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
@@ -1408,10 +1442,10 @@ async function main(): Promise<void> {
       const repo = await Repo.open(storeDirFor(cwd));
       const message = flag("-m") ?? flag("--message");
       if (!message) throw new Error("usage: avcs git-sync -m <message> [--commit] [--author <id>] [--line <line>] [--no-add]");
-      const author = flag("--author") ?? "human:cli";
+      const author = (await repo.localAuthor({ id: flag("--author") })) ?? { kind: "human" as const, id: "human:cli" };
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
-      const r = await repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+      const r = await repo.gitSync({ message, actor: author, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
       for (const p of r.captured.added) console.log(`  A ${p}`);
       for (const p of r.captured.modified) console.log(`  M ${p}`);
       for (const p of r.captured.removed) console.log(`  D ${p}`);
@@ -1592,7 +1626,7 @@ async function main(): Promise<void> {
         process.exit(0);
       }
 
-      const author = process.env.AVCS_AUTHOR ?? "human:cli";
+      const authorId = process.env.AVCS_AUTHOR ?? "human:cli";
       // cwd is the working tree (possibly a linked git worktree); the store may live in
       // the main checkout. Opening the store can itself block under contention, so bound it.
       const storeDir = storeDirFor(cwd);
@@ -1619,7 +1653,7 @@ async function main(): Promise<void> {
             // captures into that branch's workspace, where it stays isolated until it lands.
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            return repo.gitSync({ message, actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
           }, hookMs);
           if (!res.ok)
             failOpen(`avcs: pre-commit ingest exceeded ${hookMs}ms — proceeding without audit capture (#33). The change will be captured on the next sync. Set AVCS_HOOK_TIMEOUT_MS=0 to wait, or check for another avcs process holding the store.`);
@@ -1701,7 +1735,7 @@ async function main(): Promise<void> {
             const outcome = await landMergedWorkspace(repo, cwd);
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: { kind: "human", id: author }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
+            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ignorePredicate: gitIgnorePredicate(cwd) });
             return { outcome, scope, sync };
           }, hookMs);
           if (!res.ok) failOpen(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
@@ -1955,6 +1989,7 @@ async function main(): Promise<void> {
       console.log(
         "avcs <command>\n\n" +
           "  init [dir] [--mode m]       create a repo (--mode sidecar|committed, default sidecar)\n" +
+          "  config [user.name|user.email|actor] [value] [--unset]  author identity (git-style; name/email are attribution, not identity)\n" +
           "  status [view]               operation/conflict summary\n" +
           "  key provision <actor-id> | key import <src> | key ls\n" +
           "                              machine-level signing identity (~/.avcs/private; decisions, hub writes)\n" +
