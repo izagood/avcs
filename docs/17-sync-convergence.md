@@ -43,7 +43,7 @@ avcs는 이미 **저작(authoring) 레이어의 rebase를 제거**했다: op는 
 HLC(hybrid logical clock)는 **도입하지 않는다.** 결정론은 lamport 품질에 의존한 적이 없다(reducer는 `(lamport, oid)` 정렬로 총순서를 얻고, 정책 점수는 recency를 의도적으로 배제). 고칠 결함은 둘뿐:
 
 - **observe-on-import**: `pull`/`pullHub` 완료 후 가져온 op들의 max lamport로 `clock.observe()` — 이후 발급되는 lamport가 수입된 히스토리보다 뒤에 온다.
-- **multi-process reseed**: propose 직전 op-log tail에서 관찰된 `maxLamportSeen`과 reseed(`lamport = max(clock.tick(), maxSeen + 1)`) — 같은 `.avcs`를 쓰는 CLI+MCP 두 프로세스의 겹침 발급 수정. tail은 이미 캐시되므로 O(1).
+- **multi-process reseed**: propose 직전 op-log tail에서 관찰된 `maxLamportSeen`과 reseed(`lamport = max(clock.tick(), maxSeen + 1)`) — 같은 `.avcs`를 쓰는 CLI+MCP 두 프로세스의 겹침 발급 수정. tail은 캐시를 통해 읽으므로 이미 materialize한 프로세스에서는 O(1)이고, 저작만 하는 cold 프로세스에서는 첫 propose가 tail 1회를 읽고(bounded fan-out) 이후 캐시된다. **`Repo.open`은 시드하지 않는다** — 예전에는 open이 전체 op를 순회해 시드했고, 그래서 op를 한 번도 발급하지 않는 읽기 전용 소비자까지 이력 크기에 비례하는 비용을 냈다(A6c).
 
 개선되는 것은 순서의 **품질**(인과 반영도)이지 정확성이 아님을 문서화한다.
 
