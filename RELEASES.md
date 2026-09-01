@@ -19,6 +19,37 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed (determinism) — a pure deletion no longer leaves a blank line behind.
+`MERGE3_VERSION` `text3/0.3.0` → `text3/0.3.1`. This CHANGES `treeHash` for any op set that
+contains a pure deletion, so it needs at least a MINOR bump. Migration note below.**
+
+- `merge3` was not the identity on a single variant: a span the variant deleted entirely came
+  back as ONE BLANK LINE. `renderSpan` returned joined text and the caller re-split it, but
+  `"".split("\n")` is `[""]` — one empty line, not zero. So "delete these lines" reduced to
+  "replace these lines with one blank line"; `[]` and `[""]` were indistinguishable after the
+  round trip through a string.
+- **Not blank-line specific — ANY pure deletion.** Deleting the head of a file put a blank
+  line at the top; deleting every line left one blank line instead of an empty file.
+  Replacements and insertions were always correct, which is why this survived: every shape
+  whose render is non-empty round-trips fine.
+- `renderSpan` returns `string[]` and the cluster path pushes those lines directly. The
+  render-dedupe key carries the line COUNT (joined text cannot tell zero lines from one empty
+  line). `ConflictOption.text` keeps its public shape, with the lines beside it so an
+  ARBITRATED deletion removes lines instead of blanking them; the undecided branch emits base
+  lines directly.
+- Found by dogfooding a git-bridged repo: the bridge reprojects the working tree on every
+  commit, so each cycle revived one line per deleted run. The drift accumulated (a run cleaned
+  to zero grew back to ten over a day) and landed in files the commit had not touched — which
+  is what made it look like a hook problem rather than a merge problem.
+- **Migration: re-materialize, do not trust a stored hash across the boundary.** An op set of
+  only replacements/insertions is byte-identical either way. One containing a pure deletion
+  now reduces to a DIFFERENT (correct) `treeHash`, so a persisted `treeHash` or checkpoint
+  written by an earlier version is not comparable for those op sets. The boundary is explicit:
+  `materializerVersion` (stamped on every materialize result, surfaced by the hub `/`
+  endpoint) reads `text3/0.3.0` before and `text3/0.3.1` after — branch on it rather than
+  guessing. Nothing on disk is rewritten and stores open unchanged; only recomputation of a
+  materialized tree is affected.
+
 **Added — local `undo` ([docs/23](docs/23-local-undo.md), issue #91). New object type
 `"undo"`, new optional `Blob.undoOid`. Additive: existing stores open unchanged.**
 
