@@ -9,7 +9,7 @@ import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp, 
 import { existsSync } from "node:fs";
 import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { Buffer } from "node:buffer";
-import { ObjectStore } from "../store/objectStore.ts";
+import { ObjectStore, type OpLogEntry } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex, canonicalize } from "../core/canonical.ts";
 import { reduce, conflictIdFor, keysOf, detectFileConflicts, arbitrateFileConflicts, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
@@ -1095,7 +1095,7 @@ export class Repo {
    * need their bodies, so this falls back to tailing for exactly those.
    */
   async #maxLamportSeen(): Promise<number> {
-    const entries = await this.store.readOpLogEntries();
+    const entries = await this.#opLogEntries();
     let max = 0;
     const needBody: string[] = [];
     for (const e of entries) {
@@ -1105,6 +1105,23 @@ export class Repo {
     if (needBody.length === 0) return max;
     for (const op of await this.#readOps(needBody)) max = Math.max(max, op.lamport);
     return max;
+  }
+
+  /**
+   * Op-log entries, backfilling the log first if it is missing.
+   *
+   * The log is a rebuildable cache: a store predating it (pre-A5) has none, and one can go
+   * missing. `#allOpsTailed` owns that recovery — it scans the shards once, rebuilds the log
+   * and warms the cache — and every reader that decides anything FROM the log has to go
+   * through here, or an absent log reads as an absent history. It did exactly that once: a
+   * repo with three files materialized to an empty tree, and the next write reissued a
+   * lamport the history already held.
+   */
+  async #opLogEntries(): Promise<OpLogEntry[]> {
+    const entries = await this.store.readOpLogEntries();
+    if (entries.length > 0) return entries;
+    await this.#allOpsTailed(); // scans + rebuilds when the log is empty but ops exist
+    return this.store.readOpLogEntries();
   }
 
   /**
@@ -2982,7 +2999,7 @@ export class Repo {
     // An entry whose line predates the record format carries no metadata, so it cannot be
     // judged from the log and stays a candidate; a store whose whole log is like that reads
     // exactly what it read before, and `#upgradeOpLogRecords` fills the metadata in behind it.
-    const entries = await this.store.readOpLogEntries();
+    const entries = await this.#opLogEntries();
     const legacy: string[] = [];
     const candidateOids: string[] = [];
     for (const e of entries) {
