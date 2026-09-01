@@ -4,6 +4,8 @@
 // 그 자리에 꽂을 수 없다. 부착 지점을 함수에서 URL 로 옮기는 것이 이 스위트의 전부다 —
 // 테스트가 재는 내용은 바뀌지 않는다.
 import { mkdtemp, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { buildAuthHeader } from "../../src/hub/transportAuth.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHub, type HubHandle } from "../../src/hub/hubServer.ts";
@@ -63,6 +65,34 @@ export interface OpenOpts {
   url?: string;
   /** 테스트에서 능력 광고를 흉내낼 때만. 실제 사용에서는 쓰지 않는다. */
   capabilitiesOverride?: Capabilities;
+}
+
+/**
+ * 쓰기 요청 헤더. 게이트된 서버(쓰기에 AVCS-Sig 요구)를 재려면 자격을 환경으로 준다:
+ *
+ *   AVCS_CONFORMANCE_KEYID=human:ci
+ *   AVCS_CONFORMANCE_PRIVATE_KEY=<PEM>            (또는)
+ *   AVCS_CONFORMANCE_PRIVATE_KEY_FILE=<PEM 경로>
+ *
+ * 없으면 헤더 없이 나간다 — 그때 게이트된 서버의 쓰기 검사는 401/403 을 만나 조기
+ * 반환한다(측정하지 않음, 실패도 아님). 자격이 있으면 그 검사들이 실제로 잰다.
+ * 서명은 클라이언트가 보내는 것과 같은 재료다: 메서드·프로토콜 경로·본문, 그리고
+ * base URL 의 경로를 scope 로(멀티테넌트 서버에서 다른 repo 로의 재생을 막는 그 값).
+ */
+export function writeHeaders(base: string, method: string, path: string, body: string): Record<string, string> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const keyId = process.env.AVCS_CONFORMANCE_KEYID;
+  let privateKey = process.env.AVCS_CONFORMANCE_PRIVATE_KEY;
+  const file = process.env.AVCS_CONFORMANCE_PRIVATE_KEY_FILE;
+  if (!privateKey && file) privateKey = readFileSync(file, "utf8");
+  if (keyId && privateKey) {
+    const scope = new URL(base).pathname.replace(/\/$/, "");
+    headers.authorization = buildAuthHeader({
+      keyId, privateKey, method, path, body,
+      scope: scope === "/" ? "" : scope,
+    });
+  }
+  return headers;
 }
 
 export async function openTarget(opts: OpenOpts = {}): Promise<Target> {

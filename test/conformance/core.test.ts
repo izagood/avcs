@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTarget } from "./target.ts";
+import { openTarget, writeHeaders } from "./target.ts";
 import { Repo } from "../../src/api/repo.ts";
 import { computeOid } from "../../src/core/canonical.ts";
 import type { Actor } from "../../src/objects/types.ts";
@@ -35,8 +35,9 @@ test("GET /have 는 oid 문자열 배열을 준다", async () => {
     // 빈 서버에서는 아래 루프가 돌지 않아 이 검사가 아무것도 재지 못한다. 그래서 먼저 하나
     // 넣는다 — 넣을 수 없는 서버(게이트됨)라면 목록이 비어 있어도 넘어간다.
     const { body: seed } = noveltyObject();
+    const seedRaw = JSON.stringify(seed);
     const put = await fetch(`${t.base}/objects`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(seed),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/objects", seedRaw), body: seedRaw,
     });
     const seeded = put.status === 200;
 
@@ -60,10 +61,12 @@ test("POST /objects 는 저장하고 oid 를 돌려준다 — 그리고 멱등�
   const t = await openTarget();
   try {
     const { body, oid } = noveltyObject();
-    const send = async (): Promise<Response> =>
-      fetch(`${t.base}/objects`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    const send = async (): Promise<Response> => {
+      const raw = JSON.stringify(body);
+      return fetch(`${t.base}/objects`, {
+        method: "POST", headers: writeHeaders(t.base, "POST", "/objects", raw), body: raw,
       });
+    };
 
     const first = await send();
     if (first.status === 401 || first.status === 403) {
@@ -91,8 +94,9 @@ test("GET /objects/:oid 는 저장된 객체를, 없는 것에는 404 를 준다
 
     // 있는 것을 하나 만들어 되읽는다.
     const { body, oid } = noveltyObject();
+    const putRaw = JSON.stringify(body);
     const put = await fetch(`${t.base}/objects`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/objects", putRaw), body: putRaw,
     });
     if (put.status === 401 || put.status === 403) return; // 게이트된 서버
     assert.equal(put.status, 200);
@@ -114,8 +118,9 @@ test("변조된 객체는 자기 oid 에 착지한다 — 원본 자리를 뺏�
   try {
     const { body, oid } = noveltyObject();
     const forged = { ...body, oid, title: "forged" }; // 남의 oid 를 주장한다
+    const forgedRaw = JSON.stringify(forged);
     const res = await fetch(`${t.base}/objects`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(forged),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/objects", forgedRaw), body: forgedRaw,
     });
     if (res.status === 401 || res.status === 403) return;
     assert.equal(res.status, 200, "받아들여도 된다 — 다만 주장한 주소가 아니어야 한다");

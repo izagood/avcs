@@ -5,7 +5,7 @@
 // 실패로 처리하면 약속을 어기는 쪽이 스위트가 된다.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openTarget, type Target } from "./target.ts";
+import { openTarget, writeHeaders, type Target } from "./target.ts";
 
 /** 이 레벨이 적용되지 않는 서버면 조용히 통과시킨다. 이유를 남긴다. */
 async function requireLevel(t: Target, level: string): Promise<boolean> {
@@ -71,8 +71,9 @@ test("sync: POST /objects/fetch 는 없는 oid 를 조용히 빼고, 매 응답�
     const missing = "intent_" + "0".repeat(32);
     const ask = [...have.slice(0, 3), missing];
 
+    const askRaw = JSON.stringify({ oids: ask });
     const res = await fetch(`${t.base}/objects/fetch`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ oids: ask }),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/objects/fetch", askRaw), body: askRaw,
     });
     assert.equal(res.status, 200);
     const j = await res.json() as { objects: { oid: string }[]; truncated?: boolean };
@@ -90,8 +91,9 @@ test("sync: 형태가 틀린 fetch 는 400 이다", async () => {
   const t = await openTarget();
   try {
     if (!(await requireLevel(t, "sync"))) return;
+    const badRaw = JSON.stringify({ nope: 1 });
     const res = await fetch(`${t.base}/objects/fetch`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ nope: 1 }),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/objects/fetch", badRaw), body: badRaw,
     });
     assert.equal(res.status, 400, "{ oids: [...] } 가 아니면 400 이다");
   } finally {
@@ -118,9 +120,12 @@ test("queue: /integrate 가 없는 체크포인트를 422 로 거부한다", asy
   const t = await openTarget();
   try {
     if (!(await requireLevel(t, "queue"))) return;
+    // 자격이 주어졌으면 by 는 그 서명자다 — 남의 이름으로 제출하는 것은 별도 서명이 필요한
+    // 다른 시나리오고, 이 검사의 주제(없는 체크포인트 거부)가 아니다.
+    const by = process.env.AVCS_CONFORMANCE_KEYID ?? "human:h";
+    const intRaw = JSON.stringify({ view: "main", checkpoint: "checkpoint_" + "0".repeat(32), by });
     const res = await fetch(`${t.base}/integrate`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ view: "main", checkpoint: "checkpoint_" + "0".repeat(32), by: "human:h" }),
+      method: "POST", headers: writeHeaders(t.base, "POST", "/integrate", intRaw), body: intRaw,
     });
     // 게이트된 서버는 서명을 먼저 요구한다 — 그것도 프로토콜에 맞는 응답이다.
     if (res.status === 401 || res.status === 403) return;
