@@ -145,10 +145,17 @@ export class NonceCache {
   }
 }
 
-/** Resolve a keyId to its registered public key (PEM), or null if unknown. This is the
- *  pluggable hook (D3): the default server resolver reads `member:<keyId>`; an embedder
- *  (e.g. a hosted hub) injects its own user-DB lookup. */
-export type PublicKeyResolver = (keyId: string) => Promise<string | null>;
+/** Resolve a keyId to the public key(s) registered for it. This is the pluggable hook (D3):
+ *  the default server resolver reads `member:<keyId>`; an embedder (e.g. a hosted hub) injects
+ *  its own user-DB lookup.
+ *
+ *  Returns a single PEM, an array of PEMs, or null/[] when the key is unknown. The array form
+ *  exists because a keyId is an ACTOR, and one actor may hold several signing keys at once (a
+ *  per-account key set, key rotation without downtime). The AVCS-Sig header names only the
+ *  actor, never which key signed — so `verifyAuth` tries each candidate against the signature.
+ *  The freshness/nonce/scope checks run ONCE regardless, so extra candidates never consume the
+ *  nonce or widen the replay window. */
+export type PublicKeyResolver = (keyId: string) => Promise<string | string[] | null>;
 
 export type AuthResult = { ok: true; keyId: string } | { ok: false; reason: string };
 
@@ -201,21 +208,30 @@ export async function verifyAuth(args: {
     }
   }
 
-  const publicKey = await args.resolvePublicKey(cred.keyId);
-  if (!publicKey) return { ok: false, reason: `unknown signing key ${cred.keyId}` };
+  const resolved = await args.resolvePublicKey(cred.keyId);
+  const candidates = resolved == null ? [] : Array.isArray(resolved) ? resolved : [resolved];
+  if (candidates.length === 0) return { ok: false, reason: `unknown signing key ${cred.keyId}` };
 
+  // One actor may hold several keys (a per-account key set); the header names the actor, not
+  // the key, so try each candidate. `sig` and — when binding is required — `bsig` must verify
+  // under the SAME key: a request is authenticated by ONE key, never a mix. The freshness,
+  // nonce and scope checks above already ran once, so this loop neither re-consumes the nonce
+  // nor changes what a replay window means.
   const msg = canonicalRequest(args.method, args.path, cred.ts, cred.nonce, args.body);
-  if (!verifyMessage(publicKey, msg, cred.sig)) return { ok: false, reason: "request signature does not verify" };
-
-  // When binding is required, the scope must ALSO be signed — otherwise it is decoration a
-  // replayer could rewrite. Checked after `sig` so a tampered scope fails as a signature
-  // problem rather than a mismatch, and only when this hub asked for binding.
-  if (args.expectedScope) {
-    const bound = canonicalRequest(args.method, args.path, cred.ts, cred.nonce, args.body, cred.scope!);
-    if (!cred.bsig || !verifyMessage(publicKey, bound, cred.bsig)) {
-      return { ok: false, reason: "scope binding does not verify" };
-    }
+  const bound = args.expectedScope
+    ? canonicalRequest(args.method, args.path, cred.ts, cred.nonce, args.body, cred.scope!)
+    : null;
+  let sigMatched = false;
+  for (const publicKey of candidates) {
+    if (!verifyMessage(publicKey, msg, cred.sig)) continue;
+    sigMatched = true;
+    // When binding is required, the scope must ALSO be signed by this same key — otherwise it
+    // is decoration a replayer could rewrite.
+    if (bound === null) return { ok: true, keyId: cred.keyId };
+    if (cred.bsig && verifyMessage(publicKey, bound, cred.bsig)) return { ok: true, keyId: cred.keyId };
   }
-
-  return { ok: true, keyId: cred.keyId };
+  // A key matched `sig` but not the scope binding is a distinct, more precise failure than
+  // no key matching at all — preserve it so a caller (and its tests) can tell them apart.
+  if (sigMatched && bound !== null) return { ok: false, reason: "scope binding does not verify" };
+  return { ok: false, reason: "request signature does not verify" };
 }
