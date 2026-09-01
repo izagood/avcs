@@ -15,11 +15,13 @@ const ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 }
 export class Logger {
   #sink: (e: LogEntry) => void;
   #min: number;
+  #level: LogLevel;
   #base: Record<string, unknown>;
 
   constructor(opts: { sink?: (e: LogEntry) => void; level?: LogLevel; base?: Record<string, unknown> } = {}) {
     this.#sink = opts.sink ?? (() => {});
-    this.#min = ORDER[opts.level ?? "info"];
+    this.#level = opts.level ?? "info";
+    this.#min = ORDER[this.#level];
     this.#base = opts.base ?? {};
   }
 
@@ -32,10 +34,16 @@ export class Logger {
   warn(event: string, fields?: Record<string, unknown>): void { this.log("warn", event, fields); }
   error(event: string, fields?: Record<string, unknown>): void { this.log("error", event, fields); }
 
-  /** A logger that adds `fields` to every entry (request/actor context). */
+  /**
+   * A logger that adds `fields` to every entry (request/actor context).
+   *
+   * The level carries over. Attaching context is not a decision about how much to log, and
+   * omitting it here silently reset the child to the `info` default — so a child of a
+   * warn-level logger logged MORE than its parent, and a child of a debug-level one logged
+   * less. Either way the threshold the caller set stopped applying at the first `child()`.
+   */
   child(fields: Record<string, unknown>): Logger {
-    const c = new Logger({ sink: this.#sink, base: { ...this.#base, ...fields } });
-    return c;
+    return new Logger({ sink: this.#sink, level: this.#level, base: { ...this.#base, ...fields } });
   }
 }
 
