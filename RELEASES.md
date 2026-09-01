@@ -11,6 +11,13 @@ particular every change to the **reduce/merge algorithm** or the **operation for
   that **adds/removes/renames an `OperationKind`** or object field, is **breaking** for
   consumers that persist materialized state. It MUST be at least a **minor** bump
   (pre-1.0) — never a patch — and MUST appear here with a migration note.
+- **The release automation derives the level from the commit SUBJECT** (`.github/workflows/release.yml`):
+  `fix:`/`perf:` → patch, `feat:` → minor, `<type>!:` or `BREAKING CHANGE` → minor. So a
+  determinism-affecting change committed as a plain `fix:` gets released as a **patch**, which
+  this section forbids. Such a change MUST carry `!` in its subject (`fix(merge)!: …`) or set
+  `package.json#version` above the latest tag in the PR (the workflow's manual-override path).
+  Learned the hard way: v0.48.1 shipped a `treeHash`-changing fix as a patch because its
+  subject was `fix(merge):` — see the v0.49.0 entry.
 - The merge algorithm carries its own identity: `MERGE3_VERSION` (in `src/merge/merge3.ts`)
   flows into `MATERIALIZER_VERSION` (in `src/reducer/policy.ts`), which is stamped into
   every materialize result (`materializerVersion`) and surfaced by the hub `/` endpoint.
@@ -18,6 +25,45 @@ particular every change to the **reduce/merge algorithm** or the **operation for
   with it. Consumers can pin or branch on `MATERIALIZER_VERSION` to detect a boundary.
 
 ## Unreleased
+
+**Fixed (determinism) — a pure deletion no longer leaves a blank line behind.
+`MERGE3_VERSION` `text3/0.3.0` → `text3/0.3.1`. This CHANGES `treeHash` for any op set that
+contains a pure deletion.**
+
+**Version note, honestly: the code shipped in `v0.48.1` as a PATCH, which this file forbids.**
+The automation derives the level from the commit subject, and the fix was committed as
+`fix(merge):` rather than `fix(merge)!:`. `v0.49.0` re-publishes the same code under a correct
+MINOR boundary — if you are already on `v0.48.1` you have the fix, and the version number is
+the only difference. **Do not use the version number alone to decide whether you are across
+the boundary; use `materializerVersion`** (`text3/0.3.0` before, `text3/0.3.1` after), which is
+stamped on every materialize result precisely because it cannot drift from the algorithm.
+
+- `merge3` was not the identity on a single variant: a span the variant deleted entirely came
+  back as ONE BLANK LINE. `renderSpan` returned joined text and the caller re-split it, but
+  `"".split("\n")` is `[""]` — one empty line, not zero. So "delete these lines" reduced to
+  "replace these lines with one blank line"; `[]` and `[""]` were indistinguishable after the
+  round trip through a string.
+- **Not blank-line specific — ANY pure deletion.** Deleting the head of a file put a blank
+  line at the top; deleting every line left one blank line instead of an empty file.
+  Replacements and insertions were always correct, which is why this survived: every shape
+  whose render is non-empty round-trips fine.
+- `renderSpan` returns `string[]` and the cluster path pushes those lines directly. The
+  render-dedupe key carries the line COUNT (joined text cannot tell zero lines from one empty
+  line). `ConflictOption.text` keeps its public shape, with the lines beside it so an
+  ARBITRATED deletion removes lines instead of blanking them; the undecided branch emits base
+  lines directly.
+- Found by dogfooding a git-bridged repo: the bridge reprojects the working tree on every
+  commit, so each cycle revived one line per deleted run. The drift accumulated (a run cleaned
+  to zero grew back to ten over a day) and landed in files the commit had not touched — which
+  is what made it look like a hook problem rather than a merge problem.
+- **Migration: re-materialize, do not trust a stored hash across the boundary.** An op set of
+  only replacements/insertions is byte-identical either way. One containing a pure deletion
+  now reduces to a DIFFERENT (correct) `treeHash`, so a persisted `treeHash` or checkpoint
+  written by an earlier version is not comparable for those op sets. The boundary is explicit:
+  `materializerVersion` (stamped on every materialize result, surfaced by the hub `/`
+  endpoint) reads `text3/0.3.0` before and `text3/0.3.1` after — branch on it rather than
+  guessing. Nothing on disk is rewritten and stores open unchanged; only recomputation of a
+  materialized tree is affected.
 
 **Added — local `undo` ([docs/23](docs/23-local-undo.md), issue #91). New object type
 `"undo"`, new optional `Blob.undoOid`. Additive: existing stores open unchanged.**
