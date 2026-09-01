@@ -1629,7 +1629,24 @@ async function main(): Promise<void> {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
             process.exit(1); // abort the commit
           }
-          execFileSync("git", ["add", "-A"], { cwd, stdio: "inherit" });
+          // Re-stage the reprojection — but only inside what the author already chose. The
+          // index is git's answer to "what goes into this commit", and a blanket `git add -A`
+          // here overwrote that answer: every unstaged edit in the tree was swept into the
+          // commit, and `git status` came back clean afterwards, so nothing said so (#149).
+          // Re-adding just the staged paths keeps canonical content in the commit without
+          // widening it. The index is never reset, so staged renames and deletions survive.
+          const nul = (b: Buffer): string[] => b.toString().split("\0").filter((p) => p.length > 0);
+          // What the author chose: the paths the index differs from HEAD on.
+          const chosen = nul(execFileSync("git", ["diff", "--cached", "--name-only", "-z"], { cwd }));
+          // Minus the ones the index no longer holds — a staged DELETION is already recorded,
+          // and re-adding a path that exists in neither index nor tree is a fatal pathspec
+          // error that would abort the commit outright.
+          const inIndex = new Set(nul(execFileSync("git", ["ls-files", "-z"], { cwd })));
+          const paths = chosen.filter((p) => inIndex.has(p));
+          if (paths.length > 0) {
+            // Pathspec on stdin, not argv: a large commit's file list must not hit ARG_MAX.
+            execFileSync("git", ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { cwd, input: `${paths.join("\0")}\0`, stdio: ["pipe", "inherit", "inherit"] });
+          }
           await repo.writeGitPending({ checkpoint: r.checkpoint!, treeHash: r.treeHash!, ...(r.captured.intent ? { intent: r.captured.intent } : {}) }, cwd);
           break;
         }
