@@ -2019,7 +2019,7 @@ async function main(): Promise<void> {
           "  worktree attach|detach|status  share the main checkout's store from a linked working tree\n" +
           "  reindex                     rebuild the entity index (after a git pull of .avcs objects)\n" +
           "  serve [dir] [--port N] [--gated]  run a hub (HTTP) over a repo\n" +
-          "  clone <hub-url> [dir] [--key <repo-dir|key-file>] [--as <id>]  create a repo from a hub\n" +
+          "  clone <hub-url> [dir] [--at <checkpoint>] [--key <repo-dir|key-file>] [--as <id>]  create a repo from a hub (--at: at one checkpoint)\n" +
           "  remote add <name> <url>     register a named hub ([--auto-sync] [--freshness-ms N])\n" +
           "  remote rm <name> | remote ls   manage named hubs (.avcs/remotes.json)\n" +
           "  sync [remote] [--as <id>]   pull + push against a named remote (default origin)\n" +

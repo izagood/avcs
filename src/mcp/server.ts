@@ -158,8 +158,8 @@ const verboseSchema = {
 
 /**
  * The `core` profile (Phase 16 M5, docs/18 §M5): the tools the canonical loop actually
- * uses. A tool schema is a toll every agent pays every session, and 36 tools is mostly
- * noise for an agent doing the standard loop.
+ * uses. A tool schema is a toll every agent pays every session, and the full surface is
+ * mostly noise for an agent doing the standard loop.
  *
  * What is deliberately ABSENT: checkpoint.create, sync.push and integration.submit, because
  * `sync.land` performs all three internally. Advertising them in the small profile would

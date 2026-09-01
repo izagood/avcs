@@ -8,6 +8,36 @@
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 
+**An agent should not spend its context on version control.** That is the whole design
+goal, and it is measured rather than asserted — here is what the same work costs an agent:
+
+| What an agent pays for | git / the full surface | AVCS |
+|---|---|---|
+| Landing a change after someone else's PR merged first (30 KB module) | **18,922** tokens | **279** tokens — *99% less* |
+| Round trips to finish that recovery | 7 | 4 |
+| Tool schema, paid on **every** session | ≈8.8k tokens (39 tools) | ≈3.5k tokens (13, `--profile core`) |
+| What a same-line collision hands the model | the whole file, with conflict markers | one object naming the two contending operations |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rebase-token-cost-dark.svg">
+  <img alt="Agent tokens to land a change after another PR merged first: git costs 446, 5,249 and 18,922 tokens on 0.7 KB, 8 KB and 30 KB files, while AVCS stays flat at 279" src="docs/assets/rebase-token-cost-light.svg" width="820">
+</picture>
+
+git's recovery cost tracks the size of the **file** — a conflict is bytes inside it, so the
+agent reads the whole module and writes the whole module back to change one line. AVCS's
+tracks the size of the **change**: a conflict is an object naming the two contending
+operations, so it stays flat as the file grows. There is also no branch to rewrite and
+nothing to force-push, which is why the round trips differ — and that is *one* cycle,
+repeated for every PR that merges ahead of yours. Across the file sizes measured the saving
+is 37–99%.
+
+None of this is a compression trick bolted on afterwards. It falls out of storing the
+operation graph instead of snapshots: there is no rebase to perform, so there is nothing to
+re-read. Method, caveats and the harness that produced the rebase numbers:
+[avcs-demo → what it costs an agent in tokens](https://github.com/izagood/avcs-demo#what-it-costs-an-agent-in-tokens).
+The schema figures are the advertised MCP surface itself — 35 KB of JSON against 14 KB, at
+the usual ≈4 bytes per token.
+
 > Git records **when** the code changed.
 > AVCS records **who changed it, with what intent, on what evidence, and through which conflict decisions** the code reached its current state.
 
@@ -21,36 +51,13 @@ The same objects + the same policy + the same materializer produce the same tree
 
 > **Status:** research prototype. The implementation is real and test-covered, but every phase is built to a *working-MVP depth* (language-neutral text 3-way merge, ed25519 signing). Structure-aware merge, semantic-break detection, multi-signature trust, and hardened distributed sync are tracked on the [roadmap](docs/07-roadmap.md).
 
-**Jump in:** [install](#install) · [your first five minutes](#your-first-five-minutes-no-server-no-git-required) · [connect an agent over MCP](#connect-agents-mcp) · [agent quickstart walkthrough](docs/25-agent-quickstart.md)
+**Jump in:** [install](#install) · [your first five minutes](#your-first-five-minutes-no-server-no-git-required) · [work against a server](#work-against-a-server) · [connect an agent over MCP](#connect-agents-mcp) · [agent quickstart walkthrough](docs/25-agent-quickstart.md)
 
 **See it run first:** [`izagood/avcs-demo`](https://github.com/izagood/avcs-demo) — a runnable
 demo of the question this design answers: *what happens when two agents edit the same file at
 the same time?* One `./demo.sh` walks a stale-head land that is absorbed instead of rejected,
 a same-file auto-merge with no rebase, and a same-line collision that becomes a signed
 decision rather than conflict markers.
-
-## What it costs an agent to land work
-
-The demo also **measures** the difference, by running git and AVCS through the same races and
-counting the bytes each forces through the model. On the everyday one — your PR has been open
-a while, someone else's merged first, and yours must be rebased onto the moved base and
-force-pushed — that is **18,922 tokens under git versus 279 under AVCS on a 30 KB module: a
-99% saving**, and 37–99% across the file sizes measured.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rebase-token-cost-dark.svg">
-  <img alt="Agent tokens to land a change after another PR merged first: git costs 446, 5,249 and 18,922 tokens on 0.7 KB, 8 KB and 30 KB files, while AVCS stays flat at 279" src="docs/assets/rebase-token-cost-light.svg" width="820">
-</picture>
-
-git's recovery cost tracks the size of the **file** — a conflict is bytes inside it, so the
-agent reads the whole module and writes the whole module back to change one line. AVCS's
-tracks the size of the **change**: a conflict is an object naming the two contending
-operations, so it stays flat as the file grows. There is also no branch to rewrite and
-nothing to force-push, which is why the round trips differ (7 vs 4) — and that is one cycle,
-repeated for every PR that merges ahead of yours.
-
-Method, caveats and the harness that produced these numbers:
-[avcs-demo → what it costs an agent in tokens](https://github.com/izagood/avcs-demo#what-it-costs-an-agent-in-tokens).
 
 ## Why not a layer on top of git?
 
@@ -139,8 +146,14 @@ The reducer and policy engine are the foundation; the higher phases build distri
 - **Phase 11 — external contributions:** quarantine tier + `promote` + untrusted-CI gate
 - **Phase 12 — security:** `redact` (byte-eviction of leaked secrets, oid preserved), break-glass `override`, forward-only rollback
 - **Local undo** ([docs/23](docs/23-local-undo.md)) — `avcs undo [--last | <op-oid>…] [--purge] [--no-git]`: drop local ops from the view, and with `--purge` evict the bytes they uniquely reference. Refuses once the ops have been pushed, because that case belongs to admin-gated `redact`. In a git-bridged repo `--purge` clears the **git** copy too — but only where it can prove the rewrite is safe and local (nothing on a remote, the commits at the tip, no other work in them, a clean tree); anywhere else it still does the AVCS side and names precisely what is left and the one command that fits, up to and including "rotate the credential, it is already published"
+- **The working tree is genuinely derived** — `checkout` records what it projected
+  (`.avcs/projection.json`, path → blob oid) and, on the next projection, removes the files
+  the target view no longer contains. Files it never wrote — build output, ignored files,
+  anything you just created — are untouched, and a projected file you have since edited is
+  kept and named in a notice rather than silently overwritten. Switching views therefore
+  yields *that view*, not the union of every view projected before it
 
-Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (36 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the server runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the server re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by a 360-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
+Branches become **views**, commits become **checkpoints**, tags become **releases**. Agents drive AVCS through a first-class **MCP server** (39 tools, or 13 with `--profile core`); humans use the **CLI**. Since Phase 14 the server runs an **integration queue** (`avcs submit`, `POST /integrate`): a stale submission is never told "head moved — pull first" — the server re-reduces the frontier union on the submitter's behalf, and the outcome is always a verdict (`advanced` | `conflict` repair packet | `needs_evidence` — one validation run, never a redo | `queued`). Since Phase 15 replicas converge **live** (`GET /events` long-poll, `avcs sync --watch`, contention early-warning), and Phase 16 completed the MCP surface: `avcs.sync.land` lands work in one call, `avcs.context.build` assembles bounded working context with deterministic truncation, and subscribable resources notify a client when the head moves — see [docs/17](docs/17-sync-convergence.md) and [docs/18](docs/18-mcp-first-class.md). The behavior is pinned by an 827-test contract suite (`test/*.test.ts`, all green) and `tsc` is clean.
 
 ## Install
 
@@ -214,6 +227,39 @@ avcs config                              # show what is set
 These live in `.avcs/config.json`; `AVCS_AUTHOR_NAME` / `AVCS_AUTHOR_EMAIL` / `AVCS_ACTOR`
 override per invocation.
 
+### Work against a server
+
+A repo stays useful with no server at all. Once there is one — [`avcs serve`](#build-your-own-server),
+[avcs-server](https://github.com/izagood/avcs-server), or any conforming implementation — the
+whole exchange is a handful of commands:
+
+```bash
+avcs clone https://your.server/acme/web .      # fetch the graph AND project a working tree
+avcs clone https://your.server/acme/web . --at <checkpoint>   # …at one exact checkpoint
+avcs sync                                      # pull + push against the remote it recorded
+avcs sync --watch                              # live convergence: long-poll + contention early warning
+avcs land -m "add mul()"                       # push + checkpoint + integrate, in one step
+```
+
+`land` is the one to reach for. A stale head is absorbed by the server's integration queue
+rather than bounced back as "head moved — pull first", so the outcome is `landed` or a
+conflict packet for a human to decide — never a redo. `avcs remote add <name> <url>`
+registers additional servers; `avcs sync <name>` picks one.
+
+**Reading from CI, without handing out a signing key.** The default credential is an
+`AVCS-Sig` signature over the canonical request, which covers the method and the body — a
+captured read credential cannot be replayed as a write. That is the right default, and a
+poor fit for an ephemeral reader. So a *read* also accepts a bearer token:
+
+```bash
+AVCS_HUB_TOKEN=… avcs clone https://your.server/acme/web .
+```
+
+The token is read-only by construction: the write path takes no token parameter at all, so
+a leaked variable can clone but can never push, finalize, or rewrite policy. A held signing
+key always wins over the token, so a signed reader is never silently downgraded. The token's
+format, lifetime and scope belong to the server — see [docs/26](docs/26-hub-protocol.md).
+
 ### Connect agents (MCP)
 
 Agents drive AVCS through its MCP server. Once `avcs` is installed, register it with the Claude Code CLI:
@@ -231,6 +277,9 @@ claude mcp add avcs -- avcs mcp
 
 The MCP SDK ships as an optionalDependency, so a normal install includes it; no extra step needed.
 
+Every tool answers compactly by default — pretty-printing is an opt-in `verbose` flag on the
+call, because whitespace an agent never reads is still whitespace it pays for.
+
 **The loop an agent runs** — five moves, and landing is one call:
 
 ```
@@ -241,7 +290,7 @@ avcs.validate.run + avcs.evidence.attach    # a behaviour change needs passing e
 avcs.sync.land       { by }                 # push + checkpoint + integrate → landed | conflict
 ```
 
-`sync.land` is the point: a stale head is absorbed for you, so the outcome is either `landed` or a conflict packet for a human — never "pull and redo". Add `--profile core` to advertise only these 13 tools instead of all 36:
+`sync.land` is the point: a stale head is absorbed for you, so the outcome is either `landed` or a conflict packet for a human — never "pull and redo". Add `--profile core` to advertise only these 13 tools instead of all 39 — the schema an agent is handed drops from 35 KB to 14 KB, on every session:
 
 ```bash
 claude mcp add avcs -- avcs mcp --profile core
@@ -353,8 +402,6 @@ Three implementations to start from:
 - **`startHub` in this repository** — the reference: single-repo, no multi-tenancy, but it
   serves the whole protocol. Read it as the spec's executable form, or run it with `avcs serve`.
 
-## Quick start
-
 ## Running from a checkout
 
 Hacking on AVCS itself? Every command runs straight from the checkout with `node`:
@@ -398,7 +445,7 @@ AVCS_REPO=$(pwd) npm run mcp      # = node --experimental-strip-types src/mcp/se
 | `src/hub/hubServer.ts`, `hubClient.ts` | Multi-machine sync server (Phase 7; API names keep the legacy “hub” term) |
 | `src/api/repo.ts` | High-level facade (shared by CLI, demo, MCP) |
 | `src/api/keystore.ts` | Machine-level private keystore (`~/.avcs/private`) |
-| `src/mcp/server.ts` | Agent-facing MCP interface (36 tools) |
+| `src/mcp/server.ts` | Agent-facing MCP interface (39 tools; `--profile core` advertises 13) |
 | `src/cli.ts` | Human-facing inspection/release CLI |
 | `src/demo.ts` | End-to-end scenario |
 
