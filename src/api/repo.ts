@@ -38,6 +38,7 @@ import {
   type KeyFile,
 } from "./keystore.ts";
 import { checkLease, isActive, scopesOverlap, type LeaseConflict } from "../concurrency/lease.ts";
+import { mapLimit } from "../concurrency/mapLimit.ts";
 import { isBinary } from "../core/bytes.ts";
 import { PurgedBlobError, purgeTombstoneOf } from "../store/applyRedactions.ts";
 
@@ -419,10 +420,18 @@ export class Repo {
     if (!ObjectStore.isRepo(dir)) throw new RepoNotFoundError(dir);
     const store = new ObjectStore(dir);
     const repo = new Repo(dir, store, opts?.configHome);
-    // Re-seed the Lamport clock past the highest operation we've seen.
-    let max = 0;
-    for await (const op of store.list<Operation>("operation")) max = Math.max(max, op.lamport);
-    repo.#clock = new LamportClock(max);
+    // The Lamport clock is NOT seeded here, deliberately. Opening used to walk
+    // `list("operation")` — a full shard scan that decodes every operation object
+    // just to keep `max(lamport)` and discard the rest — which made opening scale
+    // with history and charged it to every reader, including one that never
+    // stamps an operation at all.
+    //
+    // The write path seeds it instead: `proposeOperation` re-observes the highest
+    // lamport from the op-log tail immediately before each stamp (Phase 13.2,
+    // multi-process reseed), reading through the warm op cache a materialize has
+    // usually already filled. So the clock is correct where it matters, and a
+    // process that only reads pays nothing. Correctness never rested on the seed
+    // either — the reducer tie-breaks by `(lamport, oid)`, total regardless.
     await repo.#loadKeyring();
     return repo;
   }
@@ -1060,18 +1069,40 @@ export class Repo {
       for (const o of scanned) this.#opCache.set(o.oid as string, o);
       log = await this.store.readOpLog();
     }
+    // Reads are issued in a bounded fan-out, not one at a time. The oids are known up
+    // front and each read is independent, so a serial loop bought nothing and cost one
+    // round-trip of latency per operation — on a long history that was nearly all of a
+    // cold materialize's wall clock, with the reduce itself a rounding error beside it.
+    const missing = log.filter((oid) => !this.#opCache.has(oid));
+    const fetched = await mapLimit(missing, Repo.OP_READ_CONCURRENCY, async (oid) => {
+      try {
+        return await this.store.get<Operation>(oid);
+      } catch (e) {
+        // Logged but no longer stored: GC collects expired quarantine, and the store is
+        // the source of truth, so the entry is skipped. Only absence means that — a decode
+        // failure is corruption and must not be swallowed into a silently shorter history.
+        if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+        throw e;
+      }
+    });
+    for (const op of fetched) if (op) this.#opCache.set(op.oid as string, op);
+
+    // Op-log order, which is first-write order — callers depend on it.
     const ops: Operation[] = [];
     for (const oid of log) {
-      let op = this.#opCache.get(oid);
-      if (!op) {
-        if (!(await this.store.has(oid))) continue; // GC'd since logged — skip
-        op = await this.store.get<Operation>(oid);
-        this.#opCache.set(oid, op);
-      }
-      ops.push(op);
+      const op = this.#opCache.get(oid);
+      if (op) ops.push(op);
     }
     return ops;
   }
+
+  /**
+   * How many operation object reads a single op-log tail keeps in flight.
+   *
+   * High enough that latency stops dominating, low enough to stay well inside a default
+   * file-descriptor limit while other work (blobs, packs) also has files open.
+   */
+  static readonly OP_READ_CONCURRENCY = 64;
 
   /** Highest Lamport timestamp visible in the op-log (0 when empty) — the reseed source
    *  for multi-process authoring (Phase 13.2). Reads through the warm op cache. */
