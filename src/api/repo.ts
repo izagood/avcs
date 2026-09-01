@@ -9,7 +9,7 @@ import { mkdir, writeFile, rm, readdir, readFile, lstat, readlink, symlink, cp, 
 import { existsSync } from "node:fs";
 import { join, dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { Buffer } from "node:buffer";
-import { ObjectStore } from "../store/objectStore.ts";
+import { ObjectStore, type OpLogEntry } from "../store/objectStore.ts";
 import { LamportClock } from "../core/clock.ts";
 import { computeOid, sha256hex, canonicalize } from "../core/canonical.ts";
 import { reduce, conflictIdFor, keysOf, detectFileConflicts, arbitrateFileConflicts, type ReductionResult, type ReduceInput } from "../reducer/reducer.ts";
@@ -1091,31 +1091,9 @@ export class Repo {
       for (const o of scanned) this.#opCache.set(o.oid as string, o);
       log = await this.store.readOpLog();
     }
-    // Reads are issued in a bounded fan-out, not one at a time. The oids are known up
-    // front and each read is independent, so a serial loop bought nothing and cost one
-    // round-trip of latency per operation — on a long history that was nearly all of a
-    // cold materialize's wall clock, with the reduce itself a rounding error beside it.
-    const missing = log.filter((oid) => !this.#opCache.has(oid));
-    const fetched = await mapLimit(missing, Repo.OP_READ_CONCURRENCY, async (oid) => {
-      try {
-        return await this.store.get<Operation>(oid);
-      } catch (e) {
-        // Logged but no longer stored: GC collects expired quarantine, and the store is
-        // the source of truth, so the entry is skipped. Only absence means that — a decode
-        // failure is corruption and must not be swallowed into a silently shorter history.
-        if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
-        throw e;
-      }
-    });
-    for (const op of fetched) if (op) this.#opCache.set(op.oid as string, op);
-
-    // Op-log order, which is first-write order — callers depend on it.
-    const ops: Operation[] = [];
-    for (const oid of log) {
-      const op = this.#opCache.get(oid);
-      if (op) ops.push(op);
-    }
-    return ops;
+    // Reads are issued in a bounded fan-out, not one at a time (see `#readOps`), and the
+    // result keeps op-log order, which is first-write order — callers depend on it.
+    return this.#readOps(log);
   }
 
   /**
@@ -1126,12 +1104,72 @@ export class Repo {
    */
   static readonly OP_READ_CONCURRENCY = 64;
 
-  /** Highest Lamport timestamp visible in the op-log (0 when empty) — the reseed source
-   *  for multi-process authoring (Phase 13.2). Reads through the warm op cache. */
+  /**
+   * Highest Lamport timestamp visible in the op-log (0 when empty) — the reseed source for
+   * multi-process authoring (Phase 13.2).
+   *
+   * The log carries each operation's lamport, so this reads one file and no objects. It used
+   * to tail every operation body to recover a single number, which made the cost of issuing
+   * ONE lamport proportional to all history — paid by a cold authoring process that had not
+   * materialized first (a materialize left the cache warm and hid it).
+   *
+   * A store whose log predates the record format has lines without metadata; those still
+   * need their bodies, so this falls back to tailing for exactly those.
+   */
   async #maxLamportSeen(): Promise<number> {
+    const entries = await this.#opLogEntries();
     let max = 0;
-    for (const op of await this.#allOpsTailed()) max = Math.max(max, op.lamport);
+    const needBody: string[] = [];
+    for (const e of entries) {
+      if (e.meta) max = Math.max(max, e.meta.lamport);
+      else needBody.push(e.oid);
+    }
+    if (needBody.length === 0) return max;
+    for (const op of await this.#readOps(needBody)) max = Math.max(max, op.lamport);
     return max;
+  }
+
+  /**
+   * Op-log entries, backfilling the log first if it is missing.
+   *
+   * The log is a rebuildable cache: a store predating it (pre-A5) has none, and one can go
+   * missing. `#allOpsTailed` owns that recovery — it scans the shards once, rebuilds the log
+   * and warms the cache — and every reader that decides anything FROM the log has to go
+   * through here, or an absent log reads as an absent history. It did exactly that once: a
+   * repo with three files materialized to an empty tree, and the next write reissued a
+   * lamport the history already held.
+   */
+  async #opLogEntries(): Promise<OpLogEntry[]> {
+    const entries = await this.store.readOpLogEntries();
+    if (entries.length > 0) return entries;
+    await this.#allOpsTailed(); // scans + rebuilds when the log is empty but ops exist
+    return this.store.readOpLogEntries();
+  }
+
+  /**
+   * Read these operations, in the order given, skipping any the store no longer holds.
+   *
+   * The op-log may name an operation GC collected (expired quarantine); the store is the
+   * source of truth, so a missing object is skipped. Absence is ENOENT specifically — a
+   * decode failure is corruption and must not be swallowed into a silently shorter history.
+   */
+  async #readOps(oids: readonly string[]): Promise<Operation[]> {
+    const missing = oids.filter((oid) => !this.#opCache.has(oid));
+    const fetched = await mapLimit(missing, Repo.OP_READ_CONCURRENCY, async (oid) => {
+      try {
+        return await this.store.get<Operation>(oid);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+        throw e;
+      }
+    });
+    for (const op of fetched) if (op) this.#opCache.set(op.oid as string, op);
+    const out: Operation[] = [];
+    for (const oid of oids) {
+      const op = this.#opCache.get(oid);
+      if (op) out.push(op);
+    }
+    return out;
   }
 
   /** Observe an imported history's max lamport (Phase 13.2 observe-on-import): after a
@@ -1568,18 +1606,20 @@ export class Repo {
   }
 
   /** Oids inherited by a line: the causal closure of its fork checkpoint's frontier. */
-  async #inheritedOps(lineName: string, allOps: Operation[]): Promise<Set<string>> {
+  async #inheritedOps(lineName: string): Promise<Set<string>> {
     const line = await this.#getLine(lineName);
     if (!line?.forkCheckpointOid) return new Set();
     const cp = await this.store.get<Checkpoint>(line.forkCheckpointOid);
-    const byId = new Map(allOps.map((o) => [o.oid as string, o]));
+    // The closure is walked from the fork frontier, so it reads only the ops it reaches.
+    // It used to be handed every op in the store just to index them by oid — which is what
+    // forced the caller to read all of them first, whether or not the line had a fork.
     const seen = new Set<string>();
-    const stack = [...cp.headOps];
-    while (stack.length) {
-      const id = stack.pop()!;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      for (const dep of byId.get(id)?.causalDeps ?? []) if (!seen.has(dep)) stack.push(dep);
+    let frontier = [...cp.headOps];
+    while (frontier.length) {
+      const fresh = frontier.filter((id) => !seen.has(id));
+      for (const id of fresh) seen.add(id);
+      const ops = await this.#readOps(fresh);
+      frontier = ops.flatMap((o) => o.causalDeps).filter((d) => !seen.has(d));
     }
     return seen;
   }
@@ -2962,8 +3002,7 @@ export class Repo {
     // its fork checkpoint (the base line's frozen frontier). Ops authored on the base
     // line AFTER the fork are excluded, which is what keeps lines divergent.
     const lineName = q.line ?? "main";
-    const allOps = await this.#allOpsTailed();
-    const inherited = await this.#inheritedOps(lineName, allOps);
+    const inherited = await this.#inheritedOps(lineName);
 
     const wsName = opts?.workspace;
     // Landing makes a workspace's ops BASE-ACCEPTED (docs/16 §4.3), so the landed set is
@@ -2971,8 +3010,32 @@ export class Repo {
     // a sibling's already-landed work invisible and rediscover the conflict at land time
     // (docs/20 §1.3).
     const landed = await this.#landedWorkspaces();
+
+    // Only the operations that can reach this view are read. The op-log records each op's
+    // line and workspace, which are precisely the two fields the loop below rejects on, so
+    // the ones a view will throw away need not be read and decoded at all. On a repo with
+    // many lines that is most of the store: measured 14,339 logged ops of which 3,586 sit on
+    // `main` and 429 carry no unlanded workspace tag.
+    //
+    // This is a PREFILTER, never the authority — the loop below still decides from the body.
+    // An entry whose line predates the record format carries no metadata, so it cannot be
+    // judged from the log and stays a candidate; a store whose whole log is like that reads
+    // exactly what it read before, and `#upgradeOpLogRecords` fills the metadata in behind it.
+    const entries = await this.#opLogEntries();
+    const legacy: string[] = [];
+    const candidateOids: string[] = [];
+    for (const e of entries) {
+      if (!e.meta) { legacy.push(e.oid); candidateOids.push(e.oid); continue; }
+      if (inherited.has(e.oid)) { candidateOids.push(e.oid); continue; }
+      if (e.meta.line !== lineName) continue;
+      const ws = e.meta.workspace;
+      if (ws !== null && ws !== wsName && !landed.has(ws)) continue;
+      candidateOids.push(e.oid);
+    }
+    const candidates = await this.#readOps(candidateOids);
+
     const ops: Operation[] = [];
-    for (const op of allOps) {
+    for (const op of candidates) {
       const onLine = (op.line ?? "main") === lineName || inherited.has(op.oid as string);
       if (!onLine) continue;
       // Workspace isolation (docs/16): a view excludes a workspace-tagged op unless that
@@ -2992,7 +3055,18 @@ export class Repo {
     // treat the missing dep as an absent edge and apply the op anyway). We exclude any op
     // a dep of which is absent from the store entirely, transitively. For a complete op
     // set nothing is held back, so determinism for settled history is unchanged.
-    const present = new Set(allOps.map((o) => o.oid as string));
+    //
+    // `present` answers only about the ops the check can ask about: the candidates it walks,
+    // and their direct deps (a dep that is not a candidate is "present but on another line",
+    // which `#causallyComplete` treats as satisfied without recursing). So presence is
+    // resolved for that bounded set instead of by reading the whole store.
+    const present = new Set(ops.map((o) => o.oid as string));
+    const unresolved = new Set<string>();
+    for (const op of ops) for (const d of op.causalDeps) if (!present.has(d)) unresolved.add(d);
+    const found = await mapLimit([...unresolved], Repo.OP_READ_CONCURRENCY, async (oid) =>
+      (await this.store.has(oid)) ? oid : null,
+    );
+    for (const oid of found) if (oid) present.add(oid);
     const { complete, pending } = this.#causallyComplete(ops, present);
     if (pending.length) {
       this.metrics.inc("materialize.causallyPending", pending.length);
@@ -3007,7 +3081,32 @@ export class Repo {
     const res = await this.#reduceOpSet(kept, includeStatuses, true); // main path: incremental by default
     for (const oid of quarantined) res.statuses.set(oid, "quarantined");
     await this.#maybeAutoCompact(viewName, res);
+    await this.#upgradeOpLogRecords(legacy);
     return res;
+  }
+
+  /**
+   * Fill in op-log metadata for lines that predate the record format.
+   *
+   * A store written before the format logs bare oids, so every materialize has to read every
+   * operation to decide what its view includes. This closes that once: the ops are already in
+   * hand and in cache, so appending their records costs one write.
+   *
+   * Append-only (docs/11 A5) — the log is never rewritten, so this cannot lose an entry a
+   * concurrent process appended, and first-write order is untouched. Best-effort: the read
+   * path is correct without it, so a failure only logs.
+   */
+  async #upgradeOpLogRecords(oids: readonly string[]): Promise<void> {
+    if (oids.length === 0) return;
+    const ops = oids.map((oid) => this.#opCache.get(oid)).filter((o): o is Operation => !!o);
+    if (ops.length === 0) return;
+    try {
+      const n = await this.store.appendOpLogRecords(ops);
+      this.metrics.inc("oplog.records.upgraded", n);
+      this.logger.info("oplog.upgraded", { records: n });
+    } catch (e) {
+      this.logger.warn("oplog.upgrade.failed", { error: (e as Error).message });
+    }
   }
 
   /**
@@ -4467,14 +4566,29 @@ export class Repo {
       const policyOid = (await this.store.getRef("policy")) ?? "default";
       if (raw.header?.materializerVersion !== MATERIALIZER_VERSION || raw.header?.policyOid !== policyOid || raw.snapshot === undefined) {
         this.metrics.inc("snapshot.cold.rejected");
+        // Say WHY, and say it out loud. A rejection is by design — a merge-algorithm or
+        // policy change must invalidate a stale base — but it also means this view is back
+        // to a full reduce on every cold start until the delta rule (`#maybeAutoCompact`)
+        // re-persists one, which for a view smaller than AUTO_COMPACT_DELTA never happens
+        // because it never needs to. Reported as a counter alone, that state was
+        // indistinguishable from "this repo has no base and wants none".
+        this.logger.info("snapshot.cold.rejected", {
+          view,
+          reason:
+            raw.snapshot === undefined ? "no snapshot in file"
+            : raw.header?.materializerVersion !== MATERIALIZER_VERSION
+              ? `materializer ${String(raw.header?.materializerVersion)} != ${MATERIALIZER_VERSION}`
+              : `policy ${String(raw.header?.policyOid)} != ${policyOid}`,
+        });
         return; // stale/incompatible base → full reduce
       }
       this.#incSnap = deserializeSnapshot(raw.snapshot);
       this.#persistedBaseOps.set(view, this.#incSnap.input.ops.length);
       this.metrics.inc("snapshot.cold.loaded");
-    } catch {
+    } catch (e) {
       this.#incSnap = null; // corrupt snapshot → full reduce (always correct)
       this.metrics.inc("snapshot.cold.rejected");
+      this.logger.warn("snapshot.cold.corrupt", { view, error: (e as Error).message });
     }
   }
 

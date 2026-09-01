@@ -18,6 +18,12 @@ import { computeOid, sha256hex, assertInteropSafe } from "../core/canonical.ts";
 import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
 import { withLock, type LockOptions } from "./lock.ts";
 import { mapLimit } from "../concurrency/mapLimit.ts";
+
+/** One parsed op-log line. `meta` is absent on a legacy bare-oid line. */
+export interface OpLogEntry {
+  oid: string;
+  meta?: { lamport: number; line: string; workspace: string | null };
+}
 import type { AnyObject, ObjectType } from "../objects/types.ts";
 
 /**
@@ -281,7 +287,7 @@ export class ObjectStore {
       // It lets a reader tail only the ops added since its last read (incremental reduce)
       // instead of scanning every shard. O_APPEND keeps small records atomic across
       // processes (same pattern as the entity index).
-      if (obj.type === "operation") await this.#appendDurable(join(this.root, "oplog"), `${oid}\n`);
+      if (obj.type === "operation") await this.#appendDurable(join(this.root, "oplog"), ObjectStore.opLogLine(oid, obj));
       // Object-log (E5 / docs/13): append EVERY newly-written object's oid (all types)
       // to a single append-only log in arrival order. A hub serves `GET /sync?since=N`
       // from it so a client fetches only objects added since its last sync, instead of
@@ -299,13 +305,46 @@ export class ObjectStore {
    * Empty for a store created before the op-log existed; `rebuildOpLog` backfills it.
    */
   async readOpLog(): Promise<string[]> {
-    const p = join(this.root, "oplog");
+    return (await this.readOpLogEntries()).map((e) => e.oid);
+  }
 
-    const seen = new Set<string>();
-    const out: string[] = [];
+  /**
+   * The same log, with whatever per-operation metadata its lines carry.
+   *
+   * A line is either a bare oid (the original format) or a TAB-separated record:
+   *
+   *     <oid>\t<lamport>\t<line>\t<workspace>
+   *
+   * Those are exactly the fields a reader needs to decide whether an operation belongs in a
+   * view WITHOUT reading its body — `materialize` filters by line and workspace, and the
+   * Lamport reseed wants the highest lamport. Recovering three small fields used to mean
+   * reading and decoding every operation object in the store.
+   *
+   * Old lines stay valid, so no store needs converting: an entry with no record reports no
+   * `meta` and the caller falls back to reading the object. And because the log is deduped
+   * BY OID with the FIRST occurrence fixing order, a record for an oid already present as a
+   * bare line can simply be APPENDED — position comes from the old line, metadata from the
+   * new one. Upgrading is therefore append-only: it never rewrites history, and it cannot
+   * lose a concurrent append the way a read-modify-write rebuild could.
+   *
+   * A line with MORE than four fields is read as a record and the extras ignored, so a store
+   * written by a later version stays readable here.
+   */
+  async readOpLogEntries(): Promise<OpLogEntry[]> {
+    const p = join(this.root, "oplog");
+    const at = new Map<string, number>();
+    const out: OpLogEntry[] = [];
+    const add = (e: OpLogEntry): void => {
+      const i = at.get(e.oid);
+      if (i === undefined) { at.set(e.oid, out.length); out.push(e); return; }
+      // Same oid again: keep its original position, take metadata from whichever line has it.
+      if (e.meta && !out[i]!.meta) out[i]!.meta = e.meta;
+    };
     if (existsSync(p)) {
-      for (const line of (await readFile(p, "utf8")).split("\n"))
-        if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+      for (const line of (await readFile(p, "utf8")).split("\n")) {
+        if (!line) continue;
+        add(ObjectStore.#parseOpLogLine(line));
+      }
     }
     // Read-your-writes extends to LOG-DERIVED reads, not just get/has. `contention()`'s
     // closure walks #allOpsTailed ← readOpLog to find "my ops"; if a batch's staged op is
@@ -314,9 +353,66 @@ export class ObjectStore {
     // contention-across-lines.test.ts the first time batched() shipped without this.
     if (this.#batch) {
       for (const [oid, obj] of this.#batch.byOid)
-        if (obj.type === "operation" && !seen.has(oid)) { seen.add(oid); out.push(oid); }
+        if (obj.type === "operation") add({ oid, meta: ObjectStore.#opMeta(obj) });
     }
     return out;
+  }
+
+  static #parseOpLogLine(line: string): OpLogEntry {
+    const f = line.split("\t");
+    if (f.length < 4) return { oid: f[0]! }; // bare oid, or a shape we do not recognise
+    const lamport = Number(f[1]);
+    if (!Number.isInteger(lamport)) return { oid: f[0]! };
+    const ws = ObjectStore.#decodeLogField(f[3]!);
+    return {
+      oid: f[0]!,
+      meta: { lamport, line: ObjectStore.#decodeLogField(f[2]!), workspace: ws === "" ? null : ws },
+    };
+  }
+
+  /** The record fields for an operation, or undefined if it does not look like one. */
+  static #opMeta(op: unknown): OpLogEntry["meta"] {
+    const o = op as { lamport?: unknown; line?: unknown; workspace?: unknown };
+    if (typeof o.lamport !== "number" || !Number.isInteger(o.lamport)) return undefined;
+    return {
+      lamport: o.lamport,
+      line: typeof o.line === "string" ? o.line : "main", // absent ⇒ main (docs/11, Phase 8)
+      workspace: typeof o.workspace === "string" && o.workspace !== "" ? o.workspace : null,
+    };
+  }
+
+  /** One op-log line for a newly written operation — a record when we can build one. */
+  static opLogLine(oid: string, op: unknown): string {
+    const m = ObjectStore.#opMeta(op);
+    if (!m) return `${oid}\n`;
+    const ws = m.workspace === null ? "" : m.workspace;
+    return `${oid}\t${m.lamport}\t${ObjectStore.#encodeLogField(m.line)}\t${ObjectStore.#encodeLogField(ws)}\n`;
+  }
+
+  // A line or workspace name is an opaque string, so it must not be able to contain the
+  // record's own separators. `%` is escaped first (and decoded LAST) so the encoding stays
+  // unambiguous — the same rule the ref-name encoder above follows.
+  static #encodeLogField(v: string): string {
+    return v.replace(/%/g, "%25").replace(/\t/g, "%09").replace(/\n/g, "%0A").replace(/\r/g, "%0D");
+  }
+  static #decodeLogField(v: string): string {
+    return v.replace(/%09/g, "\t").replace(/%0A/g, "\n").replace(/%0D/g, "\r").replace(/%25/g, "%");
+  }
+
+  /**
+   * Append records for operations whose log lines carry no metadata (best-effort upgrade).
+   *
+   * Append-only by design — see `readOpLogEntries`. Returns how many records were written.
+   */
+  async appendOpLogRecords(ops: readonly unknown[]): Promise<number> {
+    const lines = ops
+      .map((op) => {
+        const oid = (op as { oid?: unknown }).oid;
+        return typeof oid === "string" ? ObjectStore.opLogLine(oid, op) : "";
+      })
+      .filter((l) => l.includes("\t"));
+    if (lines.length) await this.#appendDurable(join(this.root, "oplog"), lines.join(""));
+    return lines.length;
   }
 
   /**
@@ -349,14 +445,24 @@ export class ObjectStore {
     if (oids.length) await this.#writeAtomic(join(this.root, "objlog"), oids.map((o) => `${o}\n`).join(""));
   }
 
-  /** Backfill the op-log from a full scan (for stores predating it, or after corruption).
-   *  Rewrites it atomically to the current operation set in canonical oid order. */
+  /**
+   * Backfill the op-log from a full scan (for stores predating it, or after corruption).
+   * Rewrites it atomically to the current operation set in canonical oid order.
+   *
+   * The order is oid order, NOT authoring order: a shard scan cannot recover the order the
+   * operations were written in. That is a real weakening of `readOpLog`'s first-write-order
+   * contract, which is why this runs only where the log is absent or already untrustworthy —
+   * the append-only upgrade path (`appendOpLogRecords`) is what an existing, intact log uses.
+   * Determinism does not rest on it either way: the reducer tie-breaks by `(lamport, oid)`.
+   */
   async rebuildOpLog(): Promise<number> {
-    const oids: string[] = [];
-    for await (const o of this.list("operation")) oids.push(o.oid as string);
-    oids.sort();
-    await this.#writeAtomic(join(this.root, "oplog"), oids.map((o) => `${o}\n`).join(""));
-    return oids.length;
+    const ops = await this.collect("operation");
+    ops.sort((a, b) => (a.oid as string).localeCompare(b.oid as string));
+    await this.#writeAtomic(
+      join(this.root, "oplog"),
+      ops.map((o) => ObjectStore.opLogLine(o.oid as string, o)).join(""),
+    );
+    return ops.length;
   }
 
   /**
@@ -491,7 +597,7 @@ export class ObjectStore {
       const chunk = objects.slice(base, base + CHUNK);
       // Plan the chunk: compute addresses, drop what already exists (content-addressed, so
       // "existing" is decided by the oid alone), and de-dupe repeats within the batch.
-      const plan: { at: number; oid: string; path: string; bytes: Buffer; isOp: boolean }[] = [];
+      const plan: { at: number; oid: string; path: string; bytes: Buffer; isOp: boolean; obj: AnyObject }[] = [];
       const inChunk = new Set<string>();
       for (let i = 0; i < chunk.length; i++) {
         const obj = chunk[i]!;
@@ -508,7 +614,7 @@ export class ObjectStore {
         }
         inChunk.add(oid);
         results[base + i] = { oid, existed: false };
-        plan.push({ at: base + i, oid, path: p, bytes: encodeCbor({ ...payload, oid }) as Buffer, isOp: obj.type === "operation" });
+        plan.push({ at: base + i, oid, path: p, bytes: encodeCbor({ ...payload, oid }) as Buffer, isOp: obj.type === "operation", obj });
       }
       if (!plan.length) continue;
 
@@ -532,8 +638,7 @@ export class ObjectStore {
       for (const d of shards) await this.#fsyncDir(d);
 
       // 2. oplog — only now, with every body in the chunk durable.
-      const opLines = plan.filter((w) => w.isOp).map((w) => `${w.oid}
-`).join("");
+      const opLines = plan.filter((w) => w.isOp).map((w) => ObjectStore.opLogLine(w.oid, w.obj)).join("");
       if (opLines) await this.#appendDurable(join(this.root, "oplog"), opLines);
       // 3. objlog.
       await this.#appendDurable(join(this.root, "objlog"), plan.map((w) => `${w.oid}
