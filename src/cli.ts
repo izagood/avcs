@@ -38,6 +38,47 @@ const cwd = process.cwd();
 if (cmd === "--version" || cmd === "-v") cmd = "version";
 if (cmd === "--help" || cmd === "-h") cmd = "help";
 
+/**
+ * Every flag that CONSUMES the token after it.
+ *
+ * This CLI is hand-parsed: each case reads its positionals straight off `args[n]` and its
+ * options through `flag()`, so nothing in between knows whether a given token is a value or
+ * an argument. The help scan below has to walk the whole command line, which makes it the
+ * one place that needs that fact for every flag rather than for its own.
+ *
+ * The registry is checked against its own callers by test/cli-help-positional.test.ts: a flag
+ * added later and left unregistered fails there rather than silently mis-parsing.
+ */
+const VALUED_FLAGS = new Set([
+  "--as", "--at", "--author", "--cache", "--choose", "--freshness-ms", "--key", "--key-from",
+  "--kind", "--line", "--max-attempts", "--message", "--mode", "--out", "--policy", "--port",
+  "--profile", "--reason", "--remote", "--repo", "--scope", "--to", "--view", "--workspace",
+  "-m", "-s",
+]);
+
+/**
+ * `--help`/`-h` anywhere in the command line is a request for help — answered here, before
+ * any case reads a positional and before a repo is even opened.
+ *
+ * It is not a nicety. `--help` is what a user types on an unfamiliar subcommand precisely
+ * BECAUSE they believe it is the safe thing to type, and every positional in this file is an
+ * `args[n]` read. Without this, `avcs workspace land --help` bound `--help` as the workspace
+ * NAME and performed a real land (issue #162) — the safety reflex became the trigger. The
+ * per-case `startsWith("--")` guards below cover the other half (any other flag-shaped token
+ * in a name slot); this covers the flag people actually type, on every command at once.
+ *
+ * The one token it must not claim is a flag's VALUE: `avcs commit -m --help` is a message.
+ */
+function asksForHelp(): boolean {
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i] as string;
+    if (VALUED_FLAGS.has(a)) { i++; continue; }
+    if (a === "--help" || a === "-h") return true;
+  }
+  return false;
+}
+if (cmd && cmd !== "help" && asksForHelp()) cmd = "help";
+
 function flag(name: string): string | undefined {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
@@ -803,7 +844,7 @@ async function main(): Promise<void> {
       const sub = args[1];
       if (sub === "provision") {
         const id = args[2];
-        if (!id) throw new Error("usage: avcs key provision <actor-id> [--kind human|ai_agent|ci_bot]");
+        if (!id || id.startsWith("--")) throw new Error("usage: avcs key provision <actor-id> [--kind human|ai_agent|ci_bot]");
         const kind = (flag("--kind") ?? kindOfActorId(id)) as Actor["kind"];
         const r = await repo.ensureOwnerKey({ kind, id });
         // The key goes to the MACHINE keystore (issue #98) — an identity belongs to a person
@@ -821,7 +862,7 @@ async function main(): Promise<void> {
         // The normal way to put an existing identity on a NEW machine: `clone --key` is the
         // escape hatch for one repo, this is the machine-wide adoption (issue #98).
         const src = args[2];
-        if (!src) throw new Error("usage: avcs key import <repo-dir | key-file> [--as <actor-id>] [--repo]");
+        if (!src || src.startsWith("--")) throw new Error("usage: avcs key import <repo-dir | key-file> [--as <actor-id>] [--repo]");
         const scope = args.includes("--repo") ? "repo" : "machine";
         const id = await repo.importLocalKey(src, flag("--as"), { scope });
         console.log(
@@ -1091,7 +1132,7 @@ async function main(): Promise<void> {
       if (sub === "add") {
         const name = args[2];
         const url = args[3];
-        if (!name || !url) throw new Error("usage: avcs remote add <name> <url> [--auto-sync] [--freshness-ms N]");
+        if (!name || name.startsWith("--") || !url || url.startsWith("--")) throw new Error("usage: avcs remote add <name> <url> [--auto-sync] [--freshness-ms N]");
         const freshness = flag("--freshness-ms");
         await repo.addRemote(name, url, {
           autoSync: args.includes("--auto-sync"),
@@ -1100,7 +1141,7 @@ async function main(): Promise<void> {
         console.log(`remote ${name} → ${url}`);
       } else if (sub === "rm") {
         const name = args[2];
-        if (!name) throw new Error("usage: avcs remote rm <name>");
+        if (!name || name.startsWith("--")) throw new Error("usage: avcs remote rm <name>");
         console.log((await repo.removeRemote(name)) ? `removed remote ${name}` : `no such remote: ${name}`);
       } else if (sub === "ls" || sub === undefined) {
         const remotes = await repo.listRemotes();
@@ -1833,7 +1874,7 @@ async function main(): Promise<void> {
           break;
         }
         const path = args[2];
-        if (!path) throw new Error("usage: avcs shared rm <path> | avcs shared rm --cache <key>");
+        if (!path || path.startsWith("--")) throw new Error("usage: avcs shared rm <path> | avcs shared rm --cache <key>");
         console.log(await repo.removeSharedPath(path) ? `removed shared path ${path} (its cache is kept — use \`avcs gc --shared\`)` : `no shared path ${path}`);
       } else {
         throw new Error("usage: avcs shared <ls|add|rm> ...");
@@ -1876,7 +1917,7 @@ async function main(): Promise<void> {
         }
       } else if (sub === "land") {
         const name = args[2];
-        if (!name) throw new Error("usage: avcs workspace land <name>");
+        if (!name || name.startsWith("--")) throw new Error("usage: avcs workspace land <name>");
         await repo.landWorkspace(name);
         console.log(`landed workspace ${name}`);
       } else if (sub === "list") {
@@ -1895,7 +1936,7 @@ async function main(): Promise<void> {
     }
     case "checkpoint": {
       const repo = await Repo.open(cwd);
-      const view = args[1] ?? "main";
+      const view = args[1] && !args[1].startsWith("--") ? args[1] : "main";
       const oid = await repo.createCheckpoint(view, flag("-m") ?? "checkpoint");
       console.log(oid);
       break;
