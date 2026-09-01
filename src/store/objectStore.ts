@@ -17,6 +17,7 @@ import { Buffer } from "node:buffer";
 import { computeOid, sha256hex, assertInteropSafe } from "../core/canonical.ts";
 import { encodeCbor, decodeCbor, looksLikeCbor } from "../core/cbor.ts";
 import { withLock, type LockOptions } from "./lock.ts";
+import { mapLimit } from "../concurrency/mapLimit.ts";
 import type { AnyObject, ObjectType } from "../objects/types.ts";
 
 /**
@@ -686,11 +687,34 @@ export class ObjectStore {
     });
   }
 
+  /**
+   * Every object of a type, as an array.
+   *
+   * Reads in a bounded fan-out rather than one at a time. This used to drain `list()` — a
+   * generator that awaits one `readFile` per object — so gathering N objects cost N
+   * round-trips of latency with the CPU idle between them, and every caller that wants a
+   * whole type paid it: `gc` (operations, then blobs), evidence/decision gathering, intent
+   * and lease listing, the MCP context and watch paths.
+   *
+   * `listOids` walks the same shards in the same order without reading a body, so the oids
+   * are known up front and the reads are independent. Order and set are therefore identical
+   * to `list()`'s — several callers index or diff the result — and a corrupt body still
+   * throws rather than shortening the answer.
+   *
+   * `list` stays a generator on purpose: it is the memory-bounded streaming API, and a
+   * caller that streams does not want the whole type buffered.
+   */
   async collect<T extends AnyObject = AnyObject>(type?: ObjectType): Promise<T[]> {
-    const out: T[] = [];
-    for await (const o of this.list<T>(type)) out.push(o);
-    return out;
+    return mapLimit(await this.listOids(type), ObjectStore.READ_CONCURRENCY, (oid) => this.get<T>(oid));
   }
+
+  /**
+   * How many object reads a single `collect` keeps in flight.
+   *
+   * High enough that latency stops dominating, low enough to stay well inside a default
+   * file-descriptor limit while other work also has files open.
+   */
+  static readonly READ_CONCURRENCY = 64;
 
   // ── refs ────────────────────────────────────────────────────────────────
   //
