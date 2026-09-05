@@ -393,26 +393,63 @@ export class Repo {
     this.#configHome = configHome;
   }
 
-  static async init(dir: string, opts?: { configHome?: string }): Promise<Repo> {
-    const store = new ObjectStore(dir);
+  /**
+   * The `main` view every repo is born with — the projection `materialize()` defaults to.
+   *
+   * A pure value, so it can be re-derived by anyone who finds the ref missing rather than
+   * only written once at creation. `createdAt` is the caller's clock: the object is
+   * content-addressed, so two derivations at different times are two oids for the same
+   * view. That is fine — the ref names which one is current, and nothing compares them.
+   */
+  static #defaultMainView(): View {
+    return {
+      type: "view",
+      name: "main",
+      baseViewOid: null,
+      query: { includeStatuses: ["accepted"] },
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Bring a store up to the refs a usable repo needs: `policy` and `view:main`.
+   *
+   * Idempotent by construction — each ref is written only if absent — which is what lets
+   * it run on a store that already exists rather than only on a fresh one. That property
+   * is the fix for #171: `ObjectStore.isRepo` is satisfied by `.avcs/objects` alone, so a
+   * store materialized by anything other than `init` (an object import, a restore from
+   * backup, a server populating a hosted repo) is "present" forever after and `init`
+   * never runs on it again. Such a repo opened cleanly, accepted operations, and then
+   * threw `no such view: main` from every `materialize()` — permanently unusable for
+   * projection, with nothing in the API saying so.
+   *
+   * Deliberately NOT called from {@link open}. Opening is a read, and a read that writes
+   * refs would make a read-only consumer mutate the store it was only inspecting — the
+   * same reason the Lamport clock is not seeded there either. {@link openOrInit} is where
+   * it belongs: that method's contract is "hand back a repo you can use", so it owes the
+   * postcondition on BOTH of its paths, not just the one that creates.
+   */
+  static async #seedDefaults(store: ObjectStore): Promise<void> {
+    // The store's own layout comes first. `isRepo` keys on `objects/` alone, so a
+    // directory can satisfy it while `refs/`, `locks/` and `indexes/` were never made —
+    // and then the very first `setRef` below dies with ENOENT. `ObjectStore.init` is
+    // `mkdir -p` plus a HEAD written only when absent, so re-running it on a complete
+    // store changes nothing.
     await store.init();
-    const repo = new Repo(dir, store, opts?.configHome);
-    // Seed the default policy and the `main` view if absent.
     if (!(await store.getRef("policy"))) {
       const policyOid = await store.put(defaultPolicy());
       await store.setRef("policy", policyOid);
     }
     if (!(await store.getRef("view:main"))) {
-      const view: View = {
-        type: "view",
-        name: "main",
-        baseViewOid: null,
-        query: { includeStatuses: ["accepted"] },
-        createdAt: new Date().toISOString(),
-      };
-      const oid = await store.put(view);
+      const oid = await store.put(Repo.#defaultMainView());
       await store.setRef("view:main", oid);
     }
+  }
+
+  static async init(dir: string, opts?: { configHome?: string }): Promise<Repo> {
+    const store = new ObjectStore(dir);
+    const repo = new Repo(dir, store, opts?.configHome);
+    await Repo.#seedDefaults(store);
     return repo;
   }
 
@@ -443,10 +480,22 @@ export class Repo {
    * `try { open } catch { init }`, and that catch cannot tell "absent" from "present but
    * unreadable"; the second case then gets an empty repo written over it. Here only
    * {@link RepoNotFoundError} routes to creation and every other failure propagates.
+   *
+   * Those two states are not the whole space, though (#171). A directory can also be
+   * **present but incompletely seeded** — `.avcs/objects` exists, so `isRepo` says yes and
+   * this routes to `open`, but no `view:main` was ever written because nothing ever ran
+   * `init` here. That is the normal end state for a store populated by object import or
+   * restored from a backup, and the repo it yielded threw `no such view: main` from every
+   * `materialize()`. So the opened path seeds too: the postcondition "you get a usable
+   * repo" is what this method sells, and it cannot depend on which branch was taken.
    */
   static async openOrInit(dir: string, opts?: { configHome?: string }): Promise<Repo> {
     try {
-      return await Repo.open(dir, opts);
+      const repo = await Repo.open(dir, opts);
+      // Idempotent, and a no-op for the overwhelmingly common case of an `init`-seeded
+      // repo: two `getRef` reads that both hit.
+      await Repo.#seedDefaults(repo.store);
+      return repo;
     } catch (e) {
       if (!(e instanceof RepoNotFoundError)) throw e;
     }
@@ -1582,8 +1631,30 @@ export class Repo {
   // ── views & materialization ──────────────────────────────────────────────
   async getView(name: string): Promise<View> {
     const oid = await this.store.getRef(`view:${name}`);
-    if (!oid) throw new Error(`no such view: ${name}`);
-    return this.store.get<View>(oid);
+    if (oid) return this.store.get<View>(oid);
+    // `main` is not a view someone created — it is the one every repo is born with, and
+    // its absence means the store was never seeded rather than that a name was mistyped
+    // (#171). Re-derive it, mirroring how `policy()` falls back to `defaultPolicy()`: both
+    // refs are written by the same seed block, so both can be missing for the same reason,
+    // and it made no sense that only one of them was survivable.
+    //
+    // Persisted, not just returned — a repo that keeps re-deriving `main` on every read is
+    // still broken, only quietly. Any OTHER name is a genuine lookup failure and still
+    // throws: inventing a view the caller asked for by name would hide the mistake.
+    if (name !== "main") throw new Error(`no such view: ${name}`);
+    const view = Repo.#defaultMainView();
+    // Best-effort persist. Writing it back means a repo does not re-derive `main` on
+    // every read, but a read must not FAIL because the write could not land — a
+    // read-only mount, or a store so incomplete it has no `refs/` yet, would otherwise
+    // turn a recoverable case back into the throw this fallback exists to remove. The
+    // derived view is correct either way; persisting only saves the next caller the work.
+    try {
+      const seeded = await this.store.put(view);
+      await this.store.setRef("view:main", seeded);
+    } catch {
+      // ignored — see above
+    }
+    return view;
   }
 
   async createView(name: string, query: ViewQuery, baseViewOid: string | null = null): Promise<string> {
