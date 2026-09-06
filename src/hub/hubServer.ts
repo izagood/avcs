@@ -554,6 +554,47 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     return;
   }
 
+  // POST /landed → union the client's landed-workspace set into the hub's.
+  //
+  // Landing is recorded as a REF (`workspaces.landed` → a blob holding the name array),
+  // and refs travel one way: `GET /refs` distributes what the hub is authoritative for,
+  // and a client never pushes one. That is right for governance, which the hub owns, but
+  // landing is authored by whoever ran `avcs land` — so the fact had no way to reach the
+  // hub at all. The blob rode along with the objects, nothing pointed at it, and a clone
+  // reduced the landed workspace's ops right back out of the base view: push reported
+  // success, every object arrived, and the tree came out at the pre-land state. Silent,
+  // because no error was available to raise.
+  //
+  // UNION, never replace. `landWorkspace` is idempotent add-only and there is no unland
+  // (docs/16 §5), so the set only grows and merging two of them cannot lose a name or
+  // depend on arrival order. That is what makes this safe without a CAS: concurrent
+  // landers converge on the same set whatever sequence the requests land in.
+  if (method === "POST" && path === "/landed") {
+    let raw: string;
+    try { raw = await readBody(req); } catch (err) { sendJson(res, 413, { error: String((err as Error).message) }); return; }
+    if (!(await enforceTransportAuth(auth, req, res, "POST", "/landed", raw, metrics))) return;
+    let body: { workspaces?: unknown };
+    try { body = JSON.parse(raw); } catch { sendJson(res, 400, { error: "invalid JSON" }); return; }
+    const incoming = body.workspaces;
+    if (!Array.isArray(incoming) || incoming.some((w) => typeof w !== "string")) {
+      sendJson(res, 400, { error: "landed requires { workspaces: string[] }" });
+      return;
+    }
+    const { Repo } = await import("../api/repo.ts");
+    const repo = await Repo.open(repoDir);
+    for (const name of incoming as string[]) await repo.landWorkspace(name);
+    sendJson(res, 200, { landed: await repo.landedWorkspaces() });
+    return;
+  }
+
+  // GET /landed → the hub's landed-workspace set, for a client to union into its own.
+  if (method === "GET" && path === "/landed") {
+    const { Repo } = await import("../api/repo.ts");
+    const repo = await Repo.open(repoDir);
+    sendJson(res, 200, { landed: await repo.landedWorkspaces() });
+    return;
+  }
+
   // GET /objects/:oid → the object JSON (404 if absent).
   if (method === "GET" && path.startsWith("/objects/")) {
     const oid = decodeURIComponent(path.slice("/objects/".length));

@@ -5,6 +5,13 @@
 //
 // 재는 것은 프로토콜 관측 가능한 것뿐이다. 서버 옵션(gated·auth·rateLimit)을 켜고 끄는
 // 검증은 여기 오지 않는다 — 그건 참조 서버의 옵션이고 프로토콜이 아니다.
+//
+// 한계 하나를 명시해 둔다 (#172): **서버측 projection 은 재지 않는다.** 아래 클론 검사의
+// treeHash 비교는 양쪽이 모두 클라이언트다 — 푸시한 쪽과 클론한 쪽. 그러니 그 검사가 세우는
+// 명제는 "서버가 받은 것을 그대로 돌려준다" 이지 "서버가 그 객체들로 트리를 낼 수 있다" 가
+// 아니다. 객체를 정확히 보관·전달하되 스스로는 아무것도 materialize 하지 않는 서버가 core 를
+// 통과하며, 그것이 의도다: projection 은 클라이언트의 일이고, capability 로 협상하는 이
+// 설계에서 부분 서버는 정당하다.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -157,6 +164,9 @@ test("core 만으로 클론이 된다 — 이것이 '호환' 의 최소 정의�
     assert.ok(pulled.pulled > 0, `객체가 넘어와야 한다 — got ${pulled.pulled}`);
 
     if (t.spawned) {
+      // 양쪽 다 클라이언트다: `src` 도 `dst` 도 위에서 `Repo.init` 으로 만들었으므로 둘 다
+      // `view:main` 을 갖는다. 서버는 여기서 바이트 릴레이로만 쓰인다 — 이 비교가 세우는
+      // 명제의 범위는 파일 상단 주석을 보라.
       const want = await (await Repo.open(src)).materialize("main");
       const got = await clone.materialize("main");
       assert.equal(got.treeHash, want.treeHash, "같은 트리를 내야 한다 — 이것이 계약이다");
