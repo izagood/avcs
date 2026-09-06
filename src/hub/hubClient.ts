@@ -7,10 +7,11 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Buffer } from "node:buffer";
 import { ObjectStore } from "../store/objectStore.ts";
 import { keysOf } from "../reducer/reducer.ts";
 import { buildAuthHeader } from "./transportAuth.ts";
-import type { AnyObject, Operation } from "../objects/types.ts";
+import type { AnyObject, Blob, Operation } from "../objects/types.ts";
 
 /** The local actor key used to authenticate a write to a hub (SSH-style transport auth,
  *  see transportAuth.ts). Optional: omit against a read-public/ungated hub that requires
@@ -322,6 +323,40 @@ async function indexIfOperation(store: ObjectStore, obj: AnyObject, oid: string)
  * and never gossiped — same rule as Repo.pull. Returns how many objects were pushed and how
  * many the hub refused.
  */
+/**
+ * The landed-workspace names this replica holds, read straight from the store.
+ *
+ * Deliberately NOT via `Repo`: the transfer layer works on an `ObjectStore` and opening a
+ * full `Repo` here would pull the API layer into the push path for one ref read. The
+ * on-disk shape (`workspaces.landed` → a blob holding a JSON string array) is the same one
+ * `Repo.landWorkspace` writes, and it is stable — docs/16 §5 fixes the set as add-only.
+ */
+async function readLandedWorkspaces(store: ObjectStore): Promise<string[]> {
+  const ref = await store.getRef("workspaces.landed");
+  if (!ref) return [];
+  try {
+    const blob = await store.get<Blob>(ref);
+    // Chunked blobs are for file content; this one is a short name array and never chunks.
+    if (!blob?.data) return [];
+    const text = Buffer.from(blob.data, "base64").toString("utf8");
+    const parsed = JSON.parse(text) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((n): n is string => typeof n === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Merge `names` into this replica's landed set, writing only when it actually grows. */
+async function unionLandedWorkspaces(store: ObjectStore, names: string[]): Promise<void> {
+  const have = new Set(await readLandedWorkspaces(store));
+  const before = have.size;
+  for (const n of names) have.add(n);
+  if (have.size === before) return;
+  const json = JSON.stringify([...have].sort());
+  const oid = await store.put({ type: "blob", data: Buffer.from(json, "utf8").toString("base64"), encoding: "base64" } satisfies Blob);
+  await store.setRef("workspaces.landed", oid);
+}
+
 export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?: HubSigner, opts?: TransferOptions): Promise<{ pushed: number; rejected: number }> {
   const base = hubUrl.replace(/\/$/, "");
   const scope = scopeOf(base);
@@ -484,6 +519,27 @@ export async function pushToHub(localRepoDir: string, hubUrl: string, signWith?:
     // (401, 413, no such route) are not.
     await recordPushedOps(store, base, acceptedOps);
   }
+
+  // Landing rides along with the objects it makes visible (see POST /landed on the hub).
+  // The blob naming the landed workspaces was already pushed above as an ordinary object,
+  // but the REF pointing at it has no push path — refs only ever travel hub→client — so
+  // without this the receiving side reduces a landed workspace's ops straight back out of
+  // the base view and materializes the pre-land tree, with the push having reported
+  // success. Best-effort: a hub that does not serve the route (404/405) is simply older,
+  // and failing an otherwise-complete push over it would be worse than the gap it closes.
+  const landed = await readLandedWorkspaces(store);
+  if (landed.length) {
+    try {
+      const payload = JSON.stringify({ workspaces: landed });
+      await hubFetch(`${base}/landed`, {
+        method: "POST",
+        headers: writeHeaders(signWith, "POST", "/landed", payload, scope),
+        body: payload,
+      }, retry);
+    } catch {
+      // Older hub, or a transient failure — the objects are already there either way.
+    }
+  }
   return { pushed, rejected };
 }
 
@@ -621,6 +677,22 @@ export async function pullFromHub(localRepoDir: string, hubUrl: string, signWith
       if (await store.has(refOid)) await store.setRef(name, refOid);
     }
   }
+  // Adopt the hub's landed-workspace set (the mirror of the POST in `pushToHub`). Union,
+  // not replace: landing is add-only, so a name this replica landed locally must survive
+  // a pull that does not know about it yet.
+  try {
+    const landedRes = await hubFetch(`${base}/landed`, { headers: readHeaders(signWith, "/landed", scopeOf(base)) }, opts?.retry);
+    if (landedRes.ok) {
+      const { landed } = (await landedRes.json()) as { landed?: unknown };
+      if (Array.isArray(landed)) {
+        const names = landed.filter((n): n is string => typeof n === "string");
+        if (names.length) await unionLandedWorkspaces(store, names);
+      }
+    }
+  } catch {
+    // Older hub, or the route is absent — leave the local set alone.
+  }
+
   // Propagate redactions: evict plaintext for blobs redacted after we pulled them.
   const { applyRedactions } = await import("./../store/applyRedactions.ts");
   await applyRedactions(store);
