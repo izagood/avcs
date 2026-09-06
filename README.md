@@ -388,6 +388,13 @@ It reports which levels apply — `core` (the three endpoints, and a clone that 
 source treeHash), then `sync`, `governance`, `queue` as your capability flags allow. A level
 you do not advertise is **skipped, not failed**: a partial server is a legitimate one.
 
+What `core` checks is **object replication and clone-ability**, not server-side projection.
+The treeHash comparison runs between two *clients* — one that pushed, one that cloned — so it
+establishes that your server returned faithfully what it was given, not that your server can
+itself derive a tree from those objects. A server that stores and serves objects correctly but
+never materializes anything passes `core`, and that is intended: projection is a client
+concern, and a server that does it too is doing more than the level asks.
+
 Three implementations to start from:
 
 - **[`examples/server.py`](examples/server.py)** — a complete conforming core-level server in

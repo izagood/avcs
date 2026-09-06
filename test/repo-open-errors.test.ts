@@ -71,3 +71,60 @@ test("경로가 파일이면 조용히 넘어가지 않는다", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ── #171: "없음" 과 "열 수 없음" 만으로는 상태 공간이 덮이지 않는다 ────────────────
+//
+// 세 번째 상태가 있다: **있지만 덜 시드된** 저장소. `isRepo` 는 `.avcs/objects` 하나만 보므로,
+// `init` 이 아닌 경로로 객체 저장소가 생긴 디렉터리(객체 import, 백업 복원, 서버가 호스팅 저장소를
+// 채우는 경우)는 그 순간부터 영원히 "있음" 이고 `init` 은 다시는 돌지 않는다. 그렇게 만들어진
+// 저장소는 멀쩡히 열리고 연산도 받다가 `materialize()` 마다 `no such view: main` 으로 죽었다.
+
+test("openOrInit 은 덜 시드된 저장소도 쓸 수 있는 상태로 돌려준다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "avcs-unseeded-"));
+  const dir = join(root, "repo");
+  try {
+    // `init` 을 거치지 않고 객체 저장소만 만든다 — 이것만으로 isRepo 는 참이 된다.
+    await mkdir(join(dir, ".avcs", "objects"), { recursive: true });
+
+    const repo = await Repo.openOrInit(dir); // init 이 아니라 open 으로 간다
+    // 예전에는 여기서 `no such view: main` 이 났다.
+    await repo.materialize();
+    assert.equal((await repo.getView("main")).name, "main");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// policy() 는 없으면 defaultPolicy() 로 살아남는데 getView 만 던졌다. 두 ref 는 같은 시드
+// 블록이 쓰므로 같은 이유로 함께 없을 수 있다 — 한쪽만 생존 가능한 것이 비대칭이었다.
+test("이미 덜 시드된 채 열린 저장소도 main 을 되찾는다 — policy() 와 같은 대칭", async () => {
+  const root = await mkdtemp(join(tmpdir(), "avcs-unseeded-getview-"));
+  const dir = join(root, "repo");
+  try {
+    await mkdir(join(dir, ".avcs", "objects"), { recursive: true });
+    await mkdir(join(dir, ".avcs", "refs"), { recursive: true });
+
+    const repo = await Repo.open(dir); // open 은 시드하지 않는다 — 읽기가 쓰면 안 되니까
+    assert.ok(await repo.policy(), "policy 는 원래도 살아남았다");
+    assert.equal((await repo.getView("main")).name, "main", "main 도 같아야 한다");
+
+    // 되살린 뷰는 남는다 — 읽을 때마다 다시 만드는 저장소는 조용히 고장난 것이다.
+    const again = await Repo.open(dir);
+    assert.ok(await again.store.getRef("view:main"), "view:main 이 영속화되어야 한다");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// 되살림은 `main` 에만 해당한다. main 은 누가 만든 뷰가 아니라 저장소가 태어날 때부터 갖는
+// 것이고, 그 부재는 "시드가 안 됐다" 는 뜻이다. 다른 이름의 부재는 진짜 조회 실패다.
+test("main 이 아닌 뷰는 없으면 여전히 던진다 — 이름을 지어내지 않는다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "avcs-getview-other-"));
+  const dir = join(root, "repo");
+  try {
+    await Repo.init(dir);
+    await assert.rejects(() => Repo.open(dir).then((r) => r.getView("nope")), /no such view: nope/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

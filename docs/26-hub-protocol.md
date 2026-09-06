@@ -170,6 +170,25 @@ POST /objects         객체 하나
 가리키는 ref 를 채택하면 그것을 읽는 게이트가 실패하고, 그 실패가 정책 판정의 얼굴을 하고
 나온다.
 
+### `GET /landed` · `POST /landed` — 선택
+
+```json
+{ "landed": ["feature-x", "hotfix-y"] }
+```
+
+land 된 workspace 이름의 집합. `/refs` 와 방향이 다르다 — 거버넌스는 hub 가 권위지만
+**land 는 `avcs land` 를 실행한 replica 가 authoring 한다.** 그래서 이 하나는 클라이언트가
+POST 로 올리고, 다른 replica 가 GET 으로 받아 간다.
+
+**양쪽 다 합집합이다. 치환이 아니다.** `landWorkspace` 는 멱등 추가 전용이고 unland 는
+없으므로([16](16-workspace-scope.md) §5) 집합은 커지기만 한다. 그래서 두 집합을 합치는 것이
+이름을 잃지 않고, 도착 순서에도 무관하다 — CAS 없이 수렴한다.
+
+이 경로가 없으면 land 는 **조용히 유실된다.** 이름 배열을 담은 blob 은 일반 객체로 push 되어
+hub 에 멀쩡히 있지만 그것을 가리키는 ref 가 못 간다. 받는 쪽은 landed 집합이 비어 있으니
+그 workspace 의 op 를 base view 에서 도로 걸러내고, push 는 성공을 보고했는데 clone 은 land
+이전 트리를 낸다. 서빙하지 않는 hub 를 향한 클라이언트는 이 요청을 best-effort 로 흘린다.
+
 ## 6. 판정 평면
 
 ### 6-1. `POST /finalize` — 선택
@@ -338,7 +357,7 @@ URL 을 주지 않으면 참조 구현을 띄워 잰다 — 그래서 스위트 
 |---|---|---|
 | `core` | 필수 3개. **이것만으로 클론이 되고 treeHash 가 일치한다** | — |
 | `sync` | 증분 발견(`/sync` 커서)과 배치 전송 | `batch: true` |
-| `governance` | 거버넌스 ref 배포(`/refs`) | `/refs` 가 404 가 아님 |
+| `governance` | 거버넌스 ref 배포(`/refs`)와 land 집합 교환(`/landed`) | `/refs` 가 404 가 아님 |
 | `queue` | 통합 큐와 라이브 이벤트 | `integrate`·`events: true` |
 
 **광고하지 않는 능력의 레벨은 건너뛴다 — 실패가 아니다.** 부분 구현 서버가 1급 시민이라는
