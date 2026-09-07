@@ -38,10 +38,23 @@ const LEVEL_PROBES: Record<Level, readonly string[]> = {
   queue: [],
 };
 
+/**
+ * 사다리 **밖**의 능력(docs/27 §5). 레벨은 누적이라 "queue 통과 = core 통과" 가 성립하지만,
+ * 서로 독립인 능력은 그 순서에 끼울 자리가 없다 — 끝에 두면 통합 큐 없는 미러가 도달하지
+ * 못하고, 중간에 두면 오늘 queue 인 서버가 강등된다. 그래서 확장은 자기 플래그가 참일 때만
+ * 재고, 어느 레벨의 결과도 바꾸지 않는다. 배지는 `queue +reduced` 로 읽는다.
+ */
+export const EXTENSIONS = {
+  reduced: { caps: ["reduced"] as readonly string[] },
+} as const;
+export type Extension = keyof typeof EXTENSIONS;
+
 export interface Capabilities {
   batch?: boolean;
   integrate?: boolean;
   events?: boolean;
+  reduced?: boolean;
+  reducedTreeMaxEntries?: number;
   auth?: string;
   protocol?: number;
   [k: string]: unknown;
@@ -57,6 +70,8 @@ export interface Target {
    *  부분 구현 서버가 1급 시민이라는 것이 프로토콜의 약속이므로(docs/25 §0), 스위트가 그것을
    *  실패로 처리하면 약속을 어기는 쪽이 스위트가 된다. */
   applicableLevels(): Promise<Level[]>;
+  /** 적용되는 확장. 광고하지 않으면 빠진다 — 실패가 아니다. 레벨과 독립이다(docs/27 §5). */
+  applicableExtensions(): Promise<Extension[]>;
   close(): Promise<void>;
 }
 
@@ -152,6 +167,10 @@ export async function openTarget(opts: OpenOpts = {}): Promise<Target> {
         out.push(level);
       }
       return out;
+    },
+    async applicableExtensions(): Promise<Extension[]> {
+      const caps = await capabilities();
+      return (Object.keys(EXTENSIONS) as Extension[]).filter((x) => EXTENSIONS[x].caps.every((c) => caps[c] === true));
     },
     async close(): Promise<void> {
       await hub?.close();

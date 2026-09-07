@@ -132,3 +132,24 @@ test("게이트된 서버: 자격 env 가 있으면 쓰기 검사가 실제로 �
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("확장은 사다리 밖이다 — 레벨 순서에 참여하지 않고 플래그가 켜져 있을 때만 잰다", async () => {
+  const { EXTENSIONS } = await import("./target.ts");
+  assert.deepEqual(Object.keys(EXTENSIONS), ["reduced"]);
+  // 참조 구현은 reduced 를 광고한다 → 확장 적용, 레벨 결과는 불변.
+  const saved = process.env.AVCS_CONFORMANCE_URL;
+  delete process.env.AVCS_CONFORMANCE_URL;
+  const t = await openTarget();
+  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
+  try {
+    assert.deepEqual(await t.applicableExtensions(), ["reduced"]);
+    assert.deepEqual(await t.applicableLevels(), LEVELS, "확장을 더해도 레벨은 그대로다");
+  } finally { await t.close(); }
+});
+
+test("reduced 를 광고하지 않는 서버는 확장이 빠질 뿐 레벨은 유지된다", async () => {
+  const t = await openTarget({ url: "http://127.0.0.1:9", capabilitiesOverride: { batch: true, integrate: true, events: true } });
+  try {
+    assert.deepEqual(await t.applicableExtensions(), []);
+  } finally { await t.close(); }
+});

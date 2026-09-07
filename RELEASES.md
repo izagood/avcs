@@ -26,6 +26,15 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Added — `GET /reduced` and `GET /reduced/blob/:oid` (docs/27): a client that does not
+replicate can read a view's derived state — statuses, conflicts, headOps, treeHash, and the
+path → blob-oid tree map — and fetch synthetic (3-way-merged) blob bytes that exist in no
+store.** `GET /version` advertises `reduced: true` and `reducedTreeMaxEntries`; `protocol`
+stays 5 (docs/26 §9). Not a determinism change: the reducer, the object format and every
+`treeHash` are untouched — the server only calls `Repo.materialize` and serializes the result.
+`hubReduced` / `hubReducedBlob` are exported; the conformance suite gains a `reduced`
+extension axis outside the cumulative level ladder.
+
 **Fixed (determinism) — a pure deletion no longer leaves a blank line behind.
 `MERGE3_VERSION` `text3/0.3.0` → `text3/0.3.1`. This CHANGES `treeHash` for any op set that
 contains a pure deletion.**

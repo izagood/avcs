@@ -12,6 +12,7 @@ import { ObjectStore } from "../store/objectStore.ts";
 import { keysOf } from "../reducer/reducer.ts";
 import { buildAuthHeader } from "./transportAuth.ts";
 import type { AnyObject, Blob, Operation } from "../objects/types.ts";
+import type { ReducedBody } from "./hubServer.ts";
 
 /** The local actor key used to authenticate a write to a hub (SSH-style transport auth,
  *  see transportAuth.ts). Optional: omit against a read-public/ungated hub that requires
@@ -237,6 +238,58 @@ async function hubCaps(base: string, signer: HubSigner | undefined, retry?: Retr
     return { batch: v.batch === true, maxBytes: max };
   } catch {
     return { batch: false, maxBytes: null };
+  }
+}
+
+/**
+ * `GET /reduced` (docs/27 §3.1) — the derived state a replica would compute, read without
+ * replicating. `null` when the server does not serve it (no advertisement, 404/405/501,
+ * unreachable) or the view does not exist: the caller falls back to replicate + reduce,
+ * which is exactly what it did before. Pass the previous `etag` to get `unchanged` (a 304)
+ * instead of a body. The answer is NOT an authority — a replica prefers its own reduce.
+ */
+export async function hubReduced(
+  base: string,
+  view = "main",
+  opts?: { signer?: HubSigner; etag?: string; retry?: RetryOptions },
+): Promise<{ status: "ok"; etag: string; body: ReducedBody } | { status: "unchanged"; etag: string } | null> {
+  const root = base.replace(/\/$/, "");
+  try {
+    const headers = { ...readHeaders(opts?.signer, "/reduced", scopeOf(root)), ...(opts?.etag ? { "if-none-match": opts.etag } : {}) };
+    const res = await hubFetch(`${root}/reduced?view=${encodeURIComponent(view)}`, { headers }, opts?.retry);
+    const etag = res.headers.get("etag") ?? "";
+    if (res.status === 304) { await res.arrayBuffer().catch(() => undefined); return { status: "unchanged", etag: etag || opts?.etag || "" }; }
+    if (!res.ok) { await res.arrayBuffer().catch(() => undefined); return null; }
+    return { status: "ok", etag, body: (await res.json()) as ReducedBody };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `GET /reduced/blob/:oid` (docs/27 §3.2) — bytes of a synthetic blob named in a `/reduced`
+ * answer's `synth` list. `stale` (412) means the reduction moved since `etag`: re-read
+ * `/reduced`. `null` for a stored blob (use `/objects/:oid`), an unknown view, or a server
+ * without the capability.
+ */
+export async function hubReducedBlob(
+  base: string,
+  view: string,
+  oid: string,
+  opts?: { signer?: HubSigner; etag?: string; retry?: RetryOptions },
+): Promise<{ status: "ok"; bytes: Uint8Array } | { status: "stale"; etag: string } | null> {
+  const root = base.replace(/\/$/, "");
+  const path = `/reduced/blob/${encodeURIComponent(oid)}`;
+  try {
+    const headers = { ...readHeaders(opts?.signer, path, scopeOf(root)), ...(opts?.etag ? { "if-match": opts.etag } : {}) };
+    const res = await hubFetch(`${root}${path}?view=${encodeURIComponent(view)}`, { headers }, opts?.retry);
+    if (res.status === 412) { await res.arrayBuffer().catch(() => undefined); return { status: "stale", etag: res.headers.get("etag") ?? "" }; }
+    if (!res.ok) { await res.arrayBuffer().catch(() => undefined); return null; }
+    const j = (await res.json()) as { data?: unknown; encoding?: unknown };
+    if (typeof j.data !== "string" || j.encoding !== "base64") return null;
+    return { status: "ok", bytes: Buffer.from(j.data, "base64") };
+  } catch {
+    return null;
   }
 }
 
