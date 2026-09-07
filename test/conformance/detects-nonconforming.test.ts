@@ -6,7 +6,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { computeOid } from "../../src/core/canonical.ts";
+import { startHub } from "../../src/hub/hubServer.ts";
+import { Repo } from "../../src/api/repo.ts";
+import type { Actor } from "../../src/objects/types.ts";
 
 /** 지정한 방식으로 어긋나는 최소 서버. */
 async function brokenHub(kind:
@@ -132,5 +138,124 @@ test("올바른 최소 서버는 네 검사를 다 통과한다", async () => {
     await checkRecomputesOid(ok.base);
   } finally {
     await ok.close();
+  }
+});
+
+// ── reduced 확장 (docs/27 §5) ──────────────────────────────────────────────────
+// 환원을 흉내낼 필요는 없다 — 참조 허브를 뒤에 두고 GET /reduced 응답만 지정한 방식으로
+// 어긋나게 바꾸는 프록시다. 나머지 경로는 그대로 통과시킨다.
+
+/** 참조 허브를 뒤에 둔 프록시. `kind` 대로 /reduced 만 비튼다. */
+async function brokenReduced(kind: "truncates-tree" | "stale-etag"): Promise<{ base: string; close: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-broken-red-"));
+  const hub = await startHub({ repoDir: dir, port: 0 });
+  // 씨: 파일 둘 — 자를 것이 있어야 잘라 줄 수 있다.
+  const seed = await mkdtemp(join(tmpdir(), "avcs-broken-seed-"));
+  const repo = await Repo.init(seed);
+  const human: Actor = { kind: "human", id: "human:h" };
+  const intent = await repo.createIntent({ title: "t", owner: human.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: human });
+  await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: human, path: "a.txt", content: "a\n", declaredPurpose: "a" });
+  await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: human, path: "b.txt", content: "b\n", declaredPurpose: "b" });
+  await repo.pushHub(hub.url);
+
+  const readBody = (req: import("node:http").IncomingMessage): Promise<string> =>
+    new Promise((r) => { let s = ""; req.on("data", (c) => { s += String(c); }); req.on("end", () => r(s)); });
+
+  const server: Server = createServer((req, res) => {
+    void (async () => {
+      const url = new URL(req.url ?? "/", "http://x");
+      const init: RequestInit = { method: req.method, headers: { "content-type": req.headers["content-type"] ?? "application/json", ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) } };
+      if (req.method === "POST") init.body = await readBody(req);
+      const upstream = await fetch(`${hub.url}${url.pathname}${url.search}`, init);
+      const text = await upstream.text();
+      const headers: Record<string, string> = { "content-type": upstream.headers.get("content-type") ?? "application/json" };
+      const etag = upstream.headers.get("etag");
+      if (url.pathname === "/reduced" && upstream.status === 200) {
+        const j = JSON.parse(text) as { tree?: Record<string, string>; treeOmitted: boolean };
+        if (kind === "truncates-tree" && j.tree) {
+          const [first] = Object.entries(j.tree);
+          j.tree = first ? { [first[0]]: first[1] } : {};
+          j.treeOmitted = false;
+        }
+        headers.etag = kind === "stale-etag" ? '"deadbeefdeadbeefdeadbeefdeadbeef"' : (etag ?? "");
+        res.writeHead(200, headers);
+        res.end(JSON.stringify(j));
+        return;
+      }
+      if (etag) headers.etag = etag;
+      res.writeHead(upstream.status, headers);
+      res.end(text);
+    })().catch((e) => { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: String((e as Error).message) })); });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  return {
+    base: `http://127.0.0.1:${port}`,
+    close: async () => {
+      await new Promise<void>((r) => server.close(() => r()));
+      await hub.close();
+      await rm(dir, { recursive: true, force: true });
+      await rm(seed, { recursive: true, force: true });
+    },
+  };
+}
+
+/** reduced.test.ts 의 "treeOmitted 가 아니면 tree 는 완전하다" 를 그대로 옮긴 것. */
+async function checkTreeComplete(base: string, dst: string): Promise<void> {
+  const clone = await Repo.init(dst);
+  await clone.pullHub(base);
+  const local = await clone.materialize("main");
+  const j = (await (await fetch(`${base}/reduced?view=main`)).json()) as { tree?: Record<string, string>; treeOmitted: boolean };
+  if (!j.treeOmitted) assert.equal(Object.keys(j.tree!).length, local.tree.size, "treeOmitted 가 아니면 tree 는 완전해야 한다 — 잘린 트리는 틀린 트리다");
+}
+
+/** reduced.test.ts 의 "push 하면 ETag 가 바뀐다" 를 그대로 옮긴 것. */
+async function checkEtagMoves(base: string, dir: string): Promise<void> {
+  const first = await fetch(`${base}/reduced?view=main`);
+  const before = first.headers.get("etag");
+  await first.arrayBuffer();
+  const repo = await Repo.init(dir);
+  const human: Actor = { kind: "human", id: "human:h" };
+  const intent = await repo.createIntent({ title: "more", owner: human.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: human });
+  await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: human, path: "c.txt", content: "c\n", declaredPurpose: "c" });
+  await repo.pushHub(base);
+  const second = await fetch(`${base}/reduced?view=main`);
+  const after = second.headers.get("etag");
+  await second.arrayBuffer();
+  assert.notEqual(after, before, "객체가 늘었는데 ETag 가 같다 — 낡은 답이다");
+}
+
+test("reduced 확장은 트리를 잘라 주는 서버를 잡는다", async () => {
+  const b = await brokenReduced("truncates-tree");
+  const dst = await mkdtemp(join(tmpdir(), "avcs-broken-dst-"));
+  try {
+    await assert.rejects(checkTreeComplete(b.base, dst), /완전해야 한다/);
+  } finally { await b.close(); await rm(dst, { recursive: true, force: true }); }
+});
+
+test("reduced 확장은 낡은 ETag 를 주는 서버를 잡는다", async () => {
+  const b = await brokenReduced("stale-etag");
+  const dir = await mkdtemp(join(tmpdir(), "avcs-broken-seed2-"));
+  try {
+    await assert.rejects(checkEtagMoves(b.base, dir), /낡은 답이다/);
+  } finally { await b.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("같은 두 검사가 참조 구현은 통과시킨다 — 검사가 서버를 가리지 않는다", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "avcs-ok-red-"));
+  const hub = await startHub({ repoDir: dir, port: 0 });
+  const dst = await mkdtemp(join(tmpdir(), "avcs-ok-red-dst-"));
+  const more = await mkdtemp(join(tmpdir(), "avcs-ok-red-more-"));
+  try {
+    await checkTreeComplete(hub.url, dst);
+    await checkEtagMoves(hub.url, more);
+  } finally {
+    await hub.close();
+    await rm(dir, { recursive: true, force: true });
+    await rm(dst, { recursive: true, force: true });
+    await rm(more, { recursive: true, force: true });
   }
 });
