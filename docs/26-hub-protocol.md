@@ -18,7 +18,7 @@ GET  /objects/:oid    객체 하나
 POST /objects         객체 하나
 ```
 
-나머지 아홉은 전부 선택이다. 클라이언트는 능력 광고(`GET /version`)를 보고, 광고가 없거나
+나머지는 전부 선택이다. 클라이언트는 능력 광고(`GET /version`)를 보고, 광고가 없거나
 엔드포인트가 `404`·`405`·`501` 을 주면 **스스로 예전 경로로 내려간다**. 이것이 설계 의도다 —
 클라이언트 주석의 표현대로, avcs 는 "자기가 통제하지 않는 배포"를 상대하는 공개 클라이언트다.
 
@@ -58,7 +58,9 @@ POST /objects         객체 하나
   "integratePreview": false,
   "events": true,
   "batch": true,
-  "batchMaxBytes": 8388608
+  "batchMaxBytes": 8388608,
+  "reduced": true,
+  "reducedTreeMaxEntries": 50000
 }
 ```
 
@@ -73,6 +75,8 @@ POST /objects         객체 하나
 | `events` | 라이브 롱폴을 서빙한다 | 주기 폴링 |
 | `batch` | 배치 전송을 서빙한다 | 객체당 요청 1회 |
 | `batchMaxBytes` | 이 서버가 받는 최대 본문 | 클라이언트가 `413` 으로 발견 |
+| `reduced` | 파생 상태 읽기(`/reduced` · `/reduced/blob`)를 서빙한다 — [27](27-derived-state-endpoint.md) | 복제하는 클라이언트는 아무것도 바꾸지 않는다. 얇은 클라이언트는 이 서버에서는 못 한다고 판단한다 |
+| `reducedTreeMaxEntries` | `/reduced` 가 `tree` 를 실어 주는 최대 항목 수. `reduced` 가 참이면 반드시 있다 | — |
 
 `/version` 자체가 없어도 된다. 그때 클라이언트는 **모든 능력을 off 로 가정**한다.
 
@@ -240,6 +244,47 @@ head 를 CAS 로 전진시킨다. 옛 경로이고, `integrate` 를 서빙하지
 - 응답은 **매번 거버넌스 ref 전체**를 함께 담는다 — 객체가 추가되지 않아도 head 전진이
   보이게.
 
+### 6-4. `GET /reduced?view=<name>` · `GET /reduced/blob/:oid?view=<name>` — 선택
+
+파생 상태 읽기. **복제하지 않는 클라이언트**(웹 UI · 봇 · 다른 언어)가 판정과 트리 지도를 묻는다.
+근거와 결정은 [27](27-derived-state-endpoint.md); 여기는 와이어만 기록한다.
+
+```json
+{
+  "view": "main",
+  "cursor": 1421,
+  "materializer": "avcs-text3/0.3.1",
+  "treeHash": "9f2c…",
+  "statuses": { "operation_ab12…": "accepted", "operation_cd34…": "needs_decision" },
+  "headOps": ["operation_ab12…"],
+  "conflicts": [],
+  "fileConflicts": [],
+  "blockedReasons": { "operation_ef56…": "requiredCheck `test` unsatisfied" },
+  "untrustedEvidence": 0,
+  "tree": { "src/a.ts": "blob_1a2b…", "README.md": "blob_3c4d…" },
+  "synth": ["blob_1a2b…"],
+  "treeOmitted": false
+}
+```
+
+- `view` 생략 시 `main`. 없는 view 는 `404`.
+- `cursor` 는 `/sync` · `/events` 와 **같은 커서**다 — 이 판정이 objlog 의 어느 시점 것인지.
+- `statuses` 는 이 view 가 보는 op 전량 → `proposed` · `validating` · `accepted` · `rejected` ·
+  `superseded` · `needs_decision` · `quarantined` 중 하나.
+- `tree` 는 경로 → blob oid. **내용은 없다** — `GET /objects/:oid` 로 필요한 것만 가져온다.
+- `synth` ⊂ `tree` 의 값. 3-way 병합 결과는 어느 저장된 blob 도 아니라 **이 oid 들만**
+  `/objects/:oid` 에 없다. 바이트는 `GET /reduced/blob/:oid?view=` 가 준다 —
+  `{ "oid", "data": "<base64>", "encoding": "base64" }`. 저장된 blob 은 거기서 `404`(두 경로는
+  겹치지 않는다). `If-Match` 가 현재 ETag 와 다르면 `412` — `/reduced` 를 다시 읽으라는 뜻.
+- `treeOmitted: true` 면 `tree` · `synth` 가 빠져 있다. **판정 필드는 그대로다.** `tree` 가
+  `reducedTreeMaxEntries` 를 넘으면 서버는 **잘라 주지 않고 뺀다** — 잘린 객체 목록은 부분이지만
+  잘린 트리는 틀린 트리다. 트리가 필요한 클라이언트는 복제로 내려간다.
+- 응답에는 항상 `ETag` 가 있다. `If-None-Match` 가 일치하면 `304`, 본문 없음. ETag 는
+  클라이언트에게 불투명하다 — 되돌려 줄 뿐이다.
+- **이 응답은 권위가 아니다.** 어느 복제본이든 같은 입력에서 같은 값을 계산한다. 복제하는
+  클라이언트는 자기 환원을 우선하고, 다르면 `cursor` 와 `materializer` 로 진단한다.
+- `protocol` 은 올리지 않는다(§9). 능력은 `reduced` 플래그로만 광고한다.
+
 ## 7. 인증
 
 SSH 를 그대로 옮긴 모양이다. 비밀이 전송되지 않는다.
@@ -337,6 +382,8 @@ ours."
 | `/refs` 에서 없는 객체를 가리키는 ref 를 노출 | 그것을 읽는 게이트가 실패하고, 정책 판정처럼 보인다 |
 | `queued` 를 "클라이언트가 pull 해야 함" 으로 해석 | 재제출이 정상 경로다. 로컬 히스토리를 버리게 하는 판정은 없다 |
 | `ticketId` 를 무시 | 재시도가 중복 랜딩이 된다 |
+| `/reduced` 의 `tree` 를 잘라서 준다 | 없는 파일이 "삭제됨" 으로 읽힌다. 상한을 넘으면 빼고 `treeOmitted: true` 로 말한다 |
+| 합성 blob 을 저장소에 넣거나 `/objects/:oid` 에서 찾게 한다 | 합성 바이트는 저장소에 없고 있어서도 안 된다(redaction 이 평문을 남긴다). `synth` 로 표시하고 `/reduced/blob` 으로 준다 |
 
 ## 11. 적합성 — 자기 서버를 검증한다
 
@@ -363,6 +410,19 @@ URL 을 주지 않으면 참조 구현을 띄워 잰다 — 그래서 스위트 
 **광고하지 않는 능력의 레벨은 건너뛴다 — 실패가 아니다.** 부분 구현 서버가 1급 시민이라는
 것이 §0 의 약속이므로, 스위트가 그것을 실패로 처리하면 약속을 어기는 쪽이 스위트가 된다.
 건너뛴 이유는 로그에 남는다(`(skip queue: 적용 레벨 = core, sync)`).
+
+### 확장 — 사다리 밖
+
+레벨은 누적이지만 **서로 독립인 능력은 그 순서에 끼울 자리가 없다** — 끝에 두면 통합 큐 없는
+읽기 전용 미러가 도달하지 못하고, 중간에 두면 오늘 `queue` 인 서버가 강등된다. 그래서 확장은
+자기 플래그가 참일 때만 재고 **어느 레벨의 결과도 바꾸지 않는다.** 배지는 레벨 + 확장으로 읽는다:
+`queue +reduced`, `core +reduced`.
+
+| 확장 | 무엇을 재나 | 요구 |
+|---|---|---|
+| `reduced` | 서버의 판정·트리가 **같은 객체로 로컬 환원한 것과 같은가**(core 가 재지 않는 서버측 projection), ETag/304, 잘라 주지 않음, 합성 blob 경로 | `reduced: true` |
+
+광고하지 않으면 건너뛴다 — `(skip reduced: 광고 없음)`.
 
 ### 게이트된 서버
 

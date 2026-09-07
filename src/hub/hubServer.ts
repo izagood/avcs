@@ -44,7 +44,11 @@ import type {
  *  request with per-oid verdicts, POST /objects/fetch returns many objects for one wanted-oid
  *  list; `GET /version` advertises `batch: true` plus `batchMaxBytes` (the largest body this
  *  hub accepts) — a client without it keeps the per-object POST /objects and GET /objects/:oid
- *  protocol, which is unchanged. */
+ *  protocol, which is unchanged.
+ *
+ *  Derived-state reads (GET /reduced, GET /reduced/blob — docs/27) are additive and do NOT
+ *  bump the version: docs/26 §9 fixed that rule after v5 — capabilities are advertised by
+ *  flag only. */
 export const HUB_PROTOCOL_VERSION = 5;
 
 /** Default cap on `tree` entries a `/reduced` answer carries (docs/27 §4.1). Above it the
