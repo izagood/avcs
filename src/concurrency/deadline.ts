@@ -47,3 +47,13 @@ export async function withDeadline<T>(fn: () => Promise<T>, ms: number): Promise
     if (timer) clearTimeout(timer);
   }
 }
+
+/**
+ * The hard deadline that backs a cooperative stop at `ms` (#181). The capture is asked to stop
+ * at `ms` and needs a moment to finish the op in flight and flush its staged batch; only if it
+ * cannot stop on its own does the process get exited, at this later bound. `0` (unbounded)
+ * stays unbounded.
+ */
+export function hardDeadlineMs(ms: number): number {
+  return ms > 0 ? ms + Math.min(ms, 15_000) : 0;
+}
