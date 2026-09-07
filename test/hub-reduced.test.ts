@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/api/repo.ts";
 import { startHub, HUB_PROTOCOL_VERSION, type ReducedBody } from "../src/hub/hubServer.ts";
+import { hubReduced, hubReducedBlob } from "../src/hub/hubClient.ts";
 import type { Actor } from "../src/objects/types.ts";
 
 const ai: Actor = { kind: "ai_agent", id: "ai:a" };
@@ -196,6 +197,39 @@ test("/reduced/blob: 저장된 blob 은 404, If-Match 불일치는 412, 없는 v
     assert.equal(stale.headers.get("etag"), etag, "412 는 현재 ETag 를 알려 준다");
 
     assert.equal((await fetch(`${r.hub.url}/reduced/blob/${synthOid}?view=nope`)).status, 404);
+  } finally { await r.close(); }
+});
+
+test("hubReduced: 200 → ok, 같은 etag → unchanged, 미지원 서버 → null", async () => {
+  const r = await rig({});
+  try {
+    const A = await seedTwoFiles(r.dirA);
+    await A.pushHub(r.hub.url);
+    const first = await hubReduced(r.hub.url, "main");
+    assert.ok(first && first.status === "ok");
+    assert.equal(first.body.treeHash, (await A.materialize("main")).treeHash);
+    const second = await hubReduced(r.hub.url, "main", { etag: first.etag });
+    assert.deepEqual(second, { status: "unchanged", etag: first.etag });
+    assert.equal(await hubReduced(r.hub.url, "nope"), null, "없는 view 도 null — 부르는 쪽은 폴백한다");
+    assert.equal(await hubReduced("http://127.0.0.1:9", "main"), null, "닿지 않는 서버는 null");
+  } finally { await r.close(); }
+});
+
+test("hubReducedBlob: 합성 oid → bytes, 낡은 etag → stale, 저장된 oid → null", async () => {
+  const r = await rig({});
+  try {
+    const { repo: A, path } = await seedConcurrentEdits(r.dirA);
+    await A.pushHub(r.hub.url);
+    const red = await hubReduced(r.hub.url, "main");
+    assert.ok(red && red.status === "ok");
+    const synthOid = red.body.tree![path]!;
+    const got = await hubReducedBlob(r.hub.url, "main", synthOid, { etag: red.etag });
+    assert.ok(got && got.status === "ok");
+    assert.equal(Buffer.from(got.bytes).toString("utf8"), "ONE\ntwo\nthree\nfour\nFIVE\n");
+    const stale = await hubReducedBlob(r.hub.url, "main", synthOid, { etag: '"00000000000000000000000000000000"' });
+    assert.ok(stale && stale.status === "stale" && stale.etag === red.etag);
+    const storedOid = await A.putBlob("one\ntwo\nthree\nfour\nfive\n");
+    assert.equal(await hubReducedBlob(r.hub.url, "main", storedOid), null);
   } finally { await r.close(); }
 });
 

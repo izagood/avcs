@@ -49,8 +49,12 @@ export type { IntegrationReservation } from "./api/repo.ts";
 // Hub (server + client) — the replication / trust boundary avcshub productionizes
 export { startHub, HUB_PROTOCOL_VERSION } from "./hub/hubServer.ts";
 export type { HubHandle } from "./hub/hubServer.ts";
-export { pushToHub, pullFromHub, finalizeOnHub } from "./hub/hubClient.ts";
+export { pushToHub, pullFromHub, finalizeOnHub, hubReduced, hubReducedBlob } from "./hub/hubClient.ts";
 export type { HubSigner } from "./hub/hubClient.ts";
+// Derived-state read (docs/27): the wire shape and the reference cap, for a consumer that
+// serves or renders `GET /reduced` itself.
+export type { ReducedBody } from "./hub/hubServer.ts";
+export { REDUCED_TREE_MAX_ENTRIES } from "./hub/hubServer.ts";
 // Live convergence (Phase 15): the sync-watch daemon behind `avcs sync --watch`.
 export { runSyncWatch } from "./hub/syncWatch.ts";
 export type { SyncWatchEvent, SyncWatchOpts } from "./hub/syncWatch.ts";
