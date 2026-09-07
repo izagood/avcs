@@ -26,6 +26,12 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — `avcs commit` now respects `.gitignore` inside a git work tree (#180).** It called
+`commitWorkingTree` without the `ignorePredicate` the hook (#10) and `import` (#48) already
+pass, so the same tree captured differently depending on the command — `avcs commit` next to
+a `node_modules/` pulled all of it into history. A git work tree whose `git` cannot be run now
+says so on stderr instead of silently ignoring nothing. Not a determinism change.
+
 **Added — `GET /reduced` and `GET /reduced/blob/:oid` (docs/27): a client that does not
 replicate can read a view's derived state — statuses, conflicts, headOps, treeHash, and the
 path → blob-oid tree map — and fetch synthetic (3-way-merged) blob bytes that exist in no

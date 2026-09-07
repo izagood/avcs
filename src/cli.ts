@@ -284,7 +284,18 @@ async function landMergedWorkspace(
  *  not-a-repo ⇒ a no-op, leaving the core's own `.avcsignore` as the only filter. The core
  *  prunes ignored directories, so this is invoked per surviving entry, not per ignored file. */
 function gitIgnorePredicate(dir: string): (rel: string) => boolean {
-  if (gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") return () => false;
+  const inside = gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]);
+  if (inside !== "true") {
+    // Two different situations end up here and they must not be treated alike (issue #180):
+    // "not a git repo" (fine — .avcsignore is the only filter, as documented) and "a git
+    // repo whose git could not be run" (PATH of an IDE- or agent-spawned hook, a broken
+    // install). The second used to degrade silently to ignoring nothing, which is how a
+    // repo captured 569 node_modules files with no warning. Say so, once, on stderr.
+    if (inside === null && existsSync(join(dir, ".git"))) {
+      console.error("avcs: this is a git work tree but `git` could not be run — .gitignore is NOT applied; only .avcsignore filters this capture");
+    }
+    return () => false;
+  }
   // One git invocation for the whole tree, not one per entry (issue #64). The old
   // predicate spawned `git check-ignore` per surviving entry — hundreds of process
   // spawns per hook, the dominant cost of a pre-commit ingest and the reason a
@@ -1400,8 +1411,12 @@ async function main(): Promise<void> {
       // whichever command made it. Outside git this resolves to the base view, as before.
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
+      // The same ignore rules as the hook (#10) and `import` (#48): three ways to capture one
+      // tree must agree on what the tree contains. Without this, `avcs commit` next to a
+      // `node_modules/` pulled all of it into history (issue #180) — twice in one repo.
       const r = await repo.commitWorkingTree(cwd, {
         message, actor: author, ...scope, ...declaredIntent(),
+        ignorePredicate: gitIgnorePredicate(cwd),
         allowMassDelete: args.includes("--allow-mass-delete"),
       });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
