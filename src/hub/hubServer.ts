@@ -21,7 +21,8 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { ObjectStore } from "../store/objectStore.ts";
 import { verifyMessage } from "../core/identity.ts";
-import { computeOid } from "../core/canonical.ts";
+import { canonicalize, computeOid, sha256hex } from "../core/canonical.ts";
+import type { ReductionResult } from "../reducer/reducer.ts";
 import { silentLogger, type Logger } from "../observe/logger.ts";
 import { Metrics } from "../observe/metrics.ts";
 import { MATERIALIZER_VERSION } from "../reducer/policy.ts";
@@ -45,6 +46,89 @@ import type {
  *  hub accepts) — a client without it keeps the per-object POST /objects and GET /objects/:oid
  *  protocol, which is unchanged. */
 export const HUB_PROTOCOL_VERSION = 5;
+
+/** Default cap on `tree` entries a `/reduced` answer carries (docs/27 §4.1). Above it the
+ *  tree is OMITTED, never truncated — a truncated tree reads as deletions. Advertised as
+ *  `reducedTreeMaxEntries` so a client learns it up front instead of through a surprise. */
+export const REDUCED_TREE_MAX_ENTRIES = 50_000;
+
+/** What `GET /reduced` answers with (docs/27 §3.1). Maps become plain objects on the wire. */
+export interface ReducedBody {
+  view: string;
+  cursor: number;
+  materializer: string;
+  treeHash: string;
+  statuses: Record<string, string>;
+  headOps: string[];
+  conflicts: unknown[];
+  fileConflicts: unknown[];
+  blockedReasons: Record<string, string>;
+  untrustedEvidence: number;
+  tree?: Record<string, string>;
+  synth?: string[];
+  treeOmitted: boolean;
+}
+
+interface ReducedEntry { etag: string; body: ReducedBody; synth: Map<string, Uint8Array> }
+
+/** Refs that never feed a reduction and grow without bound — one per integration ticket,
+ *  one per bridged git sha. Excluding them keeps the ETag's cost off the integration
+ *  history; every other ref stays in, conservatively (docs/27 §3.4). */
+const ETAG_EXCLUDED_REF = /^(integration:|git:)/;
+
+/** The fingerprint of a reduction's INPUTS. Same inputs ⇒ same body, so a match is a safe
+ *  304 and a safe cache hit; anything that can change the answer changes the tag. */
+async function reducedEtag(store: ObjectStore, view: string, treeMaxEntries: number): Promise<{ etag: string; cursor: number }> {
+  const all = await store.readObjLog();
+  const refs: Record<string, string> = {};
+  for (const [name, oid] of await store.listRefs()) if (!ETAG_EXCLUDED_REF.test(name)) refs[name] = oid;
+  const digest = sha256hex(canonicalize({ v: 1, view, cursor: all.length, materializer: MATERIALIZER_VERSION, treeMaxEntries, refs }));
+  return { etag: `"${digest.slice(0, 32)}"`, cursor: all.length };
+}
+
+function toReducedBody(view: string, cursor: number, r: ReductionResult, treeMaxEntries: number): ReducedBody {
+  const base = {
+    view, cursor, materializer: MATERIALIZER_VERSION, treeHash: r.treeHash,
+    statuses: Object.fromEntries(r.statuses), headOps: r.headOps,
+    conflicts: r.conflicts as unknown[], fileConflicts: r.fileConflicts as unknown[],
+    blockedReasons: Object.fromEntries(r.blockedReasons), untrustedEvidence: r.untrustedEvidence,
+  };
+  if (r.tree.size > treeMaxEntries) return { ...base, treeOmitted: true };
+  return { ...base, tree: Object.fromEntries(r.tree), synth: [...r.synthBlobs.keys()].sort(), treeOmitted: false };
+}
+
+/** The cached reduction for `view`, recomputed only when its ETag moved. `null` ⇒ no such
+ *  view.
+ *
+ *  The tag is read BEFORE and AFTER the reduce and the answer is cached only when the two
+ *  agree — that is the proof the body belongs to the tag. They can disagree for two reasons:
+ *  a write raced in (rare), or the reduce itself appended to the store — the first
+ *  `materialize` on a hub that was only ever pushed to seeds `view:main` (#171), which is
+ *  one object on the objlog. Either way the loop simply reduces again against the settled
+ *  state; if the store keeps moving, the fresh body goes out UNCACHED under the older tag,
+ *  so the next request recomputes and a stale 304 can never be issued. */
+async function reducedFor(store: ObjectStore, repoDir: string, ops: HubOps, metrics: Metrics, view: string): Promise<ReducedEntry | null> {
+  let pre = await reducedEtag(store, view, ops.reducedTreeMaxEntries);
+  const hit = ops.reduced.get(view);
+  if (hit && hit.etag === pre.etag) return hit;
+  const { Repo } = await import("../api/repo.ts");
+  const repo = await Repo.open(repoDir);
+  for (let attempt = 0; ; attempt++) {
+    let r: ReductionResult;
+    try {
+      r = await repo.materialize(view);
+    } catch (e) {
+      if (/no such view/.test(String((e as Error).message))) return null;
+      throw e;
+    }
+    metrics.inc("hub.reduced.materialize");
+    const post = await reducedEtag(store, view, ops.reducedTreeMaxEntries);
+    const entry: ReducedEntry = { etag: pre.etag, body: toReducedBody(view, pre.cursor, r, ops.reducedTreeMaxEntries), synth: r.synthBlobs };
+    if (post.etag === pre.etag) { ops.reduced.set(view, entry); return entry; }
+    if (attempt >= 2) return entry; // store still moving — serve fresh, uncached, under the older tag
+    pre = post;
+  }
+}
 
 export interface HubHandle {
   url: string;
@@ -229,6 +313,8 @@ export async function startHub(opts: {
   /** Live-convergence long-poll tuning (Phase 15.1). `maxWaiters` bounds concurrently
    *  parked GET /events responses (default 256; beyond it new polls get a 503). */
   events?: { maxWaiters?: number };
+  /** `GET /reduced` tuning (docs/27 §4.1). `treeMaxEntries` above which the tree is omitted. */
+  reduced?: { treeMaxEntries?: number };
 }): Promise<HubHandle> {
   const store = new ObjectStore(opts.repoDir);
   await store.init(); // tolerate a fresh/empty repo dir
@@ -277,7 +363,7 @@ export async function startHub(opts: {
     catch (e) { logger.warn("hub.audit.fail", { error: String((e as Error).message) }); }
   };
   const events = new EventHub(store, metrics, opts.events?.maxWaiters ?? 256);
-  const ctx: HubOps = { audit, allow, retryAfterSeconds, events };
+  const ctx: HubOps = { audit, allow, retryAfterSeconds, events, reduced: new Map(), reducedTreeMaxEntries: opts.reduced?.treeMaxEntries ?? REDUCED_TREE_MAX_ENTRIES };
 
   const server: Server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
@@ -354,6 +440,9 @@ interface HubOps {
   retryAfterSeconds(key: string): number;
   /** Parked GET /events waiters (Phase 15.1) — woken after every successful mutation. */
   events: EventHub;
+  /** Per-view cache of the last `/reduced` answer, keyed by ETag (docs/27 §3.5). */
+  reduced: Map<string, ReducedEntry>;
+  reducedTreeMaxEntries: number;
 }
 
 /** Caps on one batched request, so a client cannot make the hub hold an unbounded amount in
@@ -492,7 +581,10 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     // `batch` advertises the issue #99 batched object transfer (POST /objects/batch and
     // POST /objects/fetch); `batchMaxBytes` is the largest request body this hub accepts, so
     // a client can size its chunks instead of discovering the limit through a 413.
-    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true, events: true, batch: true, batchMaxBytes: MAX_BODY });
+    // `reduced` advertises the derived-state read (GET /reduced, docs/27): a client that
+    // does not replicate can read judgements + the tree map; `reducedTreeMaxEntries` is the
+    // cap above which the tree is omitted (never truncated).
+    sendJson(res, 200, { name: "avcs-hub", protocol: HUB_PROTOCOL_VERSION, materializer: MATERIALIZER_VERSION, gated, auth: auth.required ? "required" : "none", integrate: true, events: true, batch: true, batchMaxBytes: MAX_BODY, reduced: true, reducedTreeMaxEntries: ops.reducedTreeMaxEntries });
     return;
   }
 
@@ -551,6 +643,26 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
   // protection/head). Clients pull these to adopt the org's canonical governance.
   if (method === "GET" && path === "/refs") {
     sendJson(res, 200, { refs: Object.fromEntries(await store.listRefs()) });
+    return;
+  }
+
+  // GET /reduced?view=<name> → the derived state a replica would compute (docs/27 §3.1):
+  // statuses · conflicts · headOps · treeHash · tree map · synth list. NOT an authority —
+  // every replica computes the same value from the same objects (§3.6); this exists so a
+  // client that does not replicate (a web UI, a bot, another language) can read it at all.
+  // ETag = fingerprint of the reduction's inputs; If-None-Match ⇒ 304 with no reduce.
+  if (method === "GET" && path === "/reduced") {
+    const view = url.searchParams.get("view") ?? "main";
+    const entry = await reducedFor(store, repoDir, ops, metrics, view);
+    if (!entry) { sendJson(res, 404, { error: `no such view: ${view}` }); return; }
+    if (req.headers["if-none-match"] === entry.etag) {
+      metrics.inc("hub.reduced.304");
+      res.writeHead(304, { etag: entry.etag });
+      res.end();
+      return;
+    }
+    res.setHeader("etag", entry.etag);
+    sendJson(res, 200, entry.body);
     return;
   }
 
