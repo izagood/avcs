@@ -135,6 +135,70 @@ test("tree 가 상한을 넘으면 잘라 주지 않고 뺀다 — 판정 필드
   } finally { await r.close(); }
 });
 
+/** 같은 base 에서 서로 다른 줄을 고친 동시 edit_file 둘 → 3-way 병합 → 합성 blob. */
+async function seedConcurrentEdits(dir: string): Promise<{ repo: Repo; path: string }> {
+  const repo = await Repo.init(dir);
+  const intent = await repo.createIntent({ title: "merge", owner: human.id });
+  const sess = await repo.startSession({ intentOid: intent, actor: ai });
+  const baseText = "one\ntwo\nthree\nfour\nfive\n";
+  const base = await repo.proposeFileWrite({ sessionOid: sess, intentOid: intent, actor: ai, path: "m.txt", content: baseText, declaredPurpose: "base" });
+  await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: ai, path: "m.txt", baseText, newText: "ONE\ntwo\nthree\nfour\nfive\n", declaredPurpose: "edit head", causalDeps: [base] });
+  await repo.proposeEdit({ sessionOid: sess, intentOid: intent, actor: human, path: "m.txt", baseText, newText: "one\ntwo\nthree\nfour\nFIVE\n", declaredPurpose: "edit tail", causalDeps: [base] });
+  return { repo, path: "m.txt" };
+}
+
+test("합성 blob: /objects/:oid 는 404, /reduced/blob/:oid 는 200 이고 바이트가 로컬 환원과 같다", async () => {
+  const r = await rig({});
+  try {
+    const { repo: A, path } = await seedConcurrentEdits(r.dirA);
+    await A.pushHub(r.hub.url);
+    const want = await A.materialize("main");
+    const synthOid = want.tree.get(path)!;
+    assert.ok(want.synthBlobs.has(synthOid), "시드가 합성 blob 을 만들어야 이 테스트가 무언가를 잰다");
+
+    const reduced = await getReduced(r.hub.url);
+    const etag = reduced.headers.get("etag")!;
+    const body = (await reduced.json()) as ReducedBody;
+    assert.deepEqual(body.synth, [synthOid], "synth 목록이 합성 oid 를 가리킨다");
+    assert.equal(body.tree?.[path], synthOid);
+
+    const asObject = await fetch(`${r.hub.url}/objects/${synthOid}`);
+    assert.equal(asObject.status, 404, "합성 blob 은 저장소에 없다 — 있어서도 안 된다");
+
+    const res = await fetch(`${r.hub.url}/reduced/blob/${synthOid}?view=main`, { headers: { "if-match": etag } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("etag"), etag);
+    const blob = (await res.json()) as { oid: string; data: string; encoding: string };
+    assert.equal(blob.oid, synthOid);
+    assert.equal(blob.encoding, "base64");
+    assert.equal(Buffer.from(blob.data, "base64").toString("utf8"), Buffer.from(want.synthBlobs.get(synthOid)!).toString("utf8"));
+    assert.equal(Buffer.from(blob.data, "base64").toString("utf8"), "ONE\ntwo\nthree\nfour\nFIVE\n");
+  } finally { await r.close(); }
+});
+
+test("/reduced/blob: 저장된 blob 은 404, If-Match 불일치는 412, 없는 view 는 404", async () => {
+  const r = await rig({});
+  try {
+    const { repo: A } = await seedConcurrentEdits(r.dirA);
+    await A.pushHub(r.hub.url);
+    const reduced = await getReduced(r.hub.url);
+    const etag = reduced.headers.get("etag")!;
+    const body = (await reduced.json()) as ReducedBody;
+    const synthOid = body.synth![0]!;
+
+    // 저장된 blob: 시드의 base 내용 blob 은 저장소에 있다 → 여기서는 404 (두 경로는 겹치지 않는다)
+    const storedOid = await A.putBlob("one\ntwo\nthree\nfour\nfive\n");
+    assert.equal((await fetch(`${r.hub.url}/objects/${storedOid}`)).status, 200, "전제: 저장된 blob 이다");
+    assert.equal((await fetch(`${r.hub.url}/reduced/blob/${storedOid}?view=main`)).status, 404);
+
+    const stale = await fetch(`${r.hub.url}/reduced/blob/${synthOid}?view=main`, { headers: { "if-match": '"00000000000000000000000000000000"' } });
+    assert.equal(stale.status, 412);
+    assert.equal(stale.headers.get("etag"), etag, "412 는 현재 ETag 를 알려 준다");
+
+    assert.equal((await fetch(`${r.hub.url}/reduced/blob/${synthOid}?view=nope`)).status, 404);
+  } finally { await r.close(); }
+});
+
 test("같은 ETag 면 서버는 다시 환원하지 않는다 — 변경당 1회", async () => {
   const r = await rig({});
   try {

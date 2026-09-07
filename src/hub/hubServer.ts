@@ -646,6 +646,29 @@ async function handle(store: ObjectStore, req: IncomingMessage, res: ServerRespo
     return;
   }
 
+  // GET /reduced/blob/:oid?view=<name> → bytes of a SYNTHETIC blob (docs/27 §3.2). A 3-way
+  // merge result is no stored blob: the reducer carries its bytes, and they live only in
+  // derived caches — putting them in the store would make redaction leave plaintext behind.
+  // Only the synth oids of this view's CURRENT reduction answer 200; a stored blob is 404
+  // here (go to /objects/:oid — the two routes never overlap); an If-Match that no longer
+  // holds is 412, telling the client to re-read /reduced.
+  if (method === "GET" && path.startsWith("/reduced/blob/")) {
+    const oid = decodeURIComponent(path.slice("/reduced/blob/".length));
+    const view = url.searchParams.get("view") ?? "main";
+    const entry = await reducedFor(store, repoDir, ops, metrics, view);
+    if (!entry) { sendJson(res, 404, { error: `no such view: ${view}` }); return; }
+    res.setHeader("etag", entry.etag);
+    const ifMatch = req.headers["if-match"];
+    if (typeof ifMatch === "string" && ifMatch !== entry.etag) {
+      sendJson(res, 412, { error: "reduction changed — re-read /reduced", etag: entry.etag });
+      return;
+    }
+    const bytes = entry.synth.get(oid);
+    if (!bytes) { sendJson(res, 404, { error: "not a synthetic blob of this view's current reduction", oid, view }); return; }
+    sendJson(res, 200, { oid, data: Buffer.from(bytes).toString("base64"), encoding: "base64" });
+    return;
+  }
+
   // GET /reduced?view=<name> → the derived state a replica would compute (docs/27 §3.1):
   // statuses · conflicts · headOps · treeHash · tree map · synth list. NOT an authority —
   // every replica computes the same value from the same objects (§3.6); this exists so a
