@@ -26,6 +26,18 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — `contention()` no longer reads the whole store per authored op (#179).** The keyed
+perspective (the `warnContention` path every capture takes, once per op) is now seeded from the
+entity index — O(ops-on-key), as docs/17 §15.3 always said — instead of a full op scan; the
+ancestry walks run only when another actor has a live op on the key, stop at that op's lamport,
+and the built-upon walk runs once over all keys rather than once per key. Measured on a 9k-op
+store: a 60-op commit 27.4 s → 5.3 s; `avcs status`, which walked 4 000 keys × 600 ancestors
+after a wide commit, returns in seconds instead of minutes. Warnings on a keyed check are
+unchanged. **`avcs status` (the keyless check) now reports every key you authored on** — its
+discovery loop filtered by the key set it was still filling, so it only ever checked the keys
+chained to your first op (measured: 1 of 4 203 keys). Expect more warnings there; they were
+always true. Not a determinism change.
+
 **Fixed — `avcs commit` now respects `.gitignore` inside a git work tree (#180).** It called
 `commitWorkingTree` without the `ignorePredicate` the hook (#10) and `import` (#48) already
 pass, so the same tree captured differently depending on the command — `avcs commit` next to
