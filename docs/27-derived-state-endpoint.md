@@ -1,6 +1,8 @@
 # 27 — 파생 상태 읽기: 복제하지 않는 클라이언트가 판정과 트리를 묻는다
 
-> **상태: 설계 (구현 전).** [izagood/avcs-server#7](https://github.com/izagood/avcs-server/issues/7)이
+> **상태: 1단계 구현됨** — 참조 구현(`hubServer` 두 라우트 · ETag · 캐시) · `hubClient` · 컨포먼스
+> 확장 축 · 26 §6-4. 2단계(avcs-server 의 `ReductionBackend`)는 릴리스 후.
+> [izagood/avcs-server#7](https://github.com/izagood/avcs-server/issues/7)이
 > 제기한 "파생 상태(`OperationStatus`)를 읽을 선택 엔드포인트"의 명세다. 그 이슈의 결론은 맞고
 > 이유 하나는 틀렸다 — §1.3이 그것을 바로잡는다. [26 — 서버 프로토콜](26-hub-protocol.md)이
 > "발명이 아니라 기록"이므로 이 문서가 먼저 있고, 참조 구현이 따르고, 그 다음 26이 기록한다.
