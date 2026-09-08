@@ -26,6 +26,17 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — a topic branch's capture no longer records trunk's advance as the branch's own
+work (#178).** A workspace capture diffs against base, and base is what the store captured on
+trunk — which lags whenever trunk advances outside avcs (merges on the forge, a main checkout
+parked on another branch). A worktree checked out at that newer trunk then authored trunk's
+whole delta as workspace ops: misattributed, flooding cross-line contention, and conflicting
+with base's own copy of the same changes later. Before a workspace capture (`avcs commit`, the
+pre-commit hook), the branch's merge-base with trunk is now captured to base first — from git's
+own objects, tracked files only — and linked (`git:<sha>`), so the branch diff is the branch's.
+Skipped when base already knows the fork point or a later trunk commit; never rolls base back.
+Not a determinism change.
+
 **Fixed — `undo --last` on a workspace or a line undoes THAT scope's last commit (#183).** It
 picked the newest op the view selects, and a workspace view selects every base op (a line view
 every op inherited at its fork), so a fresher base commit was undone from a branch — observed
