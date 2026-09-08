@@ -1813,7 +1813,12 @@ async function main(): Promise<void> {
           const stop = new AbortController();
           const stopTimer = hookMs > 0 ? setTimeout(() => stop.abort(), hookMs) : undefined;
           const res = await withDeadline(async () => {
-            await repo.reindex();
+            // Only committed mode can have objects that arrived OUTSIDE the store's own writes —
+            // git unioned `.avcs/objects` onto disk — and only then do the logs and indexes need
+            // rebuilding. In sidecar mode `.avcs` is git-ignored, so nothing arrived that way,
+            // and `reindex()` re-reads every op for nothing: 29 s of a 32 s hook on a 9k-op
+            // store, most of the deadline gone before the capture even starts (#184).
+            if ((await repo.getGitMode()) === "committed") await repo.reindex();
             // docs/20 §3.4 — the seam this track exists for: a merge into trunk IS the land
             // of the merged branch's workspace. It runs BEFORE the capture on purpose. Once
             // landed, those ops are in the base view, so the merged content already projects

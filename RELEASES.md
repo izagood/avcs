@@ -26,6 +26,18 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — `undo --last` on a workspace or a line undoes THAT scope's last commit (#183).** It
+picked the newest op the view selects, and a workspace view selects every base op (a line view
+every op inherited at its fork), so a fresher base commit was undone from a branch — observed
+twice in one afternoon, the second time while repairing the first. Candidates are now the ops
+tagged with the workspace / authored on the line; a scope with no commit of its own refuses
+instead of reaching into base. Base is unchanged. Not a determinism change.
+
+**Fixed — the post-merge hook reindexes only in committed mode (#184).** Only there can git
+have unioned `.avcs/objects` onto disk; in sidecar mode `reindex()` re-read every op for
+nothing — 29 s of a 32 s hook on a 9k-op store, most of the deadline gone before the capture
+started. Not a determinism change.
+
 **Fixed — a capture that cannot finish inside the git-hook deadline now leaves its progress
 behind (#181).** The hook exited the process at the bound, and because a capture stages its
 writes (`store.batched`) and flushes at the end, that exit discarded every op it had authored:

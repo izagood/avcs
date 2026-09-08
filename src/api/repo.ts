@@ -2492,15 +2492,30 @@ export class Repo {
    *
    * Resolved against what the view currently SELECTS, so a repeat walks back one commit at a
    * time: the ops a previous undo excluded are no longer candidates.
+   *
+   * "On a scope" means authored IN that scope (#183). A workspace view selects every base op
+   * too (docs/16 — the workspace is an isolated layer over base), and a line view selects the
+   * ops it inherited at its fork; the newest of THOSE is frequently a base commit somebody
+   * else just made. Undoing it from a branch is not what `--last` promised, and it happened:
+   * a workspace `undo --last` removed a 111-op base capture, and the base `undo --last` meant
+   * to repair that removed the next-newest base commit instead. Candidates are therefore the
+   * ops tagged with this workspace, or authored on this line; base is unchanged — what the
+   * base view selects is base's own.
    */
   async #lastCommitOps(viewName: string, workspace?: string): Promise<string[]> {
     const res = await this.materialize(viewName, workspace ? { workspace } : undefined);
     const ops: Operation[] = [];
     for (const oid of res.statuses.keys()) {
       const op = await this.store.get<Operation>(oid).catch(() => null);
-      if (op?.type === "operation") ops.push(op);
+      if (op?.type !== "operation") continue;
+      if (workspace && op.workspace !== workspace) continue;
+      if (!workspace && viewName !== "main" && (op.line ?? "main") !== viewName) continue;
+      ops.push(op);
     }
-    if (!ops.length) throw new Error(`undo --last: ${viewName} has no ops left to undo`);
+    if (!ops.length) {
+      const scope = workspace ? `workspace ${workspace}` : viewName === "main" ? "main" : `line ${viewName}`;
+      throw new Error(`undo --last: ${scope} has no commit of its own left to undo (base commits are not undone from a branch — run it on main)`);
+    }
     ops.sort((a, b) => a.lamport - b.lamport || (a.oid as string).localeCompare(b.oid as string));
     const newest = ops[ops.length - 1] as Operation;
     return ops.filter((o) => o.sessionOid === newest.sessionOid).map((o) => o.oid as string);
