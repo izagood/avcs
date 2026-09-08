@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
 import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
+import { catchUpTrunk, catchUpMessage, type CatchUpResult } from "./git/trunkCatchUp.ts";
 import { storeOpenTimeoutMessage, preCommitTimeoutMessage, partialCaptureMessage } from "./git/hookTimeoutMessage.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import { conflictIdFor } from "./reducer/reducer.ts";
@@ -1411,6 +1412,13 @@ async function main(): Promise<void> {
       // whichever command made it. Outside git this resolves to the base view, as before.
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
+      // A topic branch's fork point is trunk's work: if base has not captured it, do that first
+      // so the branch diff below is the branch's own changes, not trunk's advance (#178).
+      {
+        const cu = await catchUpTrunk(repo, cwd, scope, author);
+        const said = catchUpMessage(cu, scope.workspace ?? "");
+        if (said) console.error(said);
+      }
       // The same ignore rules as the hook (#10) and `import` (#48): three ways to capture one
       // tree must agree on what the tree contains. Without this, `avcs commit` next to a
       // `node_modules/` pulled all of it into history (issue #180) — twice in one repo.
@@ -1734,12 +1742,21 @@ async function main(): Promise<void> {
             // captures into that branch's workspace, where it stays isolated until it lands.
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd), signal: stop.signal });
+            const actor = (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" };
+            // A topic branch's fork point is trunk's work: capture it to base first, or the
+            // diff below records trunk's advance as this branch's own (#178).
+            const cu = await catchUpTrunk(repo, cwd, scope, actor, { signal: stop.signal });
+            if ("partial" in cu) return { catchUp: cu } as const;
+            const said = catchUpMessage(cu, scope.workspace ?? "");
+            if (said) console.error(said);
+            return { sync: await repo.gitSync({ message, actor, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd), signal: stop.signal }) } as const;
           }, hardDeadlineMs(hookMs));
           if (stopTimer) clearTimeout(stopTimer);
           if (!res.ok)
             failOpen(preCommitTimeoutMessage(hookMs));
-          const r = res.value;
+          const outcome = res.value as { catchUp?: CatchUpResult; sync?: Awaited<ReturnType<Repo["gitSync"]>> };
+          if (outcome.catchUp) failOpen(catchUpMessage(outcome.catchUp, "this branch")!);
+          const r = outcome.sync!;
           if (r.partial) failOpen(partialCaptureMessage("pre-commit", hookMs, r.captured.ops.length, r.partial.remaining));
           reportContention(r.contention);
           if (r.conflicts.length) {

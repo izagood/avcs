@@ -153,6 +153,17 @@ async gitSync(opts: { message; actor; line?; workDir?; ignorePredicate? })
 > `finalize`는 그런 checkpoint를 거부한다: land되지 않은 op을 담은 트리로 보호된 head를
 > 전진시키는 것은 미완성 작업을 verified head 아래로 공개하는 일이다.
 
+> **fork point 는 base 의 것이다 (#178).** workspace 캡처의 기준은 base 이고, base 는 스토어가
+> trunk 에서 캡처한 것이다. trunk 가 avcs 밖에서 전진하면(포지에서의 머지, 다른 브랜치에 주차된
+> 메인 체크아웃) base 가 뒤처지고, 그 새 trunk 에서 딴 worktree 는 trunk 의 전진을 자기 델타로
+> 보고 workspace op 으로 저작한다 — 귀속이 틀리고, 나중에 base 가 따라잡으면 같은 변경이 두
+> 번 존재해 충돌이 된다. 그래서 workspace 캡처(`avcs commit`, pre-commit 훅) 앞에 `git merge-base
+> <trunk> HEAD` 를 base 가 아는지(`git:<sha>` 링크) 본다. 모르면 그 커밋의 트리를 git 객체에서
+> (`git archive`, 추적 파일만) base 로 먼저 캡처하고 링크한다. base 가 그 지점이나 그 뒤의 trunk
+> 커밋을 이미 알면 건드리지 않는다 — base 를 뒤로 되돌리는 일은 없다. 브랜치가 trunk 커밋을 들고
+> 나타났다는 사실이 base 를 그만큼 전진시킬 근거다; 사람이 메인 체크아웃에서 pull 하는 습관에
+> 의존하지 않는다.
+
 ### 3.4 land 접합 — "git 머지"가 "avcs land"가 되는 지점
 
 이것이 이 트랙의 목적이다. 현재 `post-merge` 훅은 `reindex` + 재투영만 한다 —
