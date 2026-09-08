@@ -1115,6 +1115,18 @@ function decideGroup(
     return out;
   }
 
+  // The same effect, asserted more than once, is agreement (issue #176). Two heads that write
+  // the same blob to the same path, or both delete it, or both move it the same way, differ in
+  // provenance alone — and provenance is not something a human can arbitrate; the conflict
+  // report used to ask them to choose between two indistinguishable options. Accepting every
+  // such head yields one outcome for the key whatever the order (determinism holds) and keeps
+  // both records in history. Reachable by ordinary use: two machines that `init` + `import` the
+  // same tree, or a file deleted on two scopes. Different bytes still contend below.
+  if (viable.length > 1 && !needsHuman && new Set(viable.map((o) => canonicalize(o.body))).size === 1) {
+    for (const o of viable) out.set(o.oid as string, "accepted");
+    return out;
+  }
+
   const ranked = [...viable].sort((a, b) => {
     const d = evalOf(b, inConflict).score - evalOf(a, inConflict).score;
     if (d !== 0) return d;

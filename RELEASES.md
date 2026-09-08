@@ -26,6 +26,25 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Breaking (determinism) — identical-effect heads are agreement, not a tie (#176).
+`MERGE3_VERSION` `text3/0.3.1` → `text3/0.4.0`. This CHANGES `treeHash` for any op set in which
+two or more contending heads on a key had the same effect.** Two ops that write the same blob to
+the same path (or both delete it, or both move it the same way) differ in provenance alone, and
+the reducer sent exactly that case to `needs_decision` ("score tie — needs a human"): two repos
+that `init` + `import` the same tree and are merged projected NOTHING, and a file deleted
+concurrently on two scopes stayed as a 61-way tie nobody could meaningfully decide. Such heads
+are now all `accepted`, like concurrent disjoint text edits already were.
+
+- Affected: only stores that hold such a tie. There the key's projection changes from "absent"
+  (or the pre-delete content) to the agreed blob (or the deletion) — the outcome either
+  indistinguishable option would have produced. Every other op set is byte-identical.
+- Persisted compaction snapshots invalidate on the stamp mismatch and re-reduce once. Existing
+  checkpoints keep their recorded `treeHash` (immutable records); a re-projection of an affected
+  tree differs, correctly.
+- Different bytes at the same path, or a delete racing a write, still contend exactly as before.
+- **Use `materializerVersion`, not the package version, to tell which side of this boundary a
+  replica is on** (`text3/0.3.1` before, `text3/0.4.0` after).
+
 **Fixed — a topic branch's capture no longer records trunk's advance as the branch's own
 work (#178).** A workspace capture diffs against base, and base is what the store captured on
 trunk — which lags whenever trunk advances outside avcs (merges on the forge, a main checkout

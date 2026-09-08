@@ -28,7 +28,12 @@
 // empty line. An op set whose changes are all replacements/insertions is byte-identical either
 // way; one containing a pure deletion materializes DIFFERENTLY (correctly) now, so the stamp
 // moves — a replica on the older substrate must not silently disagree about that tree.
-export const MERGE3_VERSION = "text3/0.3.1";
+// 0.4.0 — identical-effect heads are agreement, not a tie (#176). The change is in the reducer's
+// group decision, not in the text merge, but `MATERIALIZER_VERSION` derives from this stamp and
+// the tree it projects changes: a key whose heads wrote the same blob (or all deleted it) used to
+// land in `needs_decision` and project nothing (or the pre-delete content); it now projects that
+// blob (or the deletion). Any store holding such a tie reduces differently, so the stamp moves.
+export const MERGE3_VERSION = "text3/0.4.0";
 
 /** A maximal changed segment: base lines [start,end) are replaced by `lines`. */
 interface Hunk {
