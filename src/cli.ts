@@ -23,11 +23,11 @@ import { execFileSync } from "node:child_process";
 import { Repo, kindOfActorId, type GitMode } from "./api/repo.ts";
 import { machineKeyPath, machineKeystoreDir } from "./api/keystore.ts";
 import { type BranchScope, mergedBranchFromReflog, scopeForBranch } from "./git/scope.ts";
-import { storeOpenTimeoutMessage, preCommitTimeoutMessage } from "./git/hookTimeoutMessage.ts";
+import { storeOpenTimeoutMessage, preCommitTimeoutMessage, partialCaptureMessage } from "./git/hookTimeoutMessage.ts";
 import { ObjectStore } from "./store/objectStore.ts";
 import { conflictIdFor } from "./reducer/reducer.ts";
 import type { Operation, Actor, Undo } from "./objects/types.ts";
-import { withDeadline, hookTimeoutMs } from "./concurrency/deadline.ts";
+import { withDeadline, hookTimeoutMs, hardDeadlineMs } from "./concurrency/deadline.ts";
 
 const args = process.argv.slice(2);
 let cmd = args[0];
@@ -284,7 +284,18 @@ async function landMergedWorkspace(
  *  not-a-repo ⇒ a no-op, leaving the core's own `.avcsignore` as the only filter. The core
  *  prunes ignored directories, so this is invoked per surviving entry, not per ignored file. */
 function gitIgnorePredicate(dir: string): (rel: string) => boolean {
-  if (gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") return () => false;
+  const inside = gitCmd(dir, ["rev-parse", "--is-inside-work-tree"]);
+  if (inside !== "true") {
+    // Two different situations end up here and they must not be treated alike (issue #180):
+    // "not a git repo" (fine — .avcsignore is the only filter, as documented) and "a git
+    // repo whose git could not be run" (PATH of an IDE- or agent-spawned hook, a broken
+    // install). The second used to degrade silently to ignoring nothing, which is how a
+    // repo captured 569 node_modules files with no warning. Say so, once, on stderr.
+    if (inside === null && existsSync(join(dir, ".git"))) {
+      console.error("avcs: this is a git work tree but `git` could not be run — .gitignore is NOT applied; only .avcsignore filters this capture");
+    }
+    return () => false;
+  }
   // One git invocation for the whole tree, not one per entry (issue #64). The old
   // predicate spawned `git check-ignore` per surviving entry — hundreds of process
   // spawns per hook, the dominant cost of a pre-commit ingest and the reason a
@@ -1400,8 +1411,12 @@ async function main(): Promise<void> {
       // whichever command made it. Outside git this resolves to the base view, as before.
       const scope = await scopeFor(repo, cwd, flag("--line"));
       await ensureLine(repo, scope.line);
+      // The same ignore rules as the hook (#10) and `import` (#48): three ways to capture one
+      // tree must agree on what the tree contains. Without this, `avcs commit` next to a
+      // `node_modules/` pulled all of it into history (issue #180) — twice in one repo.
       const r = await repo.commitWorkingTree(cwd, {
         message, actor: author, ...scope, ...declaredIntent(),
+        ignorePredicate: gitIgnorePredicate(cwd),
         allowMassDelete: args.includes("--allow-mass-delete"),
       });
       if (!r.ops.length) { console.log("nothing to commit (working tree matches the view)"); break; }
@@ -1706,16 +1721,26 @@ async function main(): Promise<void> {
           // Capture working-tree edits as ops, gate on conflicts, checkpoint, reproject,
           // re-stage the canonical projection, and stash the provenance for the next hooks.
           const message = process.env.AVCS_COMMIT_MESSAGE ?? "git commit";
+          // Two bounds (#181). At `hookMs` the capture is asked to STOP: it finishes the op in
+          // flight, flushes what it staged and returns `partial`, so every run leaves progress
+          // behind and repeated commits converge. The hard deadline behind it is the old
+          // fail-open for a capture that cannot stop cooperatively (a store lock, a synchronous
+          // section) — that exit drops the staged batch, which is exactly why it is no longer
+          // the first line of defence.
+          const stop = new AbortController();
+          const stopTimer = hookMs > 0 ? setTimeout(() => stop.abort(), hookMs) : undefined;
           const res = await withDeadline(async () => {
             // docs/20 §3.3: on trunk this captures to the base view; on a topic branch it
             // captures into that branch's workspace, where it stays isolated until it lands.
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd) });
-          }, hookMs);
+            return repo.gitSync({ message, actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd), signal: stop.signal });
+          }, hardDeadlineMs(hookMs));
+          if (stopTimer) clearTimeout(stopTimer);
           if (!res.ok)
             failOpen(preCommitTimeoutMessage(hookMs));
           const r = res.value;
+          if (r.partial) failOpen(partialCaptureMessage("pre-commit", hookMs, r.captured.ops.length, r.partial.remaining));
           reportContention(r.contention);
           if (r.conflicts.length) {
             console.error(`avcs: ${r.conflicts.length} open conflict(s) — resolve via \`avcs conflicts\` before committing.`);
@@ -1783,6 +1808,10 @@ async function main(): Promise<void> {
           // Capturing first ingests the pulled tree as ops, making reprojection a no-op
           // on it; in committed mode the capture finds no diff and this reduces to the
           // old behavior plus a checkpoint.
+          // Same two bounds as pre-commit (#181): ask the capture to stop at `hookMs`, keep the
+          // hard exit behind it for a capture that cannot stop on its own.
+          const stop = new AbortController();
+          const stopTimer = hookMs > 0 ? setTimeout(() => stop.abort(), hookMs) : undefined;
           const res = await withDeadline(async () => {
             await repo.reindex();
             // docs/20 §3.4 — the seam this track exists for: a merge into trunk IS the land
@@ -1793,11 +1822,14 @@ async function main(): Promise<void> {
             const outcome = await landMergedWorkspace(repo, cwd);
             const scope = await scopeFor(repo, cwd);
             await ensureLine(repo, scope.line);
-            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd) });
+            const sync = await repo.gitSync({ message: process.env.AVCS_COMMIT_MESSAGE ?? "git merge", actor: (await repo.localAuthor({ id: process.env.AVCS_AUTHOR })) ?? { kind: "human" as const, id: "human:cli" }, workDir: cwd, ...scope, ...declaredIntent(), ignorePredicate: gitIgnorePredicate(cwd), signal: stop.signal });
             return { outcome, scope, sync };
-          }, hookMs);
-          if (!res.ok) failOpen(`avcs: post-merge sync exceeded ${hookMs}ms — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
-          else {
+          }, hardDeadlineMs(hookMs));
+          if (stopTimer) clearTimeout(stopTimer);
+          if (!res.ok) failOpen(`avcs: post-merge sync exceeded ${hookMs}ms and could not stop cleanly — skipped; run \`avcs git-sync -m "post-merge" --no-add\` if the store looks stale (#33).`);
+          else if (res.value.sync.partial) {
+            failOpen(partialCaptureMessage("post-merge", hookMs, res.value.sync.captured.ops.length, res.value.sync.partial.remaining));
+          } else {
             const { outcome, scope, sync } = res.value;
             if ("landed" in outcome) console.log(`avcs: landed workspace ${outcome.landed} — its ops are now part of the base view`);
             else if (outcome.needsHuman) {

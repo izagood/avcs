@@ -1131,6 +1131,10 @@ export class Repo {
    * and backfills the log for a store created before A5.
    */
   async #allOpsTailed(): Promise<Operation[]> {
+    // Counted so a test can assert a code path did NOT read the whole store (#179): the cost
+    // of everything below is O(all ops), and a hot path that pays it per authored op turns a
+    // commit into O(M × N).
+    this.metrics.inc("ops.fullScan");
     let log = await this.store.readOpLog();
     if (log.length === 0) {
       // Pre-A5 store (no log yet) — scan once, backfill the log, warm the cache.
@@ -1527,22 +1531,39 @@ export class Repo {
         myOpOids.push(op.oid as string);
         for (const k of keysOf(op)) keys.add(k);
       }
+    } else if (mine && keys.size) {
+      // Keyed perspective — the `proposeOperation({ warnContention })` path, i.e. once per
+      // authored op. "My ops on these keys" is exactly what the entity index answers, in
+      // O(ops-on-key), which is the contract docs/17 §15.3 states. Seeding it by reading
+      // every op in the store instead made each authored op cost a full store read: 67 ops on
+      // a 9k-op store took 30 s, and a 585-op commit could never finish inside the hook
+      // deadline (#179, #181).
+      for (const key of keys) {
+        for (const oid of await this.store.readEntityIndex(key)) {
+          if (!(await this.store.has(oid))) continue;
+          const op = await this.store.get<Operation>(oid);
+          if (op.actor.id === mine) myOpOids.push(oid);
+        }
+      }
     } else if (mine) {
+      // No keys: the actor's keys can only be discovered from the ops themselves. This is the
+      // `avcs status` path — once per command, not once per op — so the full scan is the
+      // honest cost here.
       for (const op of await this.#allOpsTailed()) {
         if (op.actor.id !== mine) continue;
-        if (keys.size && ![...keysOf(op)].some((k) => keys.has(k))) continue;
         myOpOids.push(op.oid as string);
-        if (!args.keys?.length) for (const k of keysOf(op)) keys.add(k);
+        for (const k of keysOf(op)) keys.add(k);
       }
     }
     if (!keys.size) return [];
 
-    // Ops I've already seen/built on are not surprises — they're my history.
-    const myClosure = myOpOids.length ? await this.#closureOf(myOpOids) : new Set<string>();
     const rejected = new Set((await this.store.collect<Decision>("decision")).flatMap((d) => d.rejectedOps));
     const leases = await this.activeLeases();
 
-    const out: ContentionWarning[] = [];
+    // Read every key's ops once, up front: the two ancestry walks below only matter when some
+    // OTHER actor has a live op on one of these keys. With no such candidate — the
+    // single-author case, which is most commits — no ancestry is walked at all.
+    const keyOps = new Map<string, Operation[]>();
     for (const key of [...keys].sort()) {
       const ops: Operation[] = [];
       for (const oid of await this.store.readEntityIndex(key)) {
@@ -1552,9 +1573,20 @@ export class Repo {
         if (!args.acrossLines && (op.line ?? "main") !== line) continue;
         ops.push({ ...op, oid } as Operation);
       }
-      // An op some later op (on any key) causally builds on is superseded work, not
-      // contention — one ancestry walk over the union of the key ops' deps finds them.
-      const builtUpon = await this.#closureOf(ops.flatMap((o) => o.causalDeps));
+      keyOps.set(key, ops);
+    }
+    const allKeyOps = [...keyOps.values()].flat();
+    const candidates = allKeyOps.filter((o) => o.actor.id !== mine && !rejected.has(o.oid as string));
+    // Ops I've already seen/built on are not surprises — they're my history.
+    const myClosure = candidates.length && myOpOids.length ? await this.#closureOf(myOpOids) : new Set<string>();
+    // An op some later op — on any of these keys — causally builds on is superseded work, not
+    // contention. ONE ancestry walk over the union of every key op's deps finds them. Walking
+    // it per key was the second O(N) in here: after a wide commit every op names ~600 heads,
+    // so `status` over 4 000 keys walked 4 000 × 600 ancestors and never came back (#179).
+    const builtUpon = candidates.length ? await this.#closureOf(allKeyOps.flatMap((o) => o.causalDeps)) : new Set<string>();
+
+    const out: ContentionWarning[] = [];
+    for (const [key, ops] of keyOps) {
       const theirs = ops
         .filter((o) => {
           const oid = o.oid as string;
@@ -1920,7 +1952,20 @@ export class Repo {
 
   /** Causal closure (op oids) of a frontier. Missing objects are skipped — callers gate
    *  completeness separately via #missingCausalDeps. */
+  /**
+   * Causal closure of `heads` (the heads included), memoized by the head set.
+   *
+   * The memo is sound because the store is append-only: an op's `causalDeps` never change and
+   * a new op never becomes an ancestor of an existing one, so the closure of a given head set
+   * is a fixed fact. It pays off where the same heads are asked about repeatedly — every op a
+   * capture authors names the same `deps`, so contention's built-upon walk is one walk per
+   * commit instead of one per op (#179). The result is shared, not copied: callers only read.
+   */
   async #closureOf(heads: string[]): Promise<Set<string>> {
+    if (heads.length === 0) return new Set();
+    const key = heads.length === 1 ? heads[0]! : sha256hex([...new Set(heads)].sort().join("\n"));
+    const hit = this.#closureMemo.get(key);
+    if (hit) return hit;
     const seen = new Set<string>();
     const stack = [...heads];
     while (stack.length) {
@@ -1931,8 +1976,12 @@ export class Repo {
       const op = await this.store.get<Operation>(id);
       for (const d of op.causalDeps) if (!seen.has(d)) stack.push(d);
     }
+    if (this.#closureMemo.size >= 64) this.#closureMemo.delete(this.#closureMemo.keys().next().value!);
+    this.#closureMemo.set(key, seen);
     return seen;
   }
+  /** Head-set signature → closure. Bounded; entries are never stale (see `#closureOf`). */
+  #closureMemo = new Map<string, Set<string>>();
 
   #queueRel(view: string): string {
     return join("queue", `${view}.json`);
@@ -4174,6 +4223,11 @@ export class Repo {
       /** Author a deletion that covers (almost) the whole tree. Off by default — see
        *  {@link MassDeleteError} for why that is not paranoia. */
       allowMassDelete?: boolean;
+      /** Stop authoring at the next op boundary once aborted (#181). Everything authored up
+       *  to that point is flushed and reported as usual; `partial.remaining` counts the
+       *  changes that were NOT authored, so the caller can say so and the next capture can
+       *  pick up from here instead of from zero. */
+      signal?: AbortSignal;
     },
   ): Promise<{
     ops: string[];
@@ -4185,6 +4239,8 @@ export class Repo {
     renamed: { from: string; to: string }[];
     intent: string;
     contention: ContentionWarning[];
+    /** Present only when `signal` aborted mid-way: the lists above hold what WAS authored. */
+    partial?: { remaining: number };
   }> {
     const view = opts.line ?? "main";
     const ws = opts.workspace ? { workspace: opts.workspace } : {};
@@ -4273,12 +4329,24 @@ export class Repo {
       }
     };
     const warn = { warnContention: true, contentionAcrossLines: true, onContention: collect } as const;
+    // Cooperative stop (#181). Checked at every op boundary, never mid-op: an aborted capture
+    // returns what it authored — which the enclosing `batched` then flushes — and counts the
+    // rest. Exiting the process at a deadline instead threw the whole staged batch away, so a
+    // capture that could not finish inside the bound made NO progress, and the next commit
+    // repeated it from zero, forever.
+    const stopped = (): boolean => opts.signal?.aborted === true;
+    let remaining = 0;
+    const doneRenamed: { from: string; to: string }[] = [];
+    const doneAdded: string[] = [];
+    const doneModified: string[] = [];
+    const doneRemoved: string[] = [];
     // Moves first, sorted by source. The paired `edit_file` must causally FOLLOW its own
     // rename: it names the destination path, so if the two were concurrent the reducer would
     // read them as a move and an unrelated edit fighting over that path (docs/19 §3.2 leaves
     // rename-vs-destination a genuine contest, and rightly so). Depending on the rename also
     // states the truth — the author moved the file, then wrote to where it now lives.
     for (const { from, to } of renamed) {
+      if (stopped()) { remaining++; continue; }
       const rn = await this.proposeOperation({
         sessionOid: sess, intentOid: intent, actor: opts.actor,
         target: { entityKind: "file", entityId: from },
@@ -4286,6 +4354,7 @@ export class Repo {
         declaredPurpose: `move ${from} → ${to}`, causalDeps: deps, line: opts.line, ...ws, ...warn,
       });
       ops.push(rn);
+      doneRenamed.push({ from, to });
       const base = current.get(from)!;
       const content = disk.get(to)!;
       if (base.equals(content)) continue; // a pure move needs no second op
@@ -4302,6 +4371,7 @@ export class Repo {
     // One sorted pass over both categories keeps op authoring order (and therefore lamport
     // assignment) exactly as before; only the op KIND differs per category.
     for (const path of [...added, ...modified].sort()) {
+      if (stopped()) { remaining++; continue; }
       const content = disk.get(path)!;
       const base = isModified.has(path) ? current.get(path)! : undefined;
       const common = { sessionOid: sess, intentOid: intent, actor: opts.actor, path, declaredPurpose: opts.message, causalDeps: deps, line: opts.line, ...ws, ...warn };
@@ -4310,11 +4380,17 @@ export class Repo {
           ? await this.proposeEdit({ ...common, newText: content.toString("utf8"), baseBlobOid: await this.putBlob(base) })
           : await this.proposeFileWrite({ ...common, content }),
       );
+      (isModified.has(path) ? doneModified : doneAdded).push(path);
     }
     for (const path of removed.sort()) {
+      if (stopped()) { remaining++; continue; }
       ops.push(await this.proposeOperation({ sessionOid: sess, intentOid: intent, actor: opts.actor, target: { entityKind: "file", entityId: path }, body: { kind: "delete_file", path }, declaredPurpose: `delete ${path}`, causalDeps: deps, line: opts.line, ...ws, ...warn }));
+      doneRemoved.push(path);
     }
-    return { ops, added: added.sort(), modified: modified.sort(), removed: removed.sort(), renamed, intent, contention };
+    return {
+      ops, added: doneAdded.sort(), modified: doneModified.sort(), removed: doneRemoved.sort(), renamed: doneRenamed, intent, contention,
+      ...(remaining ? { partial: { remaining } } : {}),
+    };
     });
   }
 
@@ -4518,7 +4594,7 @@ export class Repo {
    * Git invocation (`git add`) is intentionally left to the caller/CLI so this core stays
    * git-agnostic; `.avcs/.gitignore` (ensured here) makes a plain `git add -A` mode-correct.
    */
-  async gitSync(opts: { message: string; actor: Actor; line?: string; workspace?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean; intentOid?: string }): Promise<{
+  async gitSync(opts: { message: string; actor: Actor; line?: string; workspace?: string; workDir?: string; ignorePredicate?: (rel: string) => boolean; intentOid?: string; signal?: AbortSignal }): Promise<{
     mode: GitMode;
     captured: { ops: string[]; added: string[]; modified: string[]; removed: string[]; renamed: { from: string; to: string }[]; intent: string };
     /** Cross-line early warnings the capture raised (docs/17 §15.3): another branch/session
@@ -4528,6 +4604,10 @@ export class Repo {
     checkpoint?: string;
     treeHash?: string;
     reprojected?: number;
+    /** The capture was stopped by `signal` at an op boundary (#181): what `captured` lists is
+     *  durable, `remaining` changes are not yet authored, and no checkpoint/reprojection was
+     *  made — the next sync continues from here. */
+    partial?: { remaining: number };
   }> {
     // The STORE is single (`this.dir`); the working tree projected/captured may be a
     // separate git worktree (`workDir`). They coincide for a plain, non-worktree repo.
@@ -4540,11 +4620,18 @@ export class Repo {
     // this working tree oscillate between two different trees.
     const wsOpt = opts.workspace ? { workspace: opts.workspace } : undefined;
     // 1. Capture direct working-tree edits as ops before anything else.
-    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(wsOpt ?? {}), ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}), ...(opts.intentOid ? { intentOid: opts.intentOid } : {}) });
+    const cap = await this.commitWorkingTree(workDir, { message: opts.message, actor: opts.actor, ...lineOpt, ...(wsOpt ?? {}), ...(opts.ignorePredicate ? { ignorePredicate: opts.ignorePredicate } : {}), ...(opts.intentOid ? { intentOid: opts.intentOid } : {}), ...(opts.signal ? { signal: opts.signal } : {}) });
     const captured = { ops: cap.ops, added: cap.added, modified: cap.modified, removed: cap.removed, renamed: cap.renamed, intent: cap.intent };
     // Ensure the gitignore reflects the current mode (pre-existing repos never wrote one).
     const mode = await this.getGitMode();
     await this.#writeGitignore(mode);
+    if (cap.partial) {
+      // Stopped at an op boundary by the caller's signal (#181). What was authored is flushed
+      // and durable, but the view is not yet the working tree, so neither a checkpoint nor a
+      // reprojection would be true — the next sync picks up from here instead of from zero.
+      this.logger.info("git.sync.partial", { view, mode, workspace: opts.workspace, capturedOps: captured.ops.length, remaining: cap.partial.remaining });
+      return { mode, captured, contention: cap.contention, conflicts: [], partial: cap.partial };
+    }
     // 2. Conflict gate.
     const res = await this.materialize(view, wsOpt);
     if (res.conflicts.length > 0) return { mode, captured, contention: cap.contention, conflicts: res.conflicts };

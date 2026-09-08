@@ -190,9 +190,13 @@ export class ObjectStore {
   }
   async readEntityIndex(key: string): Promise<string[]> {
     const p = this.#indexPathFor(key);
-    if (!existsSync(p)) return [];
     const seen = new Set<string>();
-    for (const line of (await readFile(p, "utf8")).split("\n")) if (line) seen.add(line);
+    if (existsSync(p)) for (const line of (await readFile(p, "utf8")).split("\n")) if (line) seen.add(line);
+    // Read-your-writes — the same rule `has`, `get` and `readOpLog` already follow: an append
+    // staged by the enclosing `batched()` is part of this store's state for anyone reading
+    // through it. Without it the index lagged the store by a whole capture, so a per-op check
+    // inside one saw none of the ops that capture had authored so far (#179).
+    if (this.#batch) for (const [k, oid] of this.#batch.index) if (k === key) seen.add(oid);
     return [...seen];
   }
 

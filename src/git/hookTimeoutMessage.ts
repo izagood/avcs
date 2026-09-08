@@ -24,11 +24,30 @@ export function storeOpenTimeoutMessage(phase: string | undefined, ms: number): 
   );
 }
 
-/** The ingest ran and was cut off partway: some of it is on disk, the rest is not. */
+/**
+ * The capture stopped cleanly at the bound (#181): it finished the op in flight, flushed what
+ * it had staged, and counted the rest. This is the message a slow ingest should normally end
+ * with — every run leaves progress behind, so repeated commits converge instead of repeating
+ * the same unfinished work forever.
+ */
+export function partialCaptureMessage(phase: "pre-commit" | "post-merge", ms: number, capturedOps: number, remaining: number): string {
+  return (
+    `avcs: ${phase} exceeded ${ms}ms and stopped at an op boundary — git proceeds; ${capturedOps} operation(s) were captured and are durable, ${remaining} change(s) were not reached (#181).\n` +
+    `  This commit carries no AVCS checkpoint or trailer. The next commit (or \`avcs git-sync -m "<message>"\`) continues from here, not from zero.\n` +
+    `  AVCS_HOOK_TIMEOUT_MS=0 finishes in one go; a larger value raises the bound.`
+  );
+}
+
+/**
+ * The hard deadline fired: the capture could not stop cooperatively (a store lock, a
+ * synchronous section) and the process is exiting under it. The capture stages its writes
+ * (`store.batched`), so nothing it had authored survives — say so; the old wording promised
+ * the opposite (#156, #181).
+ */
 export function preCommitTimeoutMessage(ms: number): string {
   return (
-    `avcs: pre-commit exceeded ${ms}ms — git proceeds, but this commit carries no AVCS checkpoint or trailer (#33).\n` +
-    `  Whatever the ingest had captured stays in the store; the checkpoint and the commit↔checkpoint link were not written.\n` +
+    `avcs: pre-commit exceeded ${ms}ms and could not stop cleanly — git proceeds, but this commit carries no AVCS checkpoint or trailer (#33).\n` +
+    `  Nothing from this capture is on disk: a capture stages its writes and flushes at the end, and the end was not reached.\n` +
     `  Bring the store level again with:  avcs git-sync -m "<message>"\n` +
     `  AVCS_HOOK_TIMEOUT_MS=0 waits instead of giving up; a larger value raises the bound.`
   );

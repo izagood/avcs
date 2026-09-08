@@ -26,6 +26,39 @@ particular every change to the **reduce/merge algorithm** or the **operation for
 
 ## Unreleased
 
+**Fixed — a capture that cannot finish inside the git-hook deadline now leaves its progress
+behind (#181).** The hook exited the process at the bound, and because a capture stages its
+writes (`store.batched`) and flushes at the end, that exit discarded every op it had authored:
+a store whose next capture needed more than 30 s made no progress on any commit and repeated
+the same work forever — one repo recorded nothing for six days while every hook printed
+success. `commitWorkingTree` / `gitSync` now take an `AbortSignal`; the hook asks the capture to
+stop at the bound, the capture finishes the op in flight, flushes, and returns `partial:
+{ remaining }`, and the hook says exactly what is on disk. The hard exit stays behind it
+(`hardDeadlineMs`) for a capture that cannot stop on its own, and its message no longer claims
+that what was captured "stays in the store" — under a staged batch it did not. Not a
+determinism change.
+
+**Fixed — `contention()` no longer reads the whole store per authored op (#179).** The keyed
+perspective (the `warnContention` path every capture takes, once per op) is now seeded from the
+entity index — O(ops-on-key), as docs/17 §15.3 always said — instead of a full op scan; the
+ancestry walks run only when another actor has a live op on the key, stop at that op's lamport,
+and the built-upon walk runs once over all keys rather than once per key. Measured on a 9k-op
+store: a 60-op commit 27.4 s → 5.3 s; `avcs status`, which walked 4 000 keys × 600 ancestors
+after a wide commit, returns in seconds instead of minutes. Warnings on a keyed check are
+unchanged. **`avcs status` (the keyless check) now reports every key you authored on** — its
+discovery loop filtered by the key set it was still filling, so it only ever checked the keys
+chained to your first op (measured: 1 of 4 203 keys). Expect more warnings there; they were
+always true. `ObjectStore.readEntityIndex` is now read-your-writes inside `batched()`, like
+`has`/`get`/`readOpLog` already were — the index used to lag the store by a whole capture, so a
+per-op check inside one saw none of the ops that capture had authored so far. Not a
+determinism change.
+
+**Fixed — `avcs commit` now respects `.gitignore` inside a git work tree (#180).** It called
+`commitWorkingTree` without the `ignorePredicate` the hook (#10) and `import` (#48) already
+pass, so the same tree captured differently depending on the command — `avcs commit` next to
+a `node_modules/` pulled all of it into history. A git work tree whose `git` cannot be run now
+says so on stderr instead of silently ignoring nothing. Not a determinism change.
+
 **Added — `GET /reduced` and `GET /reduced/blob/:oid` (docs/27): a client that does not
 replicate can read a view's derived state — statuses, conflicts, headOps, treeHash, and the
 path → blob-oid tree map — and fetch synthetic (3-way-merged) blob bytes that exist in no
