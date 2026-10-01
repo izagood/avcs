@@ -1,0 +1,82 @@
+name: PR guard
+
+# PR 이 공개 저장소에 남기면 안 되는 것을 머지 전에 막는다. 셋 다 실패하면 머지가 막힌다.
+#   1. commit-emails — 커밋 author·committer·Co-authored-by 메일을 허용 목록과 대조한다.
+#      커밋 메타데이터는 히스토리를 다시 써야만 지워진다(2026-10 에 그렇게 했다).
+#   2. secrets — gitleaks 로 PR 범위(base..head)의 커밋에서 비밀 값을 찾는다.
+#   3. pr-body — PR 본문의 이미지·첨부·raw 링크와 실제 테넌트 호스트를 막는다.
+# 막을 값(도메인·주소)은 어디에도 적지 않는다 — 금지 목록 대신 허용 목록만 쓴다.
+# 그 값을 저장소에 적는 순간 그 자체가 공개가 되기 때문이다.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: pr-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  commit-emails:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/check-commit-emails.sh "$BASE" "$HEAD"
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # 바이너리는 릴리스 체크섬으로 확인한다(액션 대신 바이너리 — 조직 라이선스 문제가 없고,
+      # 핀한 버전 그대로 돈다).
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: install gitleaks
+        run: |
+          f=gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          curl -fsSLo "$RUNNER_TEMP/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" gitleaks
+      - name: scan PR commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        # --redact 는 비밀 값만 가린다. --verbose 는 커밋 author 메일까지 찍으므로 쓰지 않고,
+        # JSON 보고서에서 파일·줄·규칙만 꺼내 찍는다(로그도 공개다).
+        run: |
+          set +e
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --log-opts="$BASE..$HEAD" \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" .
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ] && [ -s "$RUNNER_TEMP/gitleaks.json" ]; then
+            jq -r '.[] | "::error file=\(.File),line=\(.StartLine)::gitleaks \(.RuleID) (커밋 \(.Commit[0:9]))"' "$RUNNER_TEMP/gitleaks.json"
+          fi
+          exit "$rc"
+
+  pr-body:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: .github/scripts/check-pr-body.sh
