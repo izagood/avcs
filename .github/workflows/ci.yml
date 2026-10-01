@@ -13,6 +13,37 @@ permissions:
   contents: read
 
 jobs:
+  commit-identity:
+    # PR 의 커밋 신원(author·committer·Co-authored-by)이 공개해도 되는 메일인지 본다.
+    # 금지 목록이 아니라 허용 목록이다 — 막을 도메인을 저장소에 적으면 그 자체가 노출이다.
+    # 허용: GitHub noreply, 개인 메일, 봇, AI 공동 저자 trailer.
+    name: commit identity (allowlist)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check author / committer / Co-authored-by emails
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          ALLOW='(@users\.noreply\.github\.com|^noreply@github\.com|^ljbfif50@gmail\.com|^noreply@anthropic\.com)$'
+          bad=0
+          for c in $(git rev-list "$BASE..$HEAD"); do
+            emails="$(git log -1 --format='%ae%n%ce' "$c"; git log -1 --format='%B' "$c" | sed -nE 's/^Co-authored-by:.*<([^>]+)>.*$/\1/Ip')"
+            for e in $emails; do
+              if ! printf '%s\n' "$e" | grep -qiE "$ALLOW"; then
+                echo "::error::$(git log -1 --format=%h "$c"): email not on the allowlist — use izagood@users.noreply.github.com"
+                bad=1
+              fi
+            done
+          done
+          exit $bad
+
   test:
     name: typecheck + test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
