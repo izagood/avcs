@@ -21,7 +21,7 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
         run: |
           set -eu
-          PATTERN='!\[[^]]*\]\(|<img[[:space:]>/]|<picture[[:space:]>]|user-attachments|user-images\.githubusercontent\.com|private-user-images\.githubusercontent\.com|raw\.githubusercontent\.com|github\.com/[^[:space:])]+/raw/|[?&]raw=true'
+          PATTERN='!\[[^]]*\]\(|<img[[:space:]>/]|<picture[[:space:]>]|github\.com/user-attachments/|user-images\.githubusercontent\.com|private-user-images\.githubusercontent\.com|raw\.githubusercontent\.com|github\.com/[^[:space:])]+/raw/|[?&]raw=true'
           hits="$(printf '%s\n' "${BODY:-}" | grep -niE "$PATTERN" || true)"
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits" | cut -d: -f1 | while read -r n; do
