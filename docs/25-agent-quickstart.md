@@ -43,7 +43,7 @@ same command. The server is a **stdio** server; `type` is the transport, not the
 
 `command` is resolved on the `PATH` **of the process that spawns the server**, which for a
 desktop app or a background runner is often not your shell's `PATH`. If `avcs` is not
-installed there, either install it (`npm install -g @izagood/avcs`) or let `npx` fetch a
+installed there, either install it (`npm install -g @izagood/avcs@0.51.0`, the same version as the `npx` form) or let `npx` fetch a
 pinned version so every agent host runs the same build:
 
 ```json
