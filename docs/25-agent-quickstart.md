@@ -23,6 +23,42 @@ Any MCP client works — point it at the `avcs mcp` stdio command; the target re
 `$AVCS_REPO`, else the client's cwd. `--profile core` advertises the 13 loop tools
 instead of all 36.
 
+### Hosts that spawn agents from a JSON config
+
+Agent runners that read an `mcpServers` JSON file (rather than `claude mcp add`) need the
+same command. The server is a **stdio** server; `type` is the transport, not the program:
+
+```json
+{
+  "mcpServers": {
+    "avcs": {
+      "type": "stdio",
+      "command": "avcs",
+      "args": ["mcp", "--profile", "core"],
+      "env": { "AVCS_REPO": "/path/to/repo" }
+    }
+  }
+}
+```
+
+`command` is resolved on the `PATH` **of the process that spawns the server**, which for a
+desktop app or a background runner is often not your shell's `PATH`. If `avcs` is not
+installed there, either install it (`npm install -g @izagood/avcs`) or let `npx` fetch a
+pinned version so every agent host runs the same build:
+
+```json
+"avcs": { "type": "stdio", "command": "npx", "args": ["-y", "@izagood/avcs@0.51.0", "mcp", "--profile", "core"] }
+```
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Executable not found in $PATH` | `avcs` is not installed on the spawning process's `PATH` | install globally, or use the `npx` form above |
+| server connects but tools act on the wrong repo | no `AVCS_REPO` and the client's cwd is not the repo | set `AVCS_REPO` |
+| `@modelcontextprotocol/sdk is not installed` | installed with `--omit=optional` | reinstall without it |
+
+Check from the same host: `avcs version` must print the version you expect, and
+`claude mcp list` (or your client's equivalent) must show `avcs` as connected.
+
 ## The canonical loop
 
 The agent's first call is always `avcs.guide` — it returns this loop plus the rules,
