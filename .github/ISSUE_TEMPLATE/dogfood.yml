@@ -1,0 +1,61 @@
+name: 🐶 Dogfood report
+description: A problem found while developing avcs / avcs-server / avcshub through AVCS itself.
+title: "[dogfood] <short summary>"
+labels: ["dogfood"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We build AVCS with AVCS. File here anything that made you fall back to plain git, lost or
+        mis-projected work, or slowed an agent down. If the fault turns out to belong to the protocol
+        plane (avcs-server) or the hub (avcshub), it will be moved there.
+
+        Do not paste tokens, private keys, company names or local paths — this repository is public.
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Where did it show up?
+      options:
+        - engine / CLI / MCP (avcs)
+        - git bridge (sidecar or committed mode)
+        - protocol / conformance (avcs-server)
+        - hub API, auth or web (avcshub)
+        - not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: fallback
+    attributes:
+      label: Did you have to fall back to plain git?
+      description: This is the main stability metric of the dogfooding loop.
+      options:
+        - "yes"
+        - "no"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: CLI commands or the MCP tool calls, in order.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: ids
+    attributes:
+      label: intent / session / operation ids
+      placeholder: "intent:… session:… op:…"
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "`avcs version`, plus the hub's `/version` output if a hub was involved."
+    validations:
+      required: true
