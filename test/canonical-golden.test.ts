@@ -7,7 +7,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createPrivateKey, createPublicKey } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { canonicalize, computeOid, assertInteropSafe } from "../src/core/canonical.ts";
+import { signMessage, verifyMessage, publicKeyFromPrivate } from "../src/core/identity.ts";
+import { buildAuthHeader, canonicalRequest } from "../src/hub/transportAuth.ts";
 
 const VECTORS = fileURLToPath(new URL("../spec/canonical-vectors.json", import.meta.url));
 
@@ -83,4 +87,92 @@ test("벡터가 세 위험 지점을 실제로 덮는다", async () => {
   // ③ 비-ASCII 값과 이스케이프
   assert.ok(/[^\x00-\x7F]/.test(canon), "비-ASCII 값을 덮는 벡터가 없다");
   assert.match(canon, /\\n|\\"|\\\\/, "이스케이프가 필요한 문자열 벡터가 없다");
+});
+
+// ── 유니코드 키 정렬 — UTF-16 인가 코드포인트인가 (R0) ──────────────────────────
+// 참조 구현의 `canonicalize` 는 `Array.prototype.sort()` 로 키를 정렬한다 = UTF-16 코드유닛 순.
+// 명세는 "코드포인트 순" 이다. 둘은 BMP 안에서 같고 astral 키에서만 갈린다. 그러니 명세가
+// 참이려면 두 사실이 함께 서야 한다: ① BMP 높은 키 벡터가 통과한다 ② astral 키는 관문에서 거부된다.
+test("BMP 높은 키는 UTF-16 순과 코드포인트 순이 같다 — bmp-key-order 벡터가 실제로 높은 키를 쓴다", async () => {
+  const { accepted } = JSON.parse(await readFile(VECTORS, "utf8")) as { accepted: Vector[] };
+  const v = accepted.find((x) => x.name === "bmp-key-order");
+  assert.ok(v, "bmp-key-order 벡터가 있어야 한다");
+  const keys = Object.keys(v.payload);
+  assert.ok(keys.some((k) => k.codePointAt(0)! >= 0xe000), "U+E000 이상 키가 있어야 astral 경계 바로 아래를 잰다");
+  assert.ok(keys.some((k) => k.codePointAt(0)! >= 0xac00 && k.codePointAt(0)! <= 0xd7a3), "한글 키가 있어야 한다");
+  const utf16 = [...keys].sort();
+  const cp = [...keys].sort((a, b) => (a.codePointAt(0)! - b.codePointAt(0)!));
+  assert.deepEqual(utf16, cp, "BMP 안에서는 두 정렬이 같아야 한다");
+});
+
+test("참조 canonicalize 는 UTF-16 순이다 — 그래서 astral 키는 관문에서 거부돼야 한다", async () => {
+  const { rejected } = JSON.parse(await readFile(VECTORS, "utf8")) as { rejected: Rejected[] };
+  const min = rejected.find((r) => r.name === "astral-key-min");
+  assert.ok(min, "astral-key-min 벡터가 있어야 한다");
+  // 관문 없이 부르면 U+10000 이 U+E000 앞에 온다(UTF-16). 코드포인트 순이면 뒤다.
+  assert.equal(canonicalize(min.payload), '{"\u{10000}":2,"":1}', "참조 구현의 실제 정렬이 바뀌었다 — 명세(docs/24 §3)와 다시 맞춰야 한다");
+  assert.throws(() => assertInteropSafe(min.payload), /astral/);
+  for (const name of ["astral-key-cjk", "astral-key-nested"]) {
+    const r = rejected.find((x) => x.name === name);
+    assert.ok(r, `${name} 벡터가 있어야 한다`);
+    assert.match(JSON.stringify(r.payload), /[\u{10000}-\u{10FFFF}]/u, `${name} 에 astral 문자가 실제로 있어야 한다`);
+  }
+});
+
+// ── 서명 벡터 ───────────────────────────────────────────────────────────────────
+/** 벡터의 seed 로 키 파일과 같은 PKCS#8 PEM 을 만든다 — 개인키 PEM 을 파일에 싣지 않기 위해. */
+function privatePemOf(k: SigVectors["key"]): string {
+  const der = Buffer.from(k.pkcs8DerPrefixHex + k.seedHex, "hex");
+  return `-----BEGIN PRIVATE KEY-----\n${der.toString("base64")}\n-----END PRIVATE KEY-----\n`;
+}
+
+interface SigVectors {
+  key: { seedHex: string; publicHex: string; pkcs8DerPrefixHex: string; publicPem: string };
+  messages: { name: string; message: string; sig?: string; sigHex?: string }[];
+  transport: {
+    name: string; keyId: string; method: string; path: string; body: string; ts: string; nonce: string; scope: string;
+    canonicalRequest: string; canonicalRequestScoped: string; header: string;
+  }[];
+}
+
+test("서명 벡터 — 키 유도가 RFC 8032 TEST 1 과 같다", async () => {
+  const { signatures: s } = JSON.parse(await readFile(VECTORS, "utf8")) as { signatures: SigVectors };
+  const pem = privatePemOf(s.key);
+  // node 가 내보내는 PEM 과 바이트까지 같아야 한다 — 그래야 seed 로 만든 PEM 이 키 파일 형식이다.
+  assert.equal(createPrivateKey(pem).export({ format: "pem", type: "pkcs8" }), pem);
+  assert.equal(publicKeyFromPrivate(pem), s.key.publicPem, "개인키 PEM(PKCS#8)에서 공개키 PEM(SPKI)이 복원돼야 한다");
+  const der = createPrivateKey(pem).export({ format: "der", type: "pkcs8" });
+  assert.equal(der.subarray(-32).toString("hex"), s.key.seedHex, "PKCS#8 안의 seed 가 벡터와 같아야 한다");
+  const spki = createPublicKey(s.key.publicPem).export({ format: "der", type: "spki" });
+  assert.equal(spki.subarray(-32).toString("hex"), s.key.publicHex);
+});
+
+test("서명 벡터 — 오브젝트 oid 서명이 바이트까지 같고 검증된다", async () => {
+  const raw = JSON.parse(await readFile(VECTORS, "utf8")) as { signatures: SigVectors; accepted: Vector[] };
+  const s = raw.signatures;
+  assert.ok(s.messages.length >= 2);
+  for (const m of s.messages) {
+    const got = signMessage(privatePemOf(s.key), m.message);
+    const want = m.sig ?? Buffer.from(m.sigHex!, "hex").toString("base64");
+    assert.equal(got, want, `${m.name}: 서명이 다르다`);
+    assert.ok(verifyMessage(s.key.publicPem, m.message, want), `${m.name}: 검증돼야 한다`);
+    assert.ok(!verifyMessage(s.key.publicPem, m.message + "x", want), `${m.name}: 다른 메시지로는 검증되면 안 된다`);
+  }
+  const obj = s.messages.find((m) => m.name === "object-oid");
+  const realOp = raw.accepted.find((v) => v.name === "real-op");
+  assert.equal(obj?.message, realOp?.oid, "object-oid 는 real-op 의 oid 를 서명해야 벡터끼리 이어진다");
+});
+
+test("서명 벡터 — 허브 요청 서명(AVCS-Sig) 헤더가 바이트까지 같다", async () => {
+  const { signatures: s } = JSON.parse(await readFile(VECTORS, "utf8")) as { signatures: SigVectors };
+  assert.ok(s.transport.length >= 1);
+  for (const t of s.transport) {
+    assert.equal(canonicalRequest(t.method, t.path, t.ts, t.nonce, t.body), t.canonicalRequest, `${t.name}: 정규 요청`);
+    assert.equal(canonicalRequest(t.method, t.path, t.ts, t.nonce, t.body, t.scope), t.canonicalRequestScoped, `${t.name}: scope 붙은 정규 요청`);
+    const header = buildAuthHeader({
+      keyId: t.keyId, privateKey: privatePemOf(s.key), method: t.method, path: t.path,
+      body: t.body, ts: t.ts, nonce: t.nonce, scope: t.scope,
+    });
+    assert.equal(header, t.header, `${t.name}: 헤더가 다르다`);
+  }
 });

@@ -115,7 +115,7 @@ importObjects·hub push).
 
 ## 6. 골든 벡터
 
-`spec/canonical-vectors.json`에 허용 10건·거부 4건이 있다. 각 벡터는 페이로드와 기대 정규 문자열,
+`spec/canonical-vectors.json`에 허용 12건·거부 7건과 서명 벡터(`signatures`)가 있다. 각 벡터는 페이로드와 기대 정규 문자열,
 기대 oid를 담는다. 다른 언어 구현은 이 파일을 읽어 자기 정규화를 검증한다.
 
 `test/canonical-golden.test.ts`가 이 파일을 **검증한다**(생성하지 않는다). 생성하면 구현이 바뀔 때
@@ -129,3 +129,17 @@ importObjects·hub push).
 2. **lone surrogate는 파일에 담을 수 없다.** 정의상 유효한 UTF-8이 아니므로 UTF-8 파일이 그것을
    표현하지 못한다(Python이 쓰기를 거부해 파일이 0바이트가 되는 것을 실측했다). 그 케이스는
    벡터 파일이 아니라 **테스트 코드**에서 만든다. 다른 언어 구현도 같은 제약을 만난다.
+
+## 7. 키 정렬 판정과 서명 벡터 (R0)
+
+**참조 구현의 키 정렬은 UTF-16 코드유닛 순이다**(`canonicalize` 가 `Array.prototype.sort()` 를 쓴다).
+관문 없이 `{"\uE000":1,"\u{10000}":2}` 를 정규화하면 U+10000 이 앞에 온다 — 코드포인트 순이면 뒤다.
+그런데도 명세를 "코드포인트 순"으로 적을 수 있는 것은 `ObjectStore.put`/`putMany` 의 `assertInteropSafe` 관문이
+astral 키를 거부하기 때문이다. 허용 집합(BMP 키만)에서 두 정렬은 같은 바이트를 낸다. 벡터가 이를 고정한다:
+`bmp-key-order`(U+E000·U+FFFD·한글·라틴-1 키 — 코드포인트 정렬인 `examples/server.py` 도 같은 oid),
+`astral-key-min`·`astral-key-cjk`·`astral-key-nested`(거부). 비-JS 구현은 코드포인트 정렬로 짜되 같은 관문을 둬야 한다.
+
+**서명 벡터**(`signatures`)는 RFC 8032 §7.1 TEST 1 공개 시험 키로 만든다(시험 전용 — 어디서도 신뢰하지 않는다).
+ed25519 는 결정적이므로 같은 키·메시지는 같은 서명을 낸다. 담긴 것: 키(seed·공개키 hex, PKCS#8 접두 hex, SPKI PEM — 개인키 PEM 은 seed 로 만든다),
+RFC 서명(키 유도 확인), 오브젝트 서명(oid 문자열의 UTF-8 바이트), 허브 요청 서명(AVCS-Sig 헤더 — `sig`·`bsig`).
+

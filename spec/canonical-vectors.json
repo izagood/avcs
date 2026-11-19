@@ -1,12 +1,13 @@
 {
   "_": "avcs 정규 직렬화 골든 벡터. 비-JS 구현이 자기 정규화를 이 파일로 검증한다. 값은 손으로 적혔고 test/canonical-golden.test.ts 가 구현과 대조한다 — 생성하지 않는다.",
   "_rules": [
-    "정규 형태는 JSON: 삽입 공백 없음, 객체 키는 코드포인트 오름차순, undefined 필드는 탈락.",
+    "정규 형태는 JSON: 삽입 공백 없음, 객체 키는 코드포인트 오름차순, undefined 필드는 탈락. (참조 구현은 UTF-16 코드유닛 순으로 정렬한다 — astral 키가 거부되므로 허용 집합에서 둘은 같은 바이트를 낸다. bmp-key-order·astral-key-min 벡터가 이를 고정한다.)",
     "oid = \"<type>_\" + sha256(canonical) 앞 32 hex. type 은 페이로드의 type 필드가 아니라 별도 인자다.",
     "수는 정수만, ±(2^53-1) 이내. 부동소수는 언어별 표기가 달라 허용하지 않는다.",
     "객체 키: astral 문자(U+10000 이상) 금지, NFC 정규화 필수, lone surrogate 금지.",
     "문자열 값: astral·비-ASCII 허용(정렬에 참여하지 않는다). lone surrogate 만 금지.",
     "이스케이프: JSON 필수만 — \\\" \\\\ \\n \\r \\t 및 U+0000..U+001F 의 \\u00XX. 나머지는 UTF-8 그대로.",
+    "signatures: ed25519 서명 벡터(오브젝트 oid 서명·허브 요청 서명). 서명 대상은 UTF-8 바이트다.",
     "lone surrogate 거부 벡터는 이 파일에 없다 — 유효한 UTF-8 로 표현할 수 없어 파일 형식이 담지 못한다. 구현은 자기 테스트에서 직접 만들어 검증해야 한다."
   ],
   "accepted": [
@@ -152,6 +153,40 @@
       },
       "canonical": "{\"evidence\":{\"custom:deploy\":\"pass\",\"unit_test\":\"pass\"},\"headOps\":[\"operation_ab\"],\"status\":\"verified\",\"treeHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"type\":\"checkpoint\"}",
       "oid": "checkpoint_c5ad92b0f3738d9302c80ebc02f02ce3"
+    },
+    {
+      "name": "bmp-key-order",
+      "note": "BMP(U+0000..U+FFFF) \uc548\uc758 \ub192\uc740 \ud0a4 \u2014 \ub77c\ud2f4-1\u00b7\ud55c\uae00\u00b7\uc0ac\uc6a9 \uc601\uc5ed(U+E000)\u00b7U+FFFD. BMP \uc548\uc5d0\uc11c\ub294 UTF-16 \ucf54\ub4dc\uc720\ub2db \uc21c\uacfc \ucf54\ub4dc\ud3ec\uc778\ud2b8 \uc21c\uc774 \uac19\ub2e4(\ucc38\uc870 \uad6c\ud604\uc740 UTF-16 \uc815\ub82c, examples/server.py \ub294 \ucf54\ub4dc\ud3ec\uc778\ud2b8 \uc815\ub82c\uc778\ub370 \ub458 \ub2e4 \uc774 oid \ub97c \ub0b8\ub2e4). astral \ud0a4\uac00 \uac70\ubd80\ub418\ubbc0\ub85c \ud5c8\uc6a9 \uc9d1\ud569 \uc804\uccb4\uc5d0\uc11c \ub450 \uc815\ub82c\uc740 \uac19\uc740 \ubc14\uc774\ud2b8\ub97c \ub0b8\ub2e4.",
+      "type": "operation",
+      "payload": {
+        "z": 1,
+        "\ufffd": 2,
+        "\uac00": 3,
+        "\u00e9": 4,
+        "\ue000": 5,
+        "Z": 6
+      },
+      "canonical": "{\"Z\":6,\"z\":1,\"\u00e9\":4,\"\uac00\":3,\"\ue000\":5,\"\ufffd\":2}",
+      "oid": "operation_d8d8d831e967ac8ab0433a4b267281d2"
+    },
+    {
+      "name": "astral-values",
+      "note": "BMP 밖 문자(U+1D11E·U+20000·U+1F680·U+1F600)는 값에서는 허용되고 UTF-8 4바이트 그대로 나간다 — \\ud834\\udd1e 같은 surrogate 이스케이프로 쓰면 다른 oid 다. 중첩 객체·배열 안의 값도 같다.",
+      "type": "operation",
+      "payload": {
+        "music": "𝄞",
+        "cjk": "𠀀𠀁",
+        "nested": {
+          "arr": [
+            "🚀",
+            {
+              "k": "😀"
+            }
+          ]
+        }
+      },
+      "canonical": "{\"cjk\":\"𠀀𠀁\",\"music\":\"𝄞\",\"nested\":{\"arr\":[\"🚀\",{\"k\":\"😀\"}]}}",
+      "oid": "operation_759e1d34fd791b23fb5c9e59b528603b"
     }
   ],
   "rejected": [
@@ -183,6 +218,70 @@
       "payload": {
         "café": 1
       }
+    },
+    {
+      "name": "astral-key-min",
+      "note": "\ub450 \uc815\ub82c\uc774 \uac08\ub9ac\ub294 \uac00\uc7a5 \uc791\uc740 \uc608. U+10000(UTF-16 D800 DC00)\uc740 UTF-16 \uc815\ub82c\uc5d0\uc11c U+E000 \uc55e, \ucf54\ub4dc\ud3ec\uc778\ud2b8 \uc815\ub82c\uc5d0\uc11c \ub4a4\ub2e4. \ucc38\uc870 \uad6c\ud604\uc758 canonicalize \ub294 \uad00\ubb38 \uc5c6\uc774 \ubd80\ub974\uba74 UTF-16 \uc21c\uc73c\ub85c \ub0b8\ub2e4 \u2014 \uadf8\ub798\uc11c \uad00\ubb38(put)\uc774 \uac70\ubd80\ud574\uc57c \ud55c\ub2e4.",
+      "payload": {
+        "\ue000": 1,
+        "\ud800\udc00": 2
+      }
+    },
+    {
+      "name": "astral-key-cjk",
+      "note": "이모지만이 아니다 — CJK 확장 B(U+20000) 한자 키도 astral 이다.",
+      "payload": {
+        "𠀀": 1
+      }
+    },
+    {
+      "name": "astral-key-nested",
+      "note": "관문은 재귀한다. custom:<name> evidence 가 Checkpoint.evidence 의 키가 되므로 중첩된 키도 해시 대상이다.",
+      "payload": {
+        "evidence": {
+          "custom:🚀": "pass"
+        }
+      }
     }
-  ]
+  ],
+  "signatures": {
+    "_": "ed25519 서명 벡터. 키는 RFC 8032 §7.1 TEST 1 의 공개 시험 키다 — 시험 전용이고 어디서도 신뢰하면 안 된다. ed25519 는 결정적이라 같은 키·메시지는 언제나 같은 서명을 낸다.",
+    "key": {
+      "seedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "publicHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "pkcs8DerPrefixHex": "302e020100300506032b657004220420",
+      "publicPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+      "note": "개인키 PEM 은 파일에 싣지 않는다(비밀 스캐너가 시험 키와 진짜 키를 가리지 못한다). PKCS#8 DER = pkcs8DerPrefixHex ‖ seed 이고, 그것을 base64 로 BEGIN/END PRIVATE KEY 사이에 넣은 PEM 이 키 파일(<config>/private/<actorId>.json 의 privateKey) 형식이다. publicPem 은 SPKI 다. 공개키는 개인키에서 복원된다(publicKeyFromPrivate)."
+    },
+    "messages": [
+      {
+        "name": "rfc8032-test1",
+        "note": "빈 메시지. RFC 8032 §7.1 TEST 1 의 SIGNATURE 와 같아야 한다 — 키 유도가 맞는지 먼저 고정한다.",
+        "message": "",
+        "sigHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+      },
+      {
+        "name": "object-oid",
+        "note": "오브젝트 서명은 oid 문자열의 UTF-8 바이트에 대한 것이다(정규 JSON 이 아니다). message 는 accepted 의 real-op oid 다.",
+        "message": "operation_72ce4832d5269054295da5563dea32b3",
+        "sig": "zdmXaIZ0rAoVBwgZIZ0NXezCmgZyn0fcdRHSl7nREldNeeNCqWeCZ+bBf9UgKuc8Y7ylxnnEEK6GeUyT7xfHDg=="
+      }
+    ],
+    "transport": [
+      {
+        "name": "scoped-post",
+        "note": "허브 요청 서명(docs/26 AVCS-Sig). 정규 요청 = METHOD\\npath\\nts\\nnonce\\nsha256hex(body)[\\nscope]. sig 는 scope 없는 재료, bsig 는 scope 를 붙인 재료에 대한 서명이다(구버전 허브 호환을 위해 둘 다 보낸다).",
+        "keyId": "human:ci",
+        "method": "POST",
+        "path": "/objects",
+        "body": "{\"a\":1}",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "scope": "/acme/web",
+        "canonicalRequest": "POST\n/objects\n2026-01-01T00:00:00.000Z\nAAAAAAAAAAAAAAAA\n015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+        "canonicalRequestScoped": "POST\n/objects\n2026-01-01T00:00:00.000Z\nAAAAAAAAAAAAAAAA\n015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862\n/acme/web",
+        "header": "AVCS-Sig keyId=\"human:ci\", ts=\"2026-01-01T00:00:00.000Z\", nonce=\"AAAAAAAAAAAAAAAA\", scope=\"/acme/web\", sig=\"5L1O2D1/t4upe4ZcdzWw3XU71cF26JLgtBdREIFhVPwmlEOrAhMwyQ75znfVxuT4mFLuRri7fIqHmErP9qDTBQ==\", bsig=\"Ydnko0xensjWqQ0sRfW750t0sxuwMv3SL28pj1PMszytM4bAI3tRr6nfQi1FTWfmwTgPH0oRDo29lVpBf1cAAA==\""
+      }
+    ]
+  }
 }

@@ -384,6 +384,13 @@ Then point the conformance suite at your server:
 AVCS_CONFORMANCE_URL=https://your.hub/acme/web npm run conformance
 ```
 
+Or let the suite start your server binary itself (it runs `<bin> serve <dir> --port <port>`;
+override the argument shape with `AVCS_CONFORMANCE_BIN_ARGS`, using `{dir}` and `{port}`):
+
+```bash
+AVCS_CONFORMANCE_BIN=/path/to/your-avcs npm run conformance
+```
+
 It reports which levels apply — `core` (the three endpoints, and a clone that reproduces the
 source treeHash), then `sync`, `governance`, `queue` as your capability flags allow. A level
 you do not advertise is **skipped, not failed**: a partial server is a legitimate one.

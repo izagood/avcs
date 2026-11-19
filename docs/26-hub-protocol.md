@@ -394,6 +394,14 @@ AVCS_CONFORMANCE_URL=https://your.hub/acme/web npm run conformance
 ```
 
 URL 을 주지 않으면 참조 구현을 띄워 잰다 — 그래서 스위트 자체가 CI 에서 계속 검증된다.
+
+실행 파일을 주면 스위트가 직접 띄워 잰다(R0 — 다른 언어 구현을 CI 한 줄로 재기 위해). 빈 임시 디렉터리와 빈 포트로
+`<bin> serve <dir> --port <port>` 를 부르고 `GET /have` 가 200 을 줄 때까지 기다린다. 인자 모양은
+`AVCS_CONFORMANCE_BIN_ARGS`(`{dir}`·`{port}` 자리표시자)로 바꾼다. URL 이 있으면 URL 이 이긴다.
+
+```bash
+AVCS_CONFORMANCE_BIN=/path/to/avcs-rs npm run conformance
+```
 제3자가 돌리는 명령과 우리가 돌리는 명령이 **같고**, 다른 것은 URL 하나뿐이다.
 
 ### 레벨
