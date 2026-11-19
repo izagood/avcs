@@ -90,6 +90,31 @@ jobs:
       - name: Conformance suite
         run: npm run conformance
 
+  conformance-binary:
+    # 같은 적합성 스위트를 "외부 실행 파일" 대상으로 돌린다(R0). 다른 언어 구현(예: Rust
+    # 바이너리)은 AVCS_CONFORMANCE_BIN 만 바꿔 이 잡과 같은 명령으로 잰다. 여기서는 TS 참조 CLI 를
+    # 실행 파일로 띄워, 스위트의 띄우기·기다리기·끄기 경로 자체가 초록인지 지킨다.
+    name: conformance (reference CLI as binary)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Conformance suite (binary target)
+        run: npm run conformance
+        env:
+          AVCS_CONFORMANCE_BIN: node --experimental-strip-types src/cli.ts
+          AVCS_CONFORMANCE_BIN_ARGS: serve {dir} --port {port} --quiet
+
   release-dry-run:
     name: release dry run (build + pack)
     runs-on: ubuntu-latest

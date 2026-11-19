@@ -14,7 +14,32 @@
 //      스위트 자체가 CI 에서 계속 검증된다.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openTarget, LEVELS, type Level } from "./target.ts";
+import { fileURLToPath } from "node:url";
+import { openTarget, parseBin, LEVELS, type Level } from "./target.ts";
+
+/** env 주입(URL·실행 파일)을 끄고 참조 구현을 연다. 스위트를 외부 대상으로 돌릴 때도 이
+ *  자기검증들은 "참조 구현" 자체를 재야 하므로 — 끄지 않으면 자기모순이 된다. */
+async function openReference(): ReturnType<typeof openTarget> {
+  return openWithoutEnv();
+}
+
+/** env 주입을 끈 채로 openTarget — 자기검증이 스위트 실행 대상(URL·실행 파일)에 끌려가지 않게. */
+async function openWithoutEnv(opts?: Parameters<typeof openTarget>[0]): ReturnType<typeof openTarget> {
+  const keys = ["AVCS_CONFORMANCE_URL", "AVCS_CONFORMANCE_BIN", "AVCS_CONFORMANCE_BIN_ARGS"] as const;
+  const saved = keys.map((k) => process.env[k]);
+  for (const k of keys) delete process.env[k];
+  try {
+    return await openTarget(opts);
+  } finally {
+    keys.forEach((k, i) => { if (saved[i] !== undefined) process.env[k] = saved[i]; });
+  }
+}
+
+/** TS 참조 CLI 를 "외부 실행 파일" 로 본다 — 다른 언어 구현이 꽂힐 자리와 같은 경로로 띄운다. */
+const TS_CLI: string[] = [
+  process.execPath, "--experimental-strip-types",
+  fileURLToPath(new URL("../../src/cli.ts", import.meta.url)),
+];
 
 test("URL 을 주면 그 서버를 잰다 — 참조 구현을 띄우지 않는다", async () => {
   const t = await openTarget({ url: "http://127.0.0.1:9/acme/web" });
@@ -30,10 +55,7 @@ test("URL 이 없으면 참조 구현을 띄운다 — 기존 커버리지가 �
   // 이 자기검증은 "URL 없음" 조건 자체를 재므로 env 기본값을 명시적으로 끈다 — 스위트를
   // AVCS_CONFORMANCE_URL 로 외부 서버에 돌리면 env 가 여기까지 주입되어 자기모순이 된다.
   // 실제로 첫 외부 실행(제3 구현)이 이 버그를 찾았다.
-  const saved = process.env.AVCS_CONFORMANCE_URL;
-  delete process.env.AVCS_CONFORMANCE_URL;
-  const t = await openTarget();
-  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
+  const t = await openReference();
   try {
     assert.equal(t.spawned, true, "URL 이 없으면 참조 구현을 띄워야 한다");
     assert.match(t.base, /^http:\/\/127\.0\.0\.1:\d+$/);
@@ -57,10 +79,7 @@ test("서버가 광고하지 않는 능력의 레벨은 건너뛴다 — 실패�
   // 부분 구현 서버가 1급 시민이라는 것이 프로토콜의 약속이다(docs/26 §0). 스위트가 그것을
   // 실패로 처리하면 약속을 어기는 쪽이 스위트가 된다.
   // "참조 구현은 전부 켜져 있다" 를 재므로 env 주입을 끈다 (위 테스트와 같은 이유).
-  const saved = process.env.AVCS_CONFORMANCE_URL;
-  delete process.env.AVCS_CONFORMANCE_URL;
-  const t = await openTarget();
-  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
+  const t = await openReference();
   try {
     const caps = await t.capabilities();
     assert.equal(typeof caps.batch, "boolean");
@@ -137,10 +156,7 @@ test("확장은 사다리 밖이다 — 레벨 순서에 참여하지 않고 플
   const { EXTENSIONS } = await import("./target.ts");
   assert.deepEqual(Object.keys(EXTENSIONS), ["reduced"]);
   // 참조 구현은 reduced 를 광고한다 → 확장 적용, 레벨 결과는 불변.
-  const saved = process.env.AVCS_CONFORMANCE_URL;
-  delete process.env.AVCS_CONFORMANCE_URL;
-  const t = await openTarget();
-  if (saved !== undefined) process.env.AVCS_CONFORMANCE_URL = saved;
+  const t = await openReference();
   try {
     assert.deepEqual(await t.applicableExtensions(), ["reduced"]);
     assert.deepEqual(await t.applicableLevels(), LEVELS, "확장을 더해도 레벨은 그대로다");
@@ -152,4 +168,45 @@ test("reduced 를 광고하지 않는 서버는 확장이 빠질 뿐 레벨은 �
   try {
     assert.deepEqual(await t.applicableExtensions(), []);
   } finally { await t.close(); }
+});
+
+// ── 실행 파일 대상 (R0) ─────────────────────────────────────────────────────────
+test("실행 파일을 주면 그것을 띄워 잰다 — 참조 구현을 in-process 로 띄우지 않는다", async () => {
+  const t = await openWithoutEnv({ bin: TS_CLI, binArgs: "serve {dir} --port {port} --quiet" });
+  try {
+    assert.equal(t.kind, "binary");
+    assert.equal(t.spawned, true);
+    assert.match(t.base, /^http:\/\/127\.0\.0\.1:\d+$/);
+    const r = await fetch(`${t.base}/have`);
+    assert.equal(r.status, 200, "띄운 실행 파일이 실제로 응답해야 한다");
+    assert.deepEqual(await t.applicableLevels(), LEVELS, "참조 CLI 를 실행 파일로 띄워도 전 레벨이 적용된다");
+  } finally {
+    await t.close();
+  }
+  // close 뒤에는 포트가 닫혀야 한다 — 남은 프로세스가 다음 실행을 오염시키지 않게.
+  await assert.rejects(fetch(`${t.base}/have`));
+});
+
+test("URL 이 실행 파일보다 우선한다", async () => {
+  const t = await openTarget({ url: "http://127.0.0.1:9/x", bin: ["/nonexistent"] });
+  try {
+    assert.equal(t.kind, "url");
+    assert.equal(t.spawned, false);
+  } finally {
+    await t.close();
+  }
+});
+
+test("실행 파일이 뜨지 못하면 그 출력과 함께 실패한다 — 조용히 참조 구현으로 넘어가지 않는다", async () => {
+  await assert.rejects(
+    openWithoutEnv({ bin: [process.execPath, "-e", "console.error('boom'); process.exit(3)"], binArgs: "", startTimeoutMs: 5000 }),
+    /exit 3[\s\S]*boom/,
+  );
+});
+
+test("AVCS_CONFORMANCE_BIN 은 공백 문자열과 JSON 배열 둘 다 받는다", () => {
+  assert.deepEqual(parseBin("/usr/local/bin/avcs-rs"), ["/usr/local/bin/avcs-rs"]);
+  assert.deepEqual(parseBin("node --experimental-strip-types src/cli.ts"), ["node", "--experimental-strip-types", "src/cli.ts"]);
+  assert.deepEqual(parseBin('["/opt/my avcs/bin", "--flag"]'), ["/opt/my avcs/bin", "--flag"]);
+  assert.throws(() => parseBin("   "));
 });
